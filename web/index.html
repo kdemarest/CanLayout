@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Layout</title>
+<style>
+  :root { --bg: #10151f; --panel: rgba(16, 21, 31, 0.86); --text: #e8e6e1; --dim: #9aa3b2; --accent: #4fb3ff; --warn: #ffb060; }
+  html, body { margin: 0; height: 100%; background: radial-gradient(circle at 50% 35%, #2f3b4f, var(--bg)); color: var(--text); font: 15px system-ui, sans-serif; overflow: hidden; }
+  /* Explicit size: a canvas otherwise shows at its pixel size (2x the screen on a phone). */
+  #view { position: fixed; left: 0; top: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  button, select, input { font: inherit; color: var(--text); background: #2a3344; border: 1px solid #3d4a60; border-radius: 8px; padding: 0.45em 0.7em; }
+  button:active { background: #3d4a60; }
+  /* Holding a button (e.g. W to keep moving) must not select its text or open a menu. */
+  body { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  input, select { -webkit-user-select: text; user-select: text; }
+  #pad button { touch-action: none; }
+  button.on { background: var(--accent); color: #0b1220; border-color: var(--accent); }
+  button:disabled { opacity: 0.35; }
+  button svg { display: block; }
+  .bar { position: fixed; left: 0; right: 0; display: flex; gap: 0.4em; padding: 0.5em; align-items: center; flex-wrap: wrap; pointer-events: none; }
+  .bar > * { pointer-events: auto; }
+  #top { top: 0; }
+  #status { position: fixed; left: 0.6em; top: 3.4em; max-width: 70%; padding: 0.3em 0.6em; border-radius: 8px; background: rgba(0, 0, 0, 0.45); font-size: 0.85em; }
+  #actions { bottom: 0; justify-content: flex-start; }
+  /* A keyboard's WASD cluster: Q W E over A S D. */
+  #pad { position: fixed; right: 0.6em; bottom: 4em; display: grid; grid-template-columns: repeat(3, 3.4em); grid-template-rows: repeat(2, 3.4em); gap: 0.3em; }
+  #pad button { padding: 0; font-size: 1.15em; font-weight: 600; }
+  #pad button small { display: block; font-size: 0.55em; font-weight: 400; color: var(--dim); }
+  #scalebar { position: fixed; left: 0.6em; right: 12em; bottom: 4em; display: none; align-items: center; gap: 0.5em; padding: 0.4em 0.6em; border-radius: 8px; background: var(--panel); }
+  #scalebar input { flex: 1; }
+  .panel { position: fixed; left: 0.6em; right: 0.6em; top: 3.4em; bottom: 4em; display: none; flex-direction: column; gap: 0.4em; padding: 0.6em; border-radius: 10px; background: var(--panel); z-index: 5; }
+  .panel .list { flex: 1; overflow-y: auto; }
+  .panel .list div { padding: 0.55em 0.4em; border-bottom: 1px solid #2a3344; }
+  .panel .list div.head { color: var(--dim); font-size: 0.8em; text-transform: uppercase; border: 0; padding-top: 1em; }
+  .panel .row { display: flex; gap: 0.4em; align-items: center; flex-wrap: wrap; }
+  .panel .row input { width: 5em; }
+  #folders label { display: block; padding: 0.35em 0; }
+  /* The camera looks through the screen's exact center; W and S keep what is under it there. */
+  #reticle { position: fixed; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px; pointer-events: none; z-index: 2; }
+  #menu { position: fixed; top: 3.2em; left: 0.5em; display: none; flex-direction: column; gap: 0.3em; padding: 0.4em; border-radius: 10px; background: var(--panel); z-index: 6; }
+  #menu button { text-align: left; min-width: 9em; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<script>
+// Fail loudly: any uncaught error shows in the status line (red) and is written to layout.log.
+window.layoutError = function (text) {
+    const s = document.getElementById("status");
+    if (s) {
+        s.textContent = "Error: " + text;
+        s.style.background = "#8b1e1e";
+    }
+    fetch("/api/log", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: text, page: location.href }) }).catch(function () {});
+};
+window.addEventListener("error", function (e) {
+    window.layoutError(e.message + " (" + String(e.filename || "").split("/").pop() + ":" + e.lineno + ")");
+});
+window.addEventListener("unhandledrejection", function (e) {
+    window.layoutError(String(e.reason && e.reason.stack || e.reason).split("\n").slice(0, 3).join(" | "));
+});
+</script>
+
+<div id="top" class="bar">
+  <button id="menuBtn">☰</button>
+  <select id="sceneSelect"></select>
+  <button id="texturesBtn" class="on">Textures</button>
+  <button id="fullBtn">⛶</button>
+  <button id="reloadBtn" style="display:none" class="on">Reload</button>
+</div>
+<svg id="reticle" viewBox="0 0 22 22" aria-hidden="true"><g stroke="rgba(0,0,0,0.6)" stroke-width="3"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g><g stroke="#ffffff" stroke-width="1.2"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g></svg>
+<div id="status">Loading…</div>
+<div id="menu">
+  <button id="newBtn">New</button>
+  <button id="saveBtn">Save</button>
+  <button id="importBtn">Import area</button>
+  <button id="foldersBtn">Folders</button>
+</div>
+
+<div id="scalebar"><span>Scale</span><input id="scale" type="range" min="-2" max="2" step="0.01" value="0"><span id="scaleValue">×1.00</span></div>
+
+<div id="pad">
+  <button data-move="down">Q<small>down</small></button><button data-move="forward">W</button><button data-move="up">E<small>up</small></button>
+  <button data-move="left">A</button><button data-move="back">S</button><button data-move="right">D</button>
+</div>
+
+<div id="actions" class="bar">
+  <button id="addBtn">Add</button>
+  <button id="dropBtn">Drop</button>
+  <button id="cancelBtn">Cancel</button>
+  <button id="deleteBtn">Delete</button>
+  <button id="snapBtn">Snap</button>
+  <button id="labelsBtn">Labels</button>
+  <button id="undoBtn" title="Undo" aria-label="Undo"><svg viewBox="0 0 24 24" width="1.3em" height="1.3em" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg></button>
+  <button id="redoBtn" title="Redo" aria-label="Redo"><svg viewBox="0 0 24 24" width="1.3em" height="1.3em" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg></button>
+</div>
+
+<div id="palette" class="panel">
+  <div class="row"><input id="paletteFilter" placeholder="Filter pieces" style="flex:1; width:auto"><button id="paletteClose">Close</button></div>
+  <div id="paletteList" class="list"></div>
+</div>
+
+<div id="importPanel" class="panel">
+  <div class="row"><b>Import an area from a Unity scene</b><span style="flex:1"></span><button id="importClose">Close</button></div>
+  <div class="row">Scene <select id="unityScene"></select></div>
+  <div class="row">Center <input id="cx" placeholder="x"><input id="cy" placeholder="y"><input id="cz" placeholder="z"></div>
+  <div class="row">Half-size (m) <input id="half" value="20"></div>
+  <div class="row">Name <input id="areaName" placeholder="e.g. Rings" style="width:10em"></div>
+  <div class="row"><button id="extractBtn">Extract</button></div>
+  <div style="color: var(--dim); font-size: 0.85em">Imported areas are read-only copies of Unity. Compose in a scene of your own (New).</div>
+</div>
+
+<div id="folders" class="panel"></div>
+
+<script src="three.js"></script>
+<script src="space.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

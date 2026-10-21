@@ -1,0 +1,6 @@
+# Regenerated from the Canopy repo: guid index, piece library, converted meshes, imported areas.
+cache/
+areas/
+
+# Dev runner log.
+*.log
