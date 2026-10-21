@@ -11,6 +11,7 @@ const { execFileSync } = require('child_process');
 const U = require('./unity.js');
 const { assetToObj } = require('./asset-mesh.js');
 const FBX = require('./fbx.js');
+const Config = require('./config.js');
 const crypto = require('crypto');
 
 const ROOT = path.join(__dirname, '..');
@@ -21,9 +22,12 @@ const TEXTURES = path.join(CACHE, 'textures');
 const MATERIALS = path.join(CACHE, 'materials.json');
 const AREAS = path.join(ROOT, 'areas');
 const GIT = ['--git-dir=' + process.env.HOME + '/git-repos/Canopy.git'];
+// Blobs missing from Canopy's store are fetched into this throwaway store, read, and deleted,
+// so viewing never grows Canopy's git store (only layout's capped cache keeps anything).
+const FETCH_STORE = path.join(process.env.HOME, '.cache', 'layout-fetch.git');
 
 const round = (v, places) => { const r = +v.toFixed(places); return Object.is(r, -0) ? 0 : r; };
-const isTreeChunk = mesh => mesh && mesh.path && /\/Meshes\/Grid/.test(mesh.path);
+const CHUNK_BOUNDS = path.join(CACHE, 'chunk-bounds.json');
 
 // ---------- Piece lines ----------
 // "- Piece: Name | x y z | rx ry rz | scale | extra" -> { name, position, rotation, scale, extra }
@@ -72,30 +76,108 @@ function replacePieceLines(text, pieces) {
 }
 
 // ---------- imported areas ----------
+const isTreeChunk = (mesh, cfg) => Boolean(mesh && mesh.path && cfg.treeChunks.test(mesh.path));
+// A material's name (its file name), for material rules.
+let guidIndex = null;
+const materialName = guid => {
+  guidIndex = guidIndex || JSON.parse(fs.readFileSync(path.join(CACHE, 'guid-index.json'), 'utf8')).entries;
+  const e = guid && guidIndex[guid];
+  return e ? path.basename(e.path, '.mat') : '';
+};
+
+// Tree chunks (the trees cut into cubes; cfg.treeChunks) of any piece in the scene whose bounds
+// overlap the cube, as parts at cfg.treeLod. Bounds come from each chunk's lowest-detail mesh,
+// fetched once and cached. Returns [{ piece, parts, leaves }].
+function treeChunks(all, center, half, cfg) {
+  const TREE_LOD = cfg.treeLod;
+  const idx = JSON.parse(fs.readFileSync(path.join(CACHE, 'guid-index.json'), 'utf8')).entries;
+  const byPath = new Map(Object.values(idx).map(e => [e.path, e]));
+  const lod = (part, k) => byPath.get(part.mesh.path.replace(/_L\d+\.asset$/, `_L${k}.asset`));
+  const lowest = part => { for (let k = 9; k >= 0; k--) { const e = lod(part, k); if (e) return e; } return byPath.get(part.mesh.path); };
+  const holders = all.filter(p => p.prefab && p.prefab.parts.some(x => isTreeChunk(x.mesh, cfg)));
+  const bounds = fs.existsSync(CHUNK_BOUNDS) ? JSON.parse(fs.readFileSync(CHUNK_BOUNDS, 'utf8')) : {};
+  const need = new Set();
+  for (const p of holders) for (const part of p.prefab.parts) if (isTreeChunk(part.mesh, cfg)) { const e = lowest(part); if (e && !bounds[e.blob]) need.add(e.blob); }
+  for (const [blob, data] of blobs([...need])) {
+    const m = /m_LocalAABB:\s*m_Center: \{x: ([^,]+), y: ([^,]+), z: ([^}]+)\}\s*m_Extent: \{x: ([^,]+), y: ([^,]+), z: ([^}]+)\}/.exec(data.toString());
+    if (m) bounds[blob] = { c: [+m[1], +m[2], +m[3]], e: [+m[4], +m[5], +m[6]] };
+  }
+  if (need.size) { fs.mkdirSync(CACHE, { recursive: true }); fs.writeFileSync(CHUNK_BOUNDS, JSON.stringify(bounds)); }
+  const out = [];
+  for (const p of holders) {
+    const W = U.trs(p.pos, p.rot, p.scl);
+    const parts = [];
+    for (const part of Config.visibleParts(cfg, p.piece, p.prefab.parts, materialName)) {
+      if (!isTreeChunk(part.mesh, cfg)) continue;
+      const e = lowest(part), b = e && bounds[e.blob];
+      if (!b) continue;
+      const M = U.mul(W, part.m);
+      let overlaps = true;
+      for (let a = 0; a < 3; a++) {
+        // World extent along axis a of the chunk's local box.
+        const c = M[a * 4] * b.c[0] + M[a * 4 + 1] * b.c[1] + M[a * 4 + 2] * b.c[2] + M[a * 4 + 3];
+        const r = Math.abs(M[a * 4]) * b.e[0] + Math.abs(M[a * 4 + 1]) * b.e[1] + Math.abs(M[a * 4 + 2]) * b.e[2];
+        if (c + r < center[a] - half || c - r > center[a] + half) overlaps = false;
+      }
+      if (!overlaps) continue;
+      const shown = lod(part, TREE_LOD) || byPath.get(part.mesh.path);
+      parts.push({ ...part, mesh: { kind: 'asset', name: path.basename(shown.path, '.asset'), path: shown.path, blob: shown.blob } });
+    }
+    // The tree's other shown parts (its leaves: one mesh for the whole tree) come too, cut to
+    // the cube. Scenes save trees with leaves switched off; a show rule turns them on.
+    if (parts.length) {
+      let leaves = 0;
+      for (const part of Config.visibleParts(cfg, p.piece, p.prefab.parts, materialName)) {
+        if (!isTreeChunk(part.mesh, cfg) && part.mesh.kind === 'asset') {
+          parts.push({ ...part, clip: { world: W, center, half } });
+          leaves++;
+        }
+      }
+      out.push({ piece: p, parts, leaves });
+    }
+  }
+  return out;
+}
+
 function extractArea(scene, center, half) {
   const file = path.join(U.REPO, 'Assets', 'Scenes', scene + '.unity');
   if (!fs.existsSync(file)) throw new Error(`no scene ${scene}`);
   const inside = p => Math.abs(p.pos.x - center[0]) <= half && Math.abs(p.pos.y - center[1]) <= half && Math.abs(p.pos.z - center[2]) <= half;
-  const found = U.scenePieces(file).filter(p => inside(p) && !isTreeChunk(p.mesh)).sort((a, b) => a.path.localeCompare(b.path));
+  const cfg = Config.load(scene);
+  const all = U.scenePieces(file);
+  const found = all.filter(p => inside(p) && !isTreeChunk(p.mesh, cfg)).sort((a, b) => a.path.localeCompare(b.path));
+  const trees = treeChunks(all, center, half, cfg);
   // Plain-mesh pieces are named by their mesh; remember how they resolve.
   const lib = library();
-  for (const p of found) if (!p.prefab && !lib[p.piece]) lib[p.piece] = { kind: 'mesh', source: p.mesh.path || p.mesh.kind, parts: [{ mesh: p.mesh, m: U.I(), material: p.material || null, object: p.object }] };
+  const meshPart = p => ({ mesh: p.mesh, m: U.I(), material: p.material || null, object: p.object, prefab: '', off: Boolean(p.meshOff) });
+  for (const p of found) if (!p.prefab && !lib[p.piece]) lib[p.piece] = { kind: 'mesh', source: p.mesh.path || p.mesh.kind, parts: [meshPart(p)] };
   writeLibrary(lib);
-  return {
-    source: { scene, center, half },
-    pieces: found.map(p => {
-      const e = U.quatToEuler(p.rot);
-      return {
-        name: p.piece, path: p.path,
-        // An instance that changes objects inside its prefab carries its own parts.
-        ...(p.overridden && p.prefab ? { parts: p.prefab.parts } : {}),
-        position: [p.pos.x, p.pos.y, p.pos.z].map(v => round(v, 3)),
-        rotation: [e.x, e.y, e.z].map(v => round(v, 2) % 360),
-        scale: [p.scl.x, p.scl.y, p.scl.z].map(v => round(v, 3)),
-        extra: [p.textId ? `textId ${p.textId}` : '', p.active ? '' : 'inactive'].filter(Boolean).join(', ')
-      };
-    })
+  const place = (p, parts, extra) => {
+    const e = U.quatToEuler(p.rot);
+    return {
+      name: p.piece, path: p.path,
+      // A piece with its own parts also carries where it comes from (for the folder filter),
+      // so the viewer never resolves (and fetches) the whole prefab.
+      ...(parts ? { parts, source: p.prefab ? p.prefab.path : (p.mesh && p.mesh.path) || '' } : {}),
+      position: [p.pos.x, p.pos.y, p.pos.z].map(v => round(v, 3)),
+      rotation: [e.x, e.y, e.z].map(v => round(v, 2) % 360),
+      scale: [p.scl.x, p.scl.y, p.scl.z].map(v => round(v, 3)),
+      extra: [p.textId ? `textId ${p.textId}` : '', p.active ? '' : 'inactive', extra || ''].filter(Boolean).join(', ')
+    };
   };
+  // Every imported piece carries its own parts, filtered by the scene's show and hide rules
+  // (unity.json). A piece whose parts are all switched off or hidden is left out; one with no
+  // meshes at all stays, as a labeled box. A tree brings only its overlapping chunks.
+  const pieces = [];
+  for (const p of found) {
+    if (trees.some(t => t.piece === p)) continue;
+    const parts = p.prefab ? p.prefab.parts : [meshPart(p)];
+    const shown = Config.visibleParts(cfg, p.piece, parts, materialName);
+    if (parts.length && !shown.length) continue;
+    pieces.push(place(p, shown));
+  }
+  for (const t of trees) pieces.push(place(t.piece, t.parts, `tree chunks L${cfg.treeLod}: ${t.parts.length - t.leaves}${t.leaves ? ', leaves' : ''}`));
+  return { source: { scene, center, half, config: Config.mtime() }, pieces };
 }
 function saveArea(name, area) {
   fs.mkdirSync(AREAS, { recursive: true });
@@ -109,37 +191,56 @@ function writeLibrary(lib) {
   fs.writeFileSync(LIBRARY, JSON.stringify(lib));
 }
 const git = (args, input, env) => execFileSync('git', GIT.concat(args), { input, maxBuffer: 1 << 30, env: { ...process.env, ...env } });
-// Blob contents (Buffers) by id, fetching any missing ones from origin in one request.
-function blobs(ids) {
-  if (!ids.length) return new Map();
-  const missing = git(['cat-file', '--batch-check'], ids.join('\n') + '\n', { GIT_NO_LAZY_FETCH: '1' })
-    .toString().split('\n').filter(l => l.endsWith(' missing')).map(l => l.split(' ')[0]);
-  if (missing.length) {
-    git(['-c', 'fetch.negotiationAlgorithm=noop', 'fetch', 'origin', '--no-tags', '--no-write-fetch-head',
-      '--recurse-submodules=no', '--filter=blob:none', '--stdin'], missing.join('\n') + '\n');
-  }
-  const out = git(['cat-file', '--batch'], ids.join('\n') + '\n');
-  const text = new Map();
+// cat-file --batch output -> Map(id -> Buffer)
+function readBatch(out, into) {
   for (let i = 0; i < out.length;) {
     const nl = out.indexOf(10, i);
-    const [oid, , size] = out.slice(i, nl).toString().split(' ');
-    text.set(oid, out.subarray(nl + 1, nl + 1 + +size));
+    const [oid, type, size] = out.slice(i, nl).toString().split(' ');
+    if (type === 'missing') { i = nl + 1; continue; }
+    into.set(oid, out.subarray(nl + 1, nl + 1 + +size));
     i = nl + 1 + +size + 1;
   }
-  return text;
+  return into;
+}
+// Blob contents (Buffers) by id: from Canopy's store when there, else fetched from origin in
+// one request into the throwaway store, which is deleted afterwards.
+function blobs(ids) {
+  if (!ids.length) return new Map();
+  const noFetch = { GIT_NO_LAZY_FETCH: '1' };
+  const missing = git(['cat-file', '--batch-check'], ids.join('\n') + '\n', noFetch)
+    .toString().split('\n').filter(l => l.endsWith(' missing')).map(l => l.split(' ')[0]);
+  const present = ids.filter(id => !missing.includes(id));
+  const out = readBatch(present.length ? git(['cat-file', '--batch'], present.join('\n') + '\n', noFetch) : Buffer.alloc(0), new Map());
+  if (missing.length) {
+    const url = git(['config', '--get', 'remote.origin.url']).toString().trim();
+    const tmp = ['--git-dir=' + FETCH_STORE];
+    const run = (args, input) => execFileSync('git', tmp.concat(args), { input, maxBuffer: 1 << 30 });
+    fs.rmSync(FETCH_STORE, { recursive: true, force: true });
+    execFileSync('git', ['init', '-q', '--bare', FETCH_STORE]);
+    try {
+      for (const [k, v] of [['core.repositoryformatversion', '1'], ['extensions.partialClone', 'origin'], ['remote.origin.url', url], ['remote.origin.promisor', 'true'], ['remote.origin.partialclonefilter', 'blob:none']]) run(['config', k, v]);
+      run(['-c', 'fetch.negotiationAlgorithm=noop', 'fetch', 'origin', '--no-tags', '--no-write-fetch-head',
+        '--recurse-submodules=no', '--filter=blob:none', '--stdin'], missing.join('\n') + '\n');
+      readBatch(execFileSync('git', tmp.concat(['cat-file', '--batch']), { input: missing.join('\n') + '\n', maxBuffer: 1 << 30, env: { ...process.env, ...noFetch } }), out);
+    } finally {
+      fs.rmSync(FETCH_STORE, { recursive: true, force: true });
+    }
+  }
+  return out;
 }
 // Library entries for these piece names: prefabs are re-read each time (so edits show), their
 // .asset meshes fetched and converted once per blob. part.obj is the mesh URL, or null.
 // extraParts (pieces' own parts, from instances with inner overrides) get meshes too.
 function prepare(names, extraParts = []) {
   const lib = library();
+  const cfg = Config.load(null); // composed scenes use the defaults
   const out = {}, problems = [];
   for (const name of new Set(names)) {
     if (!(lib[name] && lib[name].kind === 'mesh')) {
       const p = U.prefabByName(name);
       if (p) lib[name] = { kind: 'prefab', source: p.path, parts: p.parts };
     }
-    if (lib[name]) out[name] = lib[name];
+    if (lib[name]) out[name] = { ...lib[name], parts: Config.visibleParts(cfg, name, lib[name].parts, materialName) };
   }
   const allParts = [...Object.values(out).flatMap(e => e.parts), ...extraParts];
   const wanted = new Map();
@@ -180,12 +281,37 @@ function prepare(names, extraParts = []) {
     }
     part.obj = part.mesh.kind === 'asset' && fs.existsSync(path.join(MESHES, part.mesh.blob + '.obj')) ? `meshes/${part.mesh.blob}.obj` : null;
   }
+  // Parts cut to an area's cube (a tree's leaves): keep the triangles whose center is inside.
+  for (const part of allParts) {
+    if (!part.clip || !part.obj) continue;
+    const key = crypto.createHash('sha1').update(JSON.stringify([part.mesh.blob, part.m, part.clip])).digest('hex').slice(0, 8);
+    const file = path.join(MESHES, `${part.mesh.blob}-${key}.obj`);
+    if (!fs.existsSync(file)) fs.writeFileSync(file, clipObj(fs.readFileSync(path.join(ROOT, 'cache', part.obj), 'utf8'), U.mul(part.clip.world, part.m), part.clip.center, part.clip.half));
+    part.obj = `meshes/${part.mesh.blob}-${key}.obj`;
+  }
   writeLibrary(lib);
-  const materials = prepareMaterials(allParts.map(p => p.material).filter(Boolean), problems);
+  const materials = prepareMaterials(allParts.map(p => p.material).filter(Boolean), problems, cfg.maxTexture);
   return { library: out, materials, problems };
 }
 
 // ---------- materials and textures ----------
+const BUILTIN_SHADERS = '0000000000000000f000000000000000';
+const SHADERS = path.join(CACHE, 'shaders.json');
+// What a custom shader does with alpha, read from its source once and cached by guid.
+function shaderFlags(shaders, idx) {
+  const cache = fs.existsSync(SHADERS) ? JSON.parse(fs.readFileSync(SHADERS, 'utf8')) : {};
+  const want = [...new Set(shaders.map(s => s.guid))].filter(g => !cache[g] && idx[g] && /\.shader$/.test(idx[g].path));
+  const texts = blobs(want.map(g => idx[g].blob));
+  for (const g of want) {
+    const src = (texts.get(idx[g].blob) || '').toString();
+    cache[g] = {
+      cutout: /\bclip\s*\(|"Queue"\s*=\s*"AlphaTest/.test(src),
+      transparent: /"Queue"\s*=\s*"Transparent|\bBlend\s+SrcAlpha\s+OneMinusSrcAlpha/.test(src)
+    };
+  }
+  if (want.length) fs.writeFileSync(SHADERS, JSON.stringify(cache));
+  return cache;
+}
 const index = () => JSON.parse(fs.readFileSync(path.join(CACHE, 'guid-index.json'), 'utf8')).entries;
 // Reads what the viewer needs from a .mat: base color, color texture, normal map, and (for
 // Canopy/General) the detail texture, each texture with its tiling and offset.
@@ -204,7 +330,19 @@ function parseMaterial(text) {
     return m ? +m[1] : null;
   };
   const general = /- _Tint: /.test(text); // Canopy/General: base * detail * tint * brightness
+  // See-through only as Unity would draw it: Standard Fade/Transparent mode, a URP transparent
+  // surface, blend keywords, or a transparent render queue. Otherwise color alpha is ignored.
+  const queue = +((/m_CustomRenderQueue: (-?\d+)/.exec(text) || [])[1] ?? -1);
+  const transparent = [2, 3].includes(float('_Mode')) || float('_Surface') === 1 || queue >= 3000
+    || /_ALPHABLEND_ON|_ALPHAPREMULTIPLY_ON|_SURFACE_TYPE_TRANSPARENT/.test(text);
+  const shader = (/m_Shader: \{fileID: (-?\d+), guid: ([0-9a-f]+)/.exec(text) || []).slice(1);
   return {
+    shader: shader.length ? { fileID: shader[0], guid: shader[1] } : null,
+    // Cutout (alpha test): Standard Cutout mode, URP alpha clip, or the keyword. Custom shaders
+    // are checked in their source (see shaderFlags).
+    cutout: float('_Mode') === 1 || float('_AlphaClip') === 1 || /_ALPHATEST_ON/.test(text),
+    cutoff: float('_Cutoff') ?? 0.5,
+    transparent,
     name: (/m_Name: (.*)/.exec(text) || [])[1] || '',
     color: (general ? color('_Tint') : null) || color('_BaseColor') || color('_Color') || [1, 1, 1, 1],
     brightness: general ? (float('_Brightness') ?? 1) : 1,
@@ -214,10 +352,9 @@ function parseMaterial(text) {
     detail: general ? tex('_DetailTex') : null
   };
 }
-// Stores a texture at most MAX_TEXTURE px on a side, as PNG (JPG stays JPG), using ImageMagick.
+// Stores a texture at most MAX_TEXTURE px (unity.json maxTexture) on a side, as PNG (JPG stays JPG), using ImageMagick.
 // TIF and PSD extra channels become alpha, as Unity reads them. Returns false if it can't.
-const MAX_TEXTURE = 1024;
-function storeTexture(data, ext, dest) {
+function storeTexture(data, ext, dest, MAX_TEXTURE) {
   const fmt = { jpg: 'jpg', jpeg: 'jpg', tif: 'tiff', tiff: 'tiff', psd: 'psd', tga: 'tga', png: 'png' }[ext];
   const run = extra => execFileSync('magick', [`${fmt}:-[0]`, ...extra, '-resize', `${MAX_TEXTURE}x${MAX_TEXTURE}>`, '-depth', '8', dest], { input: data, stdio: ['pipe', 'ignore', 'pipe'] });
   try {
@@ -244,8 +381,8 @@ function workingTreeTextures() {
   return out;
 }
 // Material descriptions by guid, with texture URLs (textures/<key>.png or .jpg). Textures are
-// fetched, capped at MAX_TEXTURE px, and stored once per source.
-function prepareMaterials(guids, problems) {
+// fetched, capped at unity.json maxTexture px, and stored once per source and cap.
+function prepareMaterials(guids, problems, maxTexture) {
   const cache = fs.existsSync(MATERIALS) ? JSON.parse(fs.readFileSync(MATERIALS, 'utf8')) : {};
   const idx = index();
   // A material checked out in the Canopy working tree may have uncommitted edits: read it fresh.
@@ -261,6 +398,14 @@ function prepareMaterials(guids, problems) {
     }
     cache[g] = parseMaterial(mats.get(matBlobs[i]).toString());
   });
+  // Custom shaders: whether they cut out (clip()/AlphaTest queue) or blend (Transparent queue).
+  const flags = shaderFlags([...new Set(guids)].map(g => cache[g] && cache[g].shader).filter(s => s && s.guid !== BUILTIN_SHADERS), idx);
+  for (const g of new Set(guids)) {
+    const d = cache[g], f = d && d.shader && flags[d.shader.guid];
+    if (!f) continue;
+    if (f.cutout) d.cutout = true;
+    if (f.transparent) d.transparent = true;
+  }
   // Textures for every material asked for: from the working tree if changed there, else git.
   const local = workingTreeTextures();
   const fromGit = new Map(); // blob -> { ext, file, path }
@@ -274,11 +419,11 @@ function prepareMaterials(guids, problems) {
     const ext = source && ((/\.(png|jpe?g|tga|tiff?|psd)$/i.exec(source) || [])[1] || '').toLowerCase();
     if (!ext) continue;
     const key = file ? 'wt' + crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex').slice(0, 38) : idx[t.guid].blob;
-    const name = `${key}.${/^jpe?g$/.test(ext) ? 'jpg' : 'png'}`;
+    const name = `${key}-${maxTexture}.${/^jpe?g$/.test(ext) ? 'jpg' : 'png'}`;
     if (!fs.existsSync(path.join(TEXTURES, name))) {
       if (file) {
         try {
-          storeTexture(fs.readFileSync(file), ext, path.join(TEXTURES, name));
+          storeTexture(fs.readFileSync(file), ext, path.join(TEXTURES, name), maxTexture);
         } catch (error) {
           problems.push(`${file}: ${error.message.split('\n')[0]}`);
           continue;
@@ -292,7 +437,7 @@ function prepareMaterials(guids, problems) {
   for (const [blob, data] of blobs([...fromGit.keys()])) {
     const t = fromGit.get(blob);
     try {
-      storeTexture(data, t.ext, path.join(TEXTURES, t.name));
+      storeTexture(data, t.ext, path.join(TEXTURES, t.name), maxTexture);
     } catch (error) {
       problems.push(`${t.path}: ${error.message.split('\n')[0]}`);
     }
@@ -305,6 +450,20 @@ function prepareMaterials(guids, problems) {
   const out = {};
   for (const g of new Set(guids)) out[g] = cache[g];
   return out;
+}
+
+// The triangles of an OBJ (cache convention: X negated from Unity) whose center, placed by
+// the row-major Unity matrix M, lies inside the cube.
+function clipObj(text, M, center, half) {
+  const lines = text.split('\n');
+  const v = [];
+  for (const l of lines) if (l.startsWith('v ')) v.push(l.split(/\s+/).slice(1).map(Number));
+  const inside = ids => {
+    const c = [0, 1, 2].map(a => ids.reduce((s, i) => s + v[i][a], 0) / ids.length);
+    const u = [-c[0], c[1], c[2]];
+    return [0, 1, 2].every(r => Math.abs(M[r * 4] * u[0] + M[r * 4 + 1] * u[1] + M[r * 4 + 2] * u[2] + M[r * 4 + 3] - center[r]) <= half);
+  };
+  return lines.filter(l => !l.startsWith('f ') || inside(l.split(/\s+/).slice(1).map(t => +t.split('/')[0] - 1))).join('\n');
 }
 
 module.exports = { ROOT, AREAS, MESHES, TEXTURES, parseMaterial, parsePieceLines, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };

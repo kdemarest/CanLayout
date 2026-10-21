@@ -1,0 +1,13 @@
+{
+  "defaults": {
+    "treeLod": 0,
+    "treeChunks": "Meshes/Grid*",
+    "maxTexture": 1024,
+    "show": [
+      "mesh:ForestTreeLeaves*"
+    ],
+    "hide": []
+  },
+  "scenes": {
+  }
+}

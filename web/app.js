@@ -210,8 +210,10 @@
         let c = d.color.slice(0, 3).map(v => v * (d.brightness || 1));
         const top = Math.max(...c);
         if (top > 1) c = c.map(v => v / top);
-        const opacity = faint ? 0.35 : Math.min(1, d.color[3]);
+        const opacity = faint ? 0.35 : d.transparent ? Math.min(1, d.color[3]) : 1;
         const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(...c), roughness: 0.85, metalness: 0, side: THREE.DoubleSide, transparent: opacity < 1, opacity });
+        // Cutout materials (e.g. leaves) drop pixels whose texture alpha is under the cutoff.
+        if (d.cutout) m.alphaTest = d.cutoff;
         texture(d.map, true).then(t => {
             if (t) {
                 m.map = t;
@@ -252,7 +254,7 @@
         group.matrixAutoUpdate = false;
         group.matrix.copy(Space.pieceMatrix(THREE, piece));
         const entry = state.library[piece.name];
-        group.userData.folder = folderOf(entry);
+        group.userData.folder = folderOf(entry || (piece.source ? { source: piece.source } : null));
         group.visible = !state.hiddenFolders.has(group.userData.folder);
         const faint = /\binactive\b/.test(piece.extra || "");
         const parts = piece.parts || (entry ? entry.parts : []); // an imported instance may carry its own
@@ -310,7 +312,8 @@
         if (!state.labels) return;
         for (const o of state.objects) {
             const name = o.userData.pieceName;
-            if (!name || !state.library[name]) continue; // placeholders are labeled already
+            const piece = state.pieces[state.objects.indexOf(o)];
+            if (!name || (!state.library[name] && !(piece && piece.parts))) continue; // placeholders are labeled already
             if (!labelTextures.has(name)) labelTextures.set(name, labelTexture(name, "#cfe8ff"));
             const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: labelTextures.get(name), depthTest: false, sizeAttenuation: false }));
             s.scale.set(0.16, 0.03, 1);

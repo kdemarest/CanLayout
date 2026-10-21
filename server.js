@@ -5,6 +5,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const S = require('./tools/scene.js');
+const Config = require('./tools/config.js');
 
 const PORT = +process.env.PORT || 8080;
 const DEV = path.join(__dirname, '..');
@@ -54,7 +55,13 @@ const api = {
     const name = safeName(q.get('name'));
     let pieces, editable;
     if (q.get('kind') === 'area') {
-      pieces = JSON.parse(fs.readFileSync(path.join(S.AREAS, name + '.json'), 'utf8')).pieces;
+      let area = JSON.parse(fs.readFileSync(path.join(S.AREAS, name + '.json'), 'utf8'));
+      // Re-import when unity.json changed since (its show/hide rules shape the area).
+      if (area.source.config !== Config.mtime()) {
+        area = S.extractArea(area.source.scene, area.source.center, area.source.half);
+        S.saveArea(name, area);
+      }
+      pieces = area.pieces;
       editable = false;
     } else {
       const parsed = S.parsePieceLines(fs.readFileSync(path.join(SCENES, name + '.md'), 'utf8'));
@@ -62,7 +69,8 @@ const api = {
       pieces = parsed.pieces;
       editable = true;
     }
-    const { library, materials, problems } = S.prepare(pieces.map(p => p.name), pieces.flatMap(p => p.parts || []));
+    // Pieces with their own parts (trees, overridden instances) are not resolved as whole prefabs.
+    const { library, materials, problems } = S.prepare(pieces.filter(p => !p.parts).map(p => p.name), pieces.flatMap(p => p.parts || []));
     return { name, editable, pieces, library, materials, problems };
   },
   'POST /api/prepare': body => S.prepare(body.names || []),
@@ -130,7 +138,7 @@ http.createServer((req, res) => {
   if (url.pathname === '/') return serveFile(res, path.join(WEB, 'index.html'));
   const mesh = /^\/meshes\/([0-9a-f]{40}(?:-[0-9a-f]{8})?\.obj)$/.exec(url.pathname);
   if (mesh) return serveFile(res, path.join(S.MESHES, mesh[1]));
-  const texture = /^\/textures\/((?:wt)?[0-9a-f]{38,40}\.(png|jpg))$/.exec(url.pathname);
+  const texture = /^\/textures\/((?:wt)?[0-9a-f]{38,40}-\d+\.(png|jpg))$/.exec(url.pathname);
   if (texture) return serveFile(res, path.join(S.TEXTURES, texture[1]));
   const web = /^\/([\w.-]+)$/.exec(url.pathname);
   if (web) return serveFile(res, path.join(WEB, web[1]));

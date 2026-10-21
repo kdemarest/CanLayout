@@ -122,8 +122,7 @@ function parse(text) {
       inst[x.id] = { src: src && src.guid, parent: ref(x.body, 'm_TransformParent'), mods: modifications(x.body) };
     }
   }
-  for (const g of Object.keys(mesh)) if (!shown[g]) delete mesh[g];
-  return { t, go, mesh, inst, strippedT, strippedGo, textId, material };
+  return { t, go, mesh, inst, strippedT, strippedGo, textId, material, shown };
 }
 
 // ---------- repository lookups ----------
@@ -145,7 +144,8 @@ function describeMesh(r) {
 }
 const isLodBeyondZero = name => /[_ ]?lod[1-9]\d*$/i.test(name);
 // LOD index from a name ending in LODn, else -1.
-const lodIndex = name => { const m = /[_ ]?lod(\d+)$/i.exec(name || ''); return m ? +m[1] : -1; };
+// Matches Lod2, _LOD2, L2 and _L2 (the tree grid chunks use L0..L5).
+const lodIndex = name => { const m = /(?:^|[_ ])l(?:od)?(\d+)$/i.exec(name || ''); return m ? +m[1] : -1; };
 // Unity's id for an object inside a prefab instance, as written in the file that holds the
 // instance: (instance id XOR the object's id in its source prefab), as 63 bits.
 const MASK = (1n << 63n) - 1n;
@@ -154,7 +154,10 @@ const xorId = (a, b) => ((BigInt(a) ^ BigInt(b)) & MASK).toString();
 // ---------- prefabs ----------
 const prefabCache = new Map();
 // Flattens a prefab (by guid) to { name, path, rootId, rootGoId, rootTrs, parts }, where each
-// part is { mesh, m } with m relative to the prefab root (the root's own transform excluded).
+// part is { mesh, m, material, object, prefab, off } with m relative to the prefab root (the
+// root's own transform excluded); prefab is the prefab whose file holds the object, and off
+// marks objects switched off (inactive, or no enabled renderer), which callers drop unless a
+// show rule names them (tools/config.js).
 // Nested prefabs and variants are followed. overrides (fileID -> { pos, rot, scl, active })
 // changes objects in this prefab, as a prefab instance's modifications do, including objects
 // inside its nested prefabs (their ids are XOR-combined; see xorId). Inactive objects are
@@ -166,7 +169,8 @@ function prefab(guid, depth = 0, overrides = null) {
   const file = path.join(REPO, e.path);
   if (!fs.existsSync(file)) return null;
   const f = parse(fs.readFileSync(file, 'utf8'));
-  const result = { name: path.basename(e.path, '.prefab'), path: e.path, ...graph(f, depth, overrides) };
+  const name = path.basename(e.path, '.prefab');
+  const result = { name, path: e.path, ...graph(f, depth, overrides, name) };
   if (!overrides) prefabCache.set(guid, result);
   return result;
 }
@@ -184,7 +188,7 @@ function nodes(f, depth, overrides = null) {
       kind: 't', father: alias(t.father),
       pos: o ? { ...t.pos, ...o.pos } : t.pos, rot: o ? { ...t.rot, ...o.rot } : t.rot, scl: o ? { ...t.scl, ...o.scl } : t.scl,
       name: g.name, active: ga === undefined ? g.active : ga, go: t.go,
-      mesh: f.mesh[t.go] || null, material: f.material[t.go] || null, textId: f.textId[t.go] || null
+      mesh: f.mesh[t.go] || null, meshOff: !f.shown[t.go], material: f.material[t.go] || null, textId: f.textId[t.go] || null
     };
   }
   for (const [id, x] of Object.entries(f.inst)) {
@@ -228,12 +232,12 @@ function nodes(f, depth, overrides = null) {
     if (overridden) sub = prefab(x.src, depth + 1, inner);
     // Components added to the instance's stripped root game object (e.g. a MeshFilter).
     const addedGo = Object.keys(f.strippedGo).find(g => f.strippedGo[g] === id);
-    n['pi' + id] = { kind: 'pi', father: alias(x.parent), pos, rot, scl, name, active, sub, overridden, mesh: addedGo ? f.mesh[addedGo] || null : null, material: addedGo ? f.material[addedGo] || null : null, textId };
+    n['pi' + id] = { kind: 'pi', father: alias(x.parent), pos, rot, scl, name, active, sub, overridden, mesh: addedGo ? f.mesh[addedGo] || null : null, meshOff: addedGo ? !f.shown[addedGo] : false, material: addedGo ? f.material[addedGo] || null : null, textId };
   }
   return n;
 }
 
-function graph(f, depth, overrides = null) {
+function graph(f, depth, overrides = null, prefabName = '') {
   const n = nodes(f, depth, overrides);
   const children = {};
   let root = null;
@@ -244,21 +248,21 @@ function graph(f, depth, overrides = null) {
   if (!root) return { rootId: null, rootGoId: null, rootTrs: { pos: { x: 0, y: 0, z: 0 }, rot: { x: 0, y: 0, z: 0, w: 1 }, scl: { x: 1, y: 1, z: 1 } }, parts: [] };
   const parts = [];
   const lods = []; // [part, parent id, group name, lod index] for this file's own meshes
-  const visit = (id, m) => {
+  const visit = (id, m, parentOff) => {
     const x = n[id];
-    if (!x.active) return;
+    const off = parentOff || !x.active;
     if (x.mesh) {
       const mesh = describeMesh(x.mesh);
-      const part = { mesh, m, material: x.material, object: x.name };
+      const part = { mesh, m, material: x.material, object: x.name, prefab: prefabName, off: off || x.meshOff };
       // LODs are named on the object (Lod0, ring_LOD1) or on the mesh (Rock_Lod2).
       const lod = lodIndex(x.name) >= 0 ? lodIndex(x.name) : lodIndex(mesh.name);
-      if (lod >= 0) lods.push([part, x.father, (x.name || '').replace(/[_ ]?lod\d+$/i, ''), lod]);
+      if (lod >= 0) lods.push([part, x.father, (x.name || '').replace(/(?:^|[_ ])l(?:od)?\d+$/i, ''), lod]);
       parts.push(part);
     }
-    if (x.kind === 'pi' && x.sub) for (const p of x.sub.parts) parts.push({ mesh: p.mesh, m: mul(m, p.m), material: p.material, object: p.object });
-    for (const c of children[id] || []) visit(c, mul(m, trs(n[c].pos, n[c].rot, n[c].scl)));
+    if (x.kind === 'pi' && x.sub) for (const p of x.sub.parts) parts.push({ ...p, m: mul(m, p.m), off: off || p.off });
+    for (const c of children[id] || []) visit(c, mul(m, trs(n[c].pos, n[c].rot, n[c].scl)), off);
   };
-  visit(root, I());
+  visit(root, I(), false);
   // Of sibling LODs keep the most detailed present (a prefab may hold only its Lod3).
   const best = {};
   for (const [, parent, group, lod] of lods) best[parent + '|' + group] = Math.min(best[parent + '|' + group] ?? Infinity, lod);
@@ -308,7 +312,7 @@ function scenePieces(sceneFile) {
     else {
       const mesh = describeMesh(x.mesh);
       if (isLodBeyondZero(mesh.name)) continue;
-      out.push({ piece: mesh.name, mesh, material: x.material, object: x.name, ...w, textId: x.textId });
+      out.push({ piece: mesh.name, mesh, material: x.material, object: x.name, meshOff: x.meshOff, ...w, textId: x.textId });
     }
   }
   return out;
