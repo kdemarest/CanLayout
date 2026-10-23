@@ -85,6 +85,7 @@ function instance(parentT, order, x) {
   if (x.scale) ['x', 'y', 'z'].forEach((k, i) => mod(x.rootT, `m_LocalScale.${k}`, n6(x.scale[i])));
   mod(x.rootGo, 'm_Name', x.name);
   if (x.material) mod(MODEL.renderer, 'm_Materials.Array.data[0]', '', `{fileID: 2100000, guid: ${x.material}, type: 2}`);
+  const removed = (x.remove || []).map(r => `\n    - {fileID: ${r}, guid: ${x.guid}, type: 3}`).join('');
   return {
     stripped,
     yaml: `--- !u!1001 &${id}
@@ -95,7 +96,7 @@ PrefabInstance:
     m_TransformParent: {fileID: ${parentT}}
     m_Modifications:
 ${mods.join('\n')}
-    m_RemovedComponents: []
+    m_RemovedComponents:${removed || ' []'}
   m_SourcePrefab: {fileID: 100100000, guid: ${x.guid}, type: 3}
 --- !u!4 &${stripped} stripped
 Transform:
@@ -141,6 +142,25 @@ Transform:
   m_RootOrder: 0
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 ${nested.map(x => x.yaml).join('')}`;
+}
+
+// "bare": the ids, as seen from an instance of this prefab, of every component that acts rather
+// than shows (scripts, rigidbodies, colliders, audio), in it and in the prefabs nested in it.
+const ACTS = new Set([114, 54, 135, 65, 64, 136, 82]); // MonoBehaviour, Rigidbody, colliders, AudioSource
+function actingComponents(guid, depth = 0) {
+  const e = index[guid];
+  if (!e || depth > 8 || !fs.existsSync(path.join(U.REPO, e.path))) return [];
+  const text = fs.readFileSync(path.join(U.REPO, e.path), 'utf8');
+  const out = [];
+  for (const m of text.matchAll(/^--- !u!(\d+) &(-?\d+)( stripped)?[^\n]*\n([\s\S]*?)(?=^--- |(?![\s\S]))/gm)) {
+    if (m[3]) continue;
+    if (ACTS.has(+m[1])) out.push(m[2]);
+    else if (m[1] === '1001') {
+      const src = /m_SourcePrefab: \{fileID: \d+, guid: ([0-9a-f]+)/.exec(m[4]);
+      if (src) for (const inner of actingComponents(src[1], depth + 1)) out.push(xorId(m[2], inner));
+    }
+  }
+  return out;
 }
 
 // The project's own prefab with this name, outside Assets/Placeholder, or a model file named
@@ -215,7 +235,9 @@ function plan() {
       else if (!target.rootT || !target.rootGo) notes.push(`${name}: can't nest ${s.name}; its root is itself a prefab instance`);
       else {
         if (s.color) notes.push(`${name}: recolor ${s.name} by hand (${s.color}); nested prefabs keep their materials`);
-        children.push({ ...target, at: s.at, turn: s.turn, scale: s.scale });
+        const remove = s.bare ? actingComponents(target.guid) : [];
+        if (s.bare) notes.push(`${name}: ${s.name} bare, ${remove.length} components removed`);
+        children.push({ ...target, at: s.at, turn: s.turn, scale: s.scale, remove });
       }
     }
     const file = `${DIR}/${unity}.prefab`;

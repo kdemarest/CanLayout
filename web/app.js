@@ -495,12 +495,19 @@
             object,
             rel: camera.matrixWorld.clone().invert().multiply(object.matrix),
             factor: 1,
+            base: index >= 0 ? uniformScale(state.pieces[index].scale) : 1, // its size when picked up, x base size
             original: object.matrix.clone(),
             extra: index >= 0 ? state.pieces[index].extra || "" : "" // settings, e.g. a tablet's text id
         };
-        $("scale").value = 0;
-        $("scaleValue").textContent = "×1.00";
+        showScale(state.carried.base);
         updateUi();
+    }
+    // The scale slider sets a piece's size as a multiple of its base size (scale 1), from x0.25
+    // to x49 on a doubling (exponential) scale.
+    const uniformScale = s => (s ? Math.cbrt(Math.abs(s[0] * s[1] * s[2])) || 1 : 1);
+    function showScale(size) {
+        $("scale").value = Math.log2(size);
+        $("scaleValue").textContent = `×${size < 10 ? size.toFixed(2) : size.toFixed(1)}`;
     }
     // Tablets, signs and notes take a text id (from the game's English.txt).
     const takesText = c => Boolean(c && (state.library[c.object.userData.pieceName] || {}).takesText);
@@ -797,23 +804,25 @@
         const list = $("paletteList");
         list.innerHTML = "";
         if (state.carried) return renderTexts(filter, list);
-        // mark(name): text shown after each name.
-        const section = (title, names, mark = () => "") => {
-            const shown = names.filter(match).slice(0, 300);
+        // mark(name): text shown after each name. Items are piece names, or { label, piece }.
+        const section = (title, items, mark = () => "") => {
+            const all = items.map(x => (typeof x === "string" ? { label: x, piece: x } : x)).filter(x => match(x.label));
             const head = document.createElement("div");
             head.className = "head";
-            head.textContent = `${title} (${names.filter(match).length})`;
+            head.textContent = `${title} (${all.length})`;
             list.appendChild(head);
-            for (const n of shown) {
+            for (const x of all.slice(0, 300)) {
                 const row = document.createElement("div");
-                row.textContent = n + mark(n);
-                row.addEventListener("click", () => addPiece(n).catch(fail));
+                row.textContent = x.label + mark(x.label);
+                row.addEventListener("click", () => addPiece(x.piece).catch(fail));
                 list.appendChild(row);
             }
         };
         // ◇: a placeholder shape (docs Shape lines); ▢: nothing yet, a labeled box.
         const shaped = new Set(palette.shaped);
         section("New assets (docs) ◇ shape, ▢ box", palette.newAssets, n => (shaped.has(n) ? " ◇" : " ▢"));
+        // Reuses by docs name ("Tablet → RuinTablet"); placed as the prefab itself.
+        section("Reused (docs)", (palette.reuses || []).map(r => ({ label: `${r.name} → ${r.prefab}`, piece: r.prefab })));
         section("Unity prefabs", palette.prefabs);
     }
     // Text ids by English.txt section, each with its first line; a typed id not there can be used too.
@@ -885,9 +894,9 @@
         restore(state.redo.pop());
     };
     $("scale").oninput = () => {
-        const factor = Math.pow(2, +$("scale").value);
-        $("scaleValue").textContent = `×${factor.toFixed(2)}`;
-        if (state.carried) state.carried.factor = factor;
+        const size = Math.pow(2, +$("scale").value);
+        showScale(size);
+        if (state.carried) state.carried.factor = size / state.carried.base;
     };
     $("saveBtn").onclick = async () => {
         try {

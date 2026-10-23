@@ -11,7 +11,8 @@
 // f times the base (a snub nose); "scale x y z" stretches it; "arc degrees" keeps a wedge of a
 // hemisphere.
 // "use <Name>" draws another asset's shapes, or a Unity prefab, e.g. "use Wood boards at 0 1 0";
-// with "color" every part of it takes that color.
+// with "color" every part of it takes that color; "bare" (Unity prefabs) keeps only its look:
+// scripts, rigidbodies, colliders and audio are removed from the placed copy.
 const KINDS = {
   box: ['width', 'height', 'depth'],
   cylinder: ['radius', 'height'],
@@ -23,7 +24,7 @@ const KINDS = {
   prism: ['width', 'height', 'depth'], // a triangle, width wide and height tall, extruded depth thick
   use: [] // followed by a name
 };
-const OPTIONS = ['at', 'turn', 'color', 'sides', 'tip', 'scale', 'arc'];
+const OPTIONS = ['at', 'turn', 'color', 'sides', 'tip', 'scale', 'arc', 'bare'];
 
 // "prism 0.05 0.22 0.006 at 0 0.12 0" -> { kind, size: [...], at, turn, color }; throws if bad.
 function parseShape(text) {
@@ -53,8 +54,9 @@ function parseShape(text) {
     else if (key === 'scale') {
       shape.scale = numbers(3);
       if (shape.scale.some(v => v <= 0)) throw new Error('scale must be above 0');
-    } else if (key === 'arc' && kind === 'hemisphere' && +words[0] > 0 && +words[0] <= 360) shape.arc = +words.shift();
-    else throw new Error(`unexpected "${key}"; after the sizes use at x y z, turn rx ry rz, color #rrggbb, scale x y z, sides N (cylinder, cone; 3 or more), tip f (cone, pyramid; 0 to below 1), arc degrees (hemisphere)`);
+    } else if (key === 'bare' && kind === 'use') shape.bare = true;
+    else if (key === 'arc' && kind === 'hemisphere' && +words[0] > 0 && +words[0] <= 360) shape.arc = +words.shift();
+    else throw new Error(`unexpected "${key}"; after the sizes use at x y z, turn rx ry rz, color #rrggbb, scale x y z, bare (use), sides N (cylinder, cone; 3 or more), tip f (cone, pyramid; 0 to below 1), arc degrees (hemisphere)`);
   }
   return shape;
 }

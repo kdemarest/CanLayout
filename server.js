@@ -94,8 +94,12 @@ const api = {
     unityScenes: listNames(UNITY_SCENES, '.unity')
   }),
   'GET /api/palette': () => {
-    const docs = docsAssets();
-    return { newAssets: docs.newAssets, shaped: Object.keys(docs.shapes), shapeErrors: docs.shapeErrors, prefabs: prefabNames() };
+    const docs = docsAssets(), prefabs = prefabNames();
+    // Reused assets by their docs name, with the prefab (or model file) each names.
+    const reuses = Object.entries(docs.unity).filter(([, a]) => a.chip === '🟢' && a.type !== 'Text')
+      .map(([name, a]) => ({ name, prefab: Shapes.unityName(name, a.unity) }))
+      .filter(r => prefabs.includes(r.prefab) || /\.(fbx|obj)$/i.test(r.prefab)).sort((a, b) => a.name.localeCompare(b.name));
+    return { newAssets: docs.newAssets, shaped: Object.keys(docs.shapes), shapeErrors: docs.shapeErrors, reuses, prefabs };
   },
   'GET /api/texts': () => ({ file: Texts.FILE, texts: Texts.loadTexts(S.REPO, JSON.parse(fs.readFileSync(path.join(__dirname, 'cache', 'guid-index.json'), 'utf8')).entries, S.blobs) }),
   'GET /api/scene': q => {

@@ -31,6 +31,8 @@ A rule is `kind:pattern`, `*` matching anything: `prefab:Cairn` (a whole piece),
 
 A composed scene can be built on an imported area: a line `- Area: <Scene> <Name>` (e.g. `- Area: BeechScene Rings`) draws that area beneath it, read-only. Its pieces can't be picked up, but Snap rests pieces on them, and Folders and Labels cover them. Save writes only the scene's own Piece lines; export will take only those. While viewing an area, **Add** (or ☰ **New**) asks for a scene name, makes the scene on that area, and keeps the camera where it is.
 
+The Add list has three sections: new assets from docs (◇ drawn from shapes, ▢ a labeled box), reused assets by docs name (`Tablet → RuinTablet`, from 🟢 Asset lines; placed as the prefab), and every Unity prefab, so any Unity object can be placed.
+
 Placeholder shapes: a new asset with `- Shape:` lines indented under its docs Asset line is drawn from them (◇ in the Add list) instead of a labeled box (▢). Shapes: `box w h d`, `cylinder r h`, `cone r h`, `pyramid w h d` (a w by d base), `sphere r`, `hemisphere r` (flat side down), `dodecahedron size`, `prism w h d` (a triangle w wide and h tall, extruded d thick), `use <Name>` (another asset's shapes, or a Unity prefab, e.g. `use Wood boards at 0 1 0`); then optionally `at x y z`, `turn rx ry rz` (degrees), `color #rrggbb`, `sides N` (cylinder, cone), `tip f` (cone, pyramid: cut off flat, the top f times the base, a snub nose), `scale x y z`, `arc degrees` (hemisphere: keep a wedge, e.g. `arc 90`); `use <Name> color #rrggbb` recolors all of it. Meters, Unity axes; each shape rests on its origin. Bad lines show as errors. Reload the page after editing them.
 
 Unity names: a docs asset's prefab is its name in PascalCase (Burl shard -> `BurlShard`), or the name after `as` on its Asset line (`- Asset: 🟢 Model: Command Aerie as Lookout`); `as LeafSingle.fbx` names a model file, placed whole (also in `use`). When that prefab exists in the project, layout draws it instead of the shapes.
@@ -46,7 +48,7 @@ Piece line: `- Piece: Name | x y z | rx ry rz | scale | extra settings`, in Unit
 - While a piece is carried it keeps its place relative to the camera, so moving carries it and orbiting turns it.
 - ☰ **Snap** (toggle) rests the carried piece on whatever is below it.
 - ☰ **Labels** (toggle) names every piece just above it; placeholder boxes are always named.
-- The scale bar sets its size (1.0 in the middle; ×0.25 to ×4).
+- The scale bar sets its size as a multiple of its base size, ×0.25 to ×49, each step a fixed percentage (it shows the piece's size when picked up).
 - **Drop** places it; **Cancel** puts it back (or discards a new one); **Delete** removes a placed piece. These show only while carrying.
 - Tap a placed piece to pick it up again. **Undo** and **Redo** cover drops and deletes. ☰ **Save** writes the Piece lines (☰ shows ● while there are unsaved changes).
 - Tablets, signs and notes (prefabs with a script that has a `textId` field) show a text from the game's `Assets/Resources/Text/English.txt`. While carrying one, **Add text** lists its text ids by section with each one's first line; pick one, or type an id that isn't there yet and use it. Drop keeps it, as `textId <id>` in the Piece line. Docs Text assets are not in the Add list.
