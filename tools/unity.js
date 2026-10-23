@@ -85,14 +85,15 @@ function vec(body, key) {
 const ref = (body, key) => { const m = new RegExp(key + ': \\{fileID: (-?\\d+)').exec(body); return m ? m[1] : '0'; };
 const guidRef = (body, key) => { const m = new RegExp(key + ': \\{fileID: (-?\\d+), guid: ([0-9a-f]+)').exec(body); return m ? { fileID: m[1], guid: m[2] } : null; };
 function modifications(body) {
-  return [...body.matchAll(/- target: \{fileID: (-?\d+)(?:, guid: [0-9a-f]+)?[^\n]*\n\s*propertyPath: ([^\n]+)\n\s*value: ([^\n]*)/g)]
-    .map(m => ({ target: m[1], path: m[2].trim(), value: m[3].trim() }));
+  return [...body.matchAll(/- target: \{fileID: (-?\d+)(?:, guid: [0-9a-f]+)?[^\n]*\n\s*propertyPath: ([^\n]+)\n\s*value: ([^\n]*)(?:\n\s*objectReference: \{fileID: -?\d+(?:, guid: ([0-9a-f]+))?)?/g)]
+    .map(m => ({ target: m[1], path: m[2].trim(), value: m[3].trim(), guid: m[4] || null }));
 }
 
 // Parses one Unity file into transforms, game objects, mesh components, and prefab instances.
 function parse(text) {
   const d = documents(text.replace(/\r\n/g, '\n')); // some files have Windows line endings
   const t = {}, go = {}, mesh = {}, inst = {}, strippedT = {}, strippedGo = {}, textId = {}, shown = {}, material = {};
+  let takesText = false; // has a script that declares a textId field (Tablet, Sign, Note)
   for (const x of d) {
     // A mesh is drawn only by an enabled MeshRenderer (23) or SkinnedMeshRenderer (137).
     if ((x.cls === 23 || x.cls === 137) && !x.stripped && !/\n {2}m_Enabled: 0/.test(x.body)) {
@@ -115,6 +116,8 @@ function parse(text) {
       const r = guidRef(x.body, 'm_Mesh');
       if (r) mesh[ref(x.body, 'm_GameObject')] = r;
     } else if (x.cls === 114) {
+      const script = guidRef(x.body, 'm_Script');
+      if (script && scriptTakesText(script.guid)) takesText = true;
       const m = /\n {2}textId: (.+)/.exec(x.body);
       if (m && m[1].trim()) textId[ref(x.body, 'm_GameObject')] = m[1].trim();
     } else if (x.cls === 1001) {
@@ -122,10 +125,20 @@ function parse(text) {
       inst[x.id] = { src: src && src.guid, parent: ref(x.body, 'm_TransformParent'), mods: modifications(x.body) };
     }
   }
-  return { t, go, mesh, inst, strippedT, strippedGo, textId, material, shown };
+  return { t, go, mesh, inst, strippedT, strippedGo, textId, material, shown, takesText };
 }
 
 // ---------- repository lookups ----------
+// Does a C# script (by guid) declare a textId field? Its saved data may predate the field.
+const scriptText = new Map();
+function scriptTakesText(guid) {
+  if (!scriptText.has(guid)) {
+    const e = index()[guid];
+    const file = e && e.path.endsWith('.cs') ? path.join(REPO, e.path) : null;
+    scriptText.set(guid, Boolean(file && fs.existsSync(file) && /^[^(\n]*\bstring\s+textId\s*[;=]/m.test(fs.readFileSync(file, 'utf8'))));
+  }
+  return scriptText.get(guid);
+}
 let guidIndex = null;
 function index() {
   if (!guidIndex) guidIndex = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cache', 'guid-index.json'), 'utf8')).entries;
@@ -171,8 +184,33 @@ function prefab(guid, depth = 0, overrides = null) {
   const f = parse(fs.readFileSync(file, 'utf8'));
   const name = path.basename(e.path, '.prefab');
   const result = { name, path: e.path, ...graph(f, depth, overrides, name) };
+  // Takes a text id if it or any prefab nested in it has a script with a textId field.
+  result.takesText = f.takesText || Object.values(f.inst).some(x => { const s = x.src && prefab(x.src, depth + 1); return Boolean(s && s.takesText); });
   if (!overrides) prefabCache.set(guid, result);
   return result;
+}
+
+// A model file (FBX, OBJ) placed directly in a prefab or scene, as a one-part prefab: the whole
+// file as one mesh in its root's space (see fbx.js wholeModelToObj). Unity ids its root
+// transform and game object with fixed values, older ones 400000 and 100000. The instance's
+// changes to objects inside the file are not applied (no game prefab makes any); a material it
+// sets on any of them is used for the whole model.
+const MODEL_ROOT_T = ['-8679921383154817045', '400000'];
+const MODEL_ROOT_GO = ['919132149155446097', '100000'];
+function modelInstance(guid, mods) {
+  const e = index()[guid];
+  if (!e || !MODEL_EXT.test(e.path)) return null;
+  const name = path.basename(e.path).replace(MODEL_EXT, '');
+  const pick = ids => ids.find(id => mods.some(m => m.target === id)) || ids[0];
+  const rootId = pick(MODEL_ROOT_T);
+  const ownScale = mods.some(m => m.target === rootId && m.path.startsWith('m_LocalScale'));
+  const mat = mods.find(m => /^m_Materials\.Array\.data\[\d+\]$/.test(m.path) && m.guid);
+  const mesh = { kind: 'model', whole: true, keepRootScale: !ownScale, name, guid, path: e.path, blob: e.blob };
+  return {
+    name, path: e.path, model: true, rootId, rootGoId: pick(MODEL_ROOT_GO),
+    rootTrs: { pos: { x: 0, y: 0, z: 0 }, rot: { x: 0, y: 0, z: 0, w: 1 }, scl: { x: 1, y: 1, z: 1 } },
+    parts: [{ mesh, m: I(), material: mat ? mat.guid : null, object: name, prefab: name, off: false }]
+  };
 }
 
 // Builds the transform tree of a parsed file. Nodes are transform ids or 'pi<id>' for
@@ -192,7 +230,7 @@ function nodes(f, depth, overrides = null) {
     };
   }
   for (const [id, x] of Object.entries(f.inst)) {
-    let sub = x.src ? prefab(x.src, depth + 1) : null;
+    let sub = x.src ? prefab(x.src, depth + 1) || modelInstance(x.src, x.mods) : null;
     const pos = { ...(sub ? sub.rootTrs.pos : { x: 0, y: 0, z: 0 }) };
     const rot = { ...(sub ? sub.rootTrs.rot : { x: 0, y: 0, z: 0, w: 1 }) };
     const scl = { ...(sub ? sub.rootTrs.scl : { x: 1, y: 1, z: 1 }) };
@@ -229,7 +267,7 @@ function nodes(f, depth, overrides = null) {
       }
     }
     const overridden = Object.keys(inner).length > 0;
-    if (overridden) sub = prefab(x.src, depth + 1, inner);
+    if (overridden && !sub.model) sub = prefab(x.src, depth + 1, inner);
     // Components added to the instance's stripped root game object (e.g. a MeshFilter).
     const addedGo = Object.keys(f.strippedGo).find(g => f.strippedGo[g] === id);
     n['pi' + id] = { kind: 'pi', father: alias(x.parent), pos, rot, scl, name, active, sub, overridden, mesh: addedGo ? f.mesh[addedGo] || null : null, meshOff: addedGo ? !f.shown[addedGo] : false, material: addedGo ? f.material[addedGo] || null : null, textId };
@@ -325,4 +363,4 @@ function prefabByName(name) {
   return hits.length ? prefab(hits[0][0]) : null;
 }
 
-module.exports = { REPO, I, mul, trs, qmul, eulerToQuat, quatToEuler, parse, prefab, prefabByName, scenePieces, describeMesh, isLodBeyondZero };
+module.exports = { REPO, I, mul, trs, qmul, eulerToQuat, quatToEuler, parse, prefab, prefabByName, modelInstance, scenePieces, describeMesh, isLodBeyondZero };

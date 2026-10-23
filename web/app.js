@@ -9,6 +9,9 @@
         scene: null,          // { name, kind: "composed" | "area", editable }
         pieces: [],           // Unity values
         objects: [],          // Three.js group per piece, same order
+        area: null,           // the imported area a composed scene sits on ("- Area:" line), or null
+        base: [],             // that area's pieces: drawn, snapped onto, never picked up or saved
+        baseObjects: [],
         library: {},
         materials: {},        // Unity material guid -> description (colors, texture URLs)
         textures: true,
@@ -166,6 +169,69 @@
         box.add(label(name));
         return box;
     }
+    // Placeholder shapes from docs "- Shape:" lines (tools/shapes.js): each rests on its origin,
+    // then moves by "at" and turns by "turn", in the piece's Unity space.
+    const shapeMaterials = new Map();
+    function shapeMaterial(color) {
+        if (!shapeMaterials.has(color)) shapeMaterials.set(color, new THREE.MeshStandardMaterial({ color, roughness: 0.8, flatShading: true, side: THREE.DoubleSide }));
+        return shapeMaterials.get(color);
+    }
+    // tint: a material that replaces every color, from an outer "use ... color".
+    function shapeMesh(shape, tint) {
+        // "use": another asset's shapes or a Unity prefab, as a piece placed at "at" and "turn".
+        if (shape.kind === "use") {
+            const piece = { name: shape.name, position: shape.at, rotation: shape.turn, scale: shape.scale || [1, 1, 1], extra: "" };
+            return buildObject(piece, shape.color ? shapeMaterial(shape.color) : tint);
+        }
+        const [a, b, c] = shape.size;
+        const tip = shape.tip || 0; // the top's size, as a fraction of the base
+        let geometry;
+        if (shape.kind === "box") geometry = new THREE.BoxGeometry(a, b, c).translate(0, b / 2, 0);
+        else if (shape.kind === "cylinder") geometry = new THREE.CylinderGeometry(a, a, b, shape.sides || 24).translate(0, b / 2, 0);
+        else if (shape.kind === "cone") geometry = new THREE.CylinderGeometry(a * tip, a, b, shape.sides || 24).translate(0, b / 2, 0);
+        else if (shape.kind === "pyramid") {
+            // A four-sided cylinder turned 45 degrees is a square; stretched to width by depth.
+            geometry = new THREE.CylinderGeometry(tip, 1, b, 4).rotateY(Math.PI / 4).scale(a / Math.SQRT2, 1, c / Math.SQRT2).translate(0, b / 2, 0);
+        }
+        else if (shape.kind === "sphere") geometry = new THREE.SphereGeometry(a, 24, 16).translate(0, a, 0);
+        else if (shape.kind === "hemisphere") {
+            // The dome, closed underneath by a disc; "arc" keeps a wedge of it, closed at both cuts.
+            const arc = (shape.arc || 360) * Math.PI / 180;
+            const dome = new THREE.SphereGeometry(a, 24, 8, 0, arc, 0, Math.PI / 2);
+            const disc = new THREE.CircleGeometry(a, 24, Math.PI - arc, arc).rotateX(Math.PI / 2);
+            const pieces = [dome, disc];
+            if (shape.arc && shape.arc < 360) {
+                const cut = () => new THREE.CircleGeometry(a, 8, Math.PI / 2, Math.PI / 2);
+                pieces.push(cut(), cut().rotateY(arc));
+            }
+            geometry = mergeGeometries(pieces);
+        }
+        else if (shape.kind === "dodecahedron") geometry = new THREE.DodecahedronGeometry(a / 2).translate(0, a / 2, 0);
+        else if (shape.kind === "prism") {
+            const triangle = new THREE.Shape([new THREE.Vector2(-a / 2, 0), new THREE.Vector2(a / 2, 0), new THREE.Vector2(0, b)]);
+            geometry = new THREE.ExtrudeGeometry(triangle, { depth: c, bevelEnabled: false }).translate(0, 0, -c / 2);
+        } else throw new Error(`unknown shape ${shape.kind}`);
+        const mesh = new THREE.Mesh(geometry, tint || shapeMaterial(shape.color || "#c9a66b"));
+        mesh.matrixAutoUpdate = false;
+        mesh.matrix.copy(Space.pieceMatrix(THREE, { position: shape.at, rotation: shape.turn, scale: shape.scale || [1, 1, 1] }));
+        return mesh;
+    }
+    // Joins non-indexed copies of geometries into one (enough for placeholder shapes).
+    function mergeGeometries(list) {
+        const flat = list.map(g => (g.index ? g.toNonIndexed() : g));
+        const merged = new THREE.BufferGeometry();
+        for (const name of ["position", "normal", "uv"]) {
+            const arrays = flat.map(g => g.attributes[name].array);
+            const out = new Float32Array(arrays.reduce((n, x) => n + x.length, 0));
+            let at = 0;
+            for (const x of arrays) {
+                out.set(x, at);
+                at += x.length;
+            }
+            merged.setAttribute(name, new THREE.BufferAttribute(out, flat[0].attributes[name].itemSize));
+        }
+        return merged;
+    }
     function folderOf(entry) {
         if (!entry) return "(new or unknown)";
         if (!entry.source || !entry.source.includes("/")) return "(built-in)";
@@ -248,8 +314,8 @@
         return m;
     }
 
-    // A Three.js group for one piece; its parts load asynchronously.
-    function buildObject(piece) {
+    // A Three.js group for one piece; its parts load asynchronously. tint replaces its materials.
+    function buildObject(piece, tint) {
         const group = new THREE.Group();
         group.matrixAutoUpdate = false;
         group.matrix.copy(Space.pieceMatrix(THREE, piece));
@@ -258,6 +324,10 @@
         group.visible = !state.hiddenFolders.has(group.userData.folder);
         const faint = /\binactive\b/.test(piece.extra || "");
         const parts = piece.parts || (entry ? entry.parts : []); // an imported instance may carry its own
+        if (!piece.parts && entry && entry.shapes) {
+            for (const shape of entry.shapes) group.add(shapeMesh(shape, tint));
+            return group;
+        }
         if (!parts.length) {
             group.add(placeholder(new THREE.Matrix4(), piece.name));
             return group;
@@ -266,7 +336,7 @@
             const local = Space.partMatrix(THREE, part.m);
             geometryFor(part).then(geometry => {
                 if (geometry) {
-                    const mesh = new THREE.Mesh(geometry, materialFor(part.material, faint));
+                    const mesh = new THREE.Mesh(geometry, tint || materialFor(part.material, faint));
                     mesh.matrixAutoUpdate = false;
                     mesh.matrix.copy(local);
                     group.add(mesh);
@@ -277,6 +347,17 @@
         }
         return group;
     }
+    function rebuildBase() {
+        for (const o of state.baseObjects) world.remove(o);
+        state.baseObjects = state.base.map(p => {
+            const o = buildObject(p);
+            o.userData.pieceName = p.name;
+            o.userData.piece = p;
+            world.add(o);
+            return o;
+        });
+    }
+    const allObjects = () => [...state.baseObjects, ...state.objects];
     function rebuildWorld() {
         for (const o of state.objects) world.remove(o);
         state.objects = state.pieces.map(p => {
@@ -310,9 +391,9 @@
             s.material.dispose();
         }
         if (!state.labels) return;
-        for (const o of state.objects) {
+        for (const o of allObjects()) {
             const name = o.userData.pieceName;
-            const piece = state.pieces[state.objects.indexOf(o)];
+            const piece = o.userData.piece || state.pieces[state.objects.indexOf(o)];
             if (!name || (!state.library[name] && !(piece && piece.parts))) continue; // placeholders are labeled already
             if (!labelTextures.has(name)) labelTextures.set(name, labelTexture(name, "#cfe8ff"));
             const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: labelTextures.get(name), depthTest: false, sizeAttenuation: false }));
@@ -346,7 +427,8 @@
         if (select) sel.value = select;
         return list;
     }
-    async function loadScene(value) {
+    // keepCamera: stay put (a new scene on the area being viewed covers the same ground).
+    async function loadScene(value, keepCamera = false) {
         if (state.dirty && !confirm("Discard unsaved changes?")) {
             $("sceneSelect").value = `${state.scene.kind}:${state.scene.name}`;
             return;
@@ -357,21 +439,25 @@
         const data = await call("GET", `/api/scene?kind=${kind}&name=${encodeURIComponent(name)}`);
         state.scene = { name, kind, editable: data.editable };
         state.pieces = data.pieces;
+        state.area = data.area || null;
+        state.base = data.base || [];
         Object.assign(state.library, data.library);
         Object.assign(state.materials, data.materials || {});
         state.undo = [];
         state.redo = [];
         state.dirty = false;
         endCarry();
+        rebuildBase();
         rebuildWorld();
-        frameAll();
+        if (!keepCamera) frameAll();
         localStorage.setItem("layout.scene", value);
         updateUi();
-        say(`${name}: ${data.pieces.length} pieces${data.problems.length ? `; ${data.problems.length} meshes failed` : ""}${data.editable ? "" : " (read-only)"}`);
+        const on = state.area ? `, on ${state.area} (${state.base.length}, read-only)` : "";
+        say(`${name}: ${data.pieces.length} pieces${on}${data.problems.length ? `; ${data.problems.length} meshes failed` : ""}${data.editable ? "" : " (read-only; Add starts a scene on it)"}`);
     }
     function frameAll() {
         const box = new THREE.Box3();
-        for (const p of state.pieces) box.expandByPoint(new THREE.Vector3(-p.position[0], p.position[1], p.position[2]));
+        for (const p of [...state.base, ...state.pieces]) box.expandByPoint(new THREE.Vector3(-p.position[0], p.position[1], p.position[2]));
         if (box.isEmpty()) return;
         const center = box.getCenter(new THREE.Vector3());
         const size = Math.max(4, box.getSize(new THREE.Vector3()).length());
@@ -409,11 +495,22 @@
             object,
             rel: camera.matrixWorld.clone().invert().multiply(object.matrix),
             factor: 1,
-            original: object.matrix.clone()
+            original: object.matrix.clone(),
+            extra: index >= 0 ? state.pieces[index].extra || "" : "" // settings, e.g. a tablet's text id
         };
         $("scale").value = 0;
         $("scaleValue").textContent = "×1.00";
         updateUi();
+    }
+    // Tablets, signs and notes take a text id (from the game's English.txt).
+    const takesText = c => Boolean(c && (state.library[c.object.userData.pieceName] || {}).takesText);
+    const textIdOf = extra => ((/(?:^|, )textId ([^,]+)/.exec(extra || "") || [])[1] || "").trim();
+    function setText(id) {
+        const c = state.carried;
+        const rest = (c.extra || "").split(", ").filter(s => s && !s.startsWith("textId "));
+        c.extra = [`textId ${id}`, ...rest].join(", ");
+        closePanels();
+        say(`${c.object.userData.pieceName} shows ${id}. Drop to keep it.`);
     }
     function endCarry() {
         state.carried = null;
@@ -445,7 +542,7 @@
             new THREE.Vector3(1, 1, 1)
         );
         startCarry(-1, object);
-        say(`Carrying ${name}. Move, orbit to turn it, then Drop.`);
+        say(`Carrying ${name}. Move, orbit to turn it, then Drop.${takesText(state.carried) ? " Add text picks its text." : ""}`);
     }
     function carriedMatrix() {
         const c = state.carried;
@@ -458,7 +555,7 @@
             if (!box.isEmpty()) {
                 const center = box.getCenter(new THREE.Vector3());
                 const ray = new THREE.Raycaster(new THREE.Vector3(center.x, box.max.y + 0.05, center.z), new THREE.Vector3(0, -1, 0));
-                const others = state.objects.filter((o, i) => i !== c.index && o.visible);
+                const others = [...state.baseObjects, ...state.objects.filter((o, i) => i !== c.index)].filter(o => o.visible);
                 const hit = ray.intersectObjects(others, true).find(h => h.object.isMesh && h.object.material !== wire);
                 if (hit) {
                     m.premultiply(new THREE.Matrix4().makeTranslation(0, hit.point.y - box.min.y, 0));
@@ -473,11 +570,11 @@
         const placement = Space.placementOf(THREE, carriedMatrix());
         commit(() => {
             if (c.index < 0) {
-                const piece = { name: c.object.userData.pieceName, ...placement, extra: "" };
+                const piece = { name: c.object.userData.pieceName, ...placement, extra: c.extra };
                 state.pieces.push(piece);
                 state.objects.push(c.object);
             } else {
-                Object.assign(state.pieces[c.index], placement);
+                Object.assign(state.pieces[c.index], placement, { extra: c.extra });
             }
             c.object.matrix.copy(Space.pieceMatrix(THREE, c.index < 0 ? state.pieces[state.pieces.length - 1] : state.pieces[c.index]));
         });
@@ -552,8 +649,8 @@
         return Math.max(0.5, base * 0.5); // halved for now (Ken, 2026-10-21)
     }
 
-    // Touch: one finger looks around (or, carrying, orbits to turn the piece); two fingers pinch
-    // (dolly) and drag (pan); a tap selects.
+    // Touch: one finger looks around (or, carrying, orbits to turn the piece); a pinch travels
+    // forward and back like W and S, at their speed (spreading 200 px is a second of W); a tap selects.
     const pointers = new Map();
     let gesture = null;
     canvas.addEventListener("pointerdown", e => {
@@ -574,10 +671,7 @@
             p.x = e.clientX;
             p.y = e.clientY;
             const after = Math.hypot(a.x - b.x, a.y - b.y);
-            const scale = state.orbitDistance * 0.004;
-            move("forward", (after - before) * scale);
-            move("right", -dx / 2 * scale);
-            move("up", dy / 2 * scale);
+            move("forward", (after - before) / 200 * speed());
             gesture = "two";
             return;
         }
@@ -606,15 +700,20 @@
         if (index >= 0) {
             o.userData.pieceName = state.pieces[index].name;
             startCarry(index, o);
-            say(`Carrying ${state.pieces[index].name}. Drop, Cancel, or Delete.`);
+            const text = textIdOf(state.pieces[index].extra);
+            say(`Carrying ${state.pieces[index].name}${text ? ` (${text})` : ""}. Drop, Cancel, or Delete.`);
         }
     }
 
-    // Movement pad and keys: held buttons move continuously.
+    // Movement pad and keys: held buttons move continuously. Only a finger that lands on a pad
+    // button presses it; a finger already turning or pinching on the view never does, even if
+    // it slides over the pad.
     const held = new Set();
     for (const b of document.querySelectorAll("[data-move]")) {
         const on = e => {
             e.preventDefault();
+            if (pointers.has(e.pointerId)) return;
+            if (pointers.size) fetch("/api/log", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: `pad ${b.dataset.move} pressed by a new finger while ${pointers.size} finger(s) on the view (${gesture || "turning"})` }) }).catch(() => {});
             held.add(b.dataset.move);
         };
         const off = () => held.delete(b.dataset.move);
@@ -637,7 +736,8 @@
     function frame(now) {
         const dt = Math.min(0.1, (now - last) / 1000);
         last = now;
-        for (const direction of held) move(direction, speed() * dt);
+        // A and D sidestep at half speed (Ken, 2026-10-22).
+        for (const direction of held) move(direction, speed() * dt * (direction === "left" || direction === "right" ? 0.5 : 1));
         if (state.carried) {
             state.carried.object.matrix.copy(carriedMatrix());
             for (const s of labels.children) if (s.userData.object === state.carried.object) placeLabel(s, s.userData.object);
@@ -654,10 +754,13 @@
     function updateUi() {
         const editable = state.scene && state.scene.editable;
         const carrying = Boolean(state.carried);
-        $("addBtn").disabled = !editable || carrying;
-        $("dropBtn").disabled = !carrying;
-        $("cancelBtn").disabled = !carrying;
-        $("deleteBtn").disabled = !carrying || state.carried.index < 0;
+        // Add places a piece; while carrying a tablet it picks the tablet's text instead.
+        $("addBtn").disabled = carrying ? !takesText(state.carried) : !(editable || (state.scene && state.scene.kind === "area"));
+        $("addBtn").textContent = carrying && takesText(state.carried) ? "Add text" : "Add";
+        // Drop, Cancel and Delete appear only while carrying (Delete only for a placed piece).
+        $("dropBtn").hidden = !carrying;
+        $("cancelBtn").hidden = !carrying;
+        $("deleteBtn").hidden = !carrying || state.carried.index < 0;
         $("undoBtn").disabled = !state.undo.length || carrying;
         $("redoBtn").disabled = !state.redo.length || carrying;
         $("saveBtn").disabled = !editable || !state.dirty;
@@ -670,7 +773,7 @@
     function closePanels() {
         for (const id of ["palette", "importPanel", "folders", "menu"]) $(id).style.display = "none";
     }
-    // The ☰ menu holds New, Save, Import area, and Folders; choosing one closes it.
+    // The ☰ menu holds New, Save, Import area, Folders, and the Snap and Labels toggles; choosing one closes it.
     $("menuBtn").onclick = e => {
         e.stopPropagation();
         const open = $("menu").style.display === "flex";
@@ -687,13 +790,15 @@
         $(id).style.display = show ? "flex" : "none";
     }
 
-    let palette = null;
+    let palette = null, texts = null;
     function renderPalette() {
         const filter = $("paletteFilter").value.trim().toLowerCase();
         const match = n => !filter || n.toLowerCase().includes(filter);
         const list = $("paletteList");
         list.innerHTML = "";
-        const section = (title, names) => {
+        if (state.carried) return renderTexts(filter, list);
+        // mark(name): text shown after each name.
+        const section = (title, names, mark = () => "") => {
             const shown = names.filter(match).slice(0, 300);
             const head = document.createElement("div");
             head.className = "head";
@@ -701,17 +806,54 @@
             list.appendChild(head);
             for (const n of shown) {
                 const row = document.createElement("div");
-                row.textContent = n;
+                row.textContent = n + mark(n);
                 row.addEventListener("click", () => addPiece(n).catch(fail));
                 list.appendChild(row);
             }
         };
-        section("New assets (docs)", palette.newAssets);
+        // ◇: a placeholder shape (docs Shape lines); ▢: nothing yet, a labeled box.
+        const shaped = new Set(palette.shaped);
+        section("New assets (docs) ◇ shape, ▢ box", palette.newAssets, n => (shaped.has(n) ? " ◇" : " ▢"));
         section("Unity prefabs", palette.prefabs);
+    }
+    // Text ids by English.txt section, each with its first line; a typed id not there can be used too.
+    function renderTexts(filter, list) {
+        const current = textIdOf(state.carried.extra);
+        const row = (label, id) => {
+            const r = document.createElement("div");
+            r.textContent = label;
+            if (id === current) r.style.color = "var(--accent, #7fd4ff)";
+            r.addEventListener("click", () => setText(id));
+            list.appendChild(r);
+        };
+        const typed = $("paletteFilter").value.trim();
+        if (typed && !/[,|]/.test(typed) && !texts.some(x => x.id === typed)) row(`Use new id "${typed}"`, typed);
+        const shown = texts.filter(x => !filter || `${x.id} ${x.preview}`.toLowerCase().includes(filter));
+        let section = null;
+        for (const x of shown) {
+            if (x.section !== section) {
+                section = x.section;
+                const head = document.createElement("div");
+                head.className = "head";
+                head.textContent = section || "Texts";
+                list.appendChild(head);
+            }
+            row(x.preview ? `${x.id} — ${x.preview}` : x.id, x.id);
+        }
     }
     $("addBtn").onclick = async () => {
         try {
-            palette = palette || await call("GET", "/api/palette");
+            // On an imported area, Add first makes a composed scene on it; the area stays read-only.
+            if (state.carried) {
+                texts = texts || (await call("GET", "/api/texts")).texts;
+                $("paletteFilter").placeholder = "Filter text ids";
+            } else {
+                if (state.scene.kind === "area" && !await newScene(state.scene.name)) return;
+                palette = palette || await call("GET", "/api/palette");
+                if (palette.shapeErrors.length) window.layoutError(`Shape lines: ${palette.shapeErrors.join("; ")}`);
+                $("paletteFilter").placeholder = "Filter pieces";
+            }
+            $("paletteFilter").value = "";
             toggle("palette");
             renderPalette();
         } catch (error) {
@@ -757,17 +899,17 @@
             fail(error);
         }
     };
-    $("newBtn").onclick = async () => {
-        const name = prompt('New scene name, "<Type> <Name>" (e.g. Landmark Ring Forge):');
-        if (!name) return;
-        try {
-            await call("POST", "/api/new", { name });
-            await refreshList(`composed:${name}`);
-            await loadScene(`composed:${name}`);
-        } catch (error) {
-            fail(error);
-        }
-    };
+    // Makes a composed scene (on an area, if given) and opens it. Returns false if cancelled.
+    async function newScene(area) {
+        const on = area ? ` on ${area}` : "";
+        const name = prompt(`New scene${on}, "<Type> <Name>" (e.g. Landmark Ring Forge):`);
+        if (!name) return false;
+        await call("POST", "/api/new", { name, area });
+        await refreshList(`composed:${name}`);
+        await loadScene(`composed:${name}`, Boolean(area));
+        return true;
+    }
+    $("newBtn").onclick = () => newScene(state.scene && state.scene.kind === "area" ? state.scene.name : null).catch(fail);
     $("importBtn").onclick = () => toggle("importPanel");
     $("importClose").onclick = closePanels;
     $("extractBtn").onclick = async () => {
@@ -788,7 +930,7 @@
     };
     $("foldersBtn").onclick = () => {
         const counts = new Map();
-        for (const o of state.objects) counts.set(o.userData.folder, (counts.get(o.userData.folder) || 0) + 1);
+        for (const o of allObjects()) counts.set(o.userData.folder, (counts.get(o.userData.folder) || 0) + 1);
         const panel = $("folders");
         panel.innerHTML = "";
         for (const [folder, n] of [...counts].sort()) {
@@ -799,7 +941,7 @@
             box.onchange = () => {
                 if (box.checked) state.hiddenFolders.delete(folder);
                 else state.hiddenFolders.add(folder);
-                for (const o of state.objects) if (o.userData.folder === folder) o.visible = box.checked;
+                for (const o of allObjects()) if (o.userData.folder === folder) o.visible = box.checked;
                 refreshLabels();
             };
             row.append(box, ` ${folder} (${n})`);

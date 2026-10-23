@@ -10,6 +10,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const U = require('./unity.js');
 const { assetToObj } = require('./asset-mesh.js');
+const { objModelToObj } = require('./obj-model.js');
 const FBX = require('./fbx.js');
 const Config = require('./config.js');
 const crypto = require('crypto');
@@ -47,6 +48,11 @@ function parsePieceLines(text) {
     pieces.push({ name: f[0], position, rotation, scale: scale.length === 1 ? [scale[0], scale[0], scale[0]] : scale, extra: f.slice(4).join(' | ') });
   });
   return { pieces, errors };
+}
+// "- Area: <Scene> <Name>": the imported area a composed scene is built on, or null.
+function areaLine(text) {
+  const m = /^\s*-\s*Area:\s*(.+?)\s*$/m.exec(String(text || ''));
+  return m ? m[1] : null;
 }
 function formatPieceLine(p) {
   const s = p.scale;
@@ -211,6 +217,10 @@ function blobs(ids) {
     .toString().split('\n').filter(l => l.endsWith(' missing')).map(l => l.split(' ')[0]);
   const present = ids.filter(id => !missing.includes(id));
   const out = readBatch(present.length ? git(['cat-file', '--batch'], present.join('\n') + '\n', noFetch) : Buffer.alloc(0), new Map());
+  // Uncommitted files (tools/guid-index.js marks them local) are read from the working tree.
+  const local = new Map(Object.values(index()).filter(e => e.local && e.blob).map(e => [e.blob, e.path]));
+  for (const id of missing.filter(id => local.has(id))) out.set(id, fs.readFileSync(path.join(U.REPO, local.get(id))));
+  missing.splice(0, missing.length, ...missing.filter(id => !local.has(id)));
   if (missing.length) {
     const url = git(['config', '--get', 'remote.origin.url']).toString().trim();
     const tmp = ['--git-dir=' + FETCH_STORE];
@@ -229,7 +239,7 @@ function blobs(ids) {
   return out;
 }
 // Library entries for these piece names: prefabs are re-read each time (so edits show), their
-// .asset meshes fetched and converted once per blob. part.obj is the mesh URL, or null.
+// .asset meshes fetched and converted once per blob. A name ending .fbx or .obj is that model file. part.obj is the mesh URL, or null.
 // extraParts (pieces' own parts, from instances with inner overrides) get meshes too.
 function prepare(names, extraParts = []) {
   const lib = library();
@@ -237,8 +247,10 @@ function prepare(names, extraParts = []) {
   const out = {}, problems = [];
   for (const name of new Set(names)) {
     if (!(lib[name] && lib[name].kind === 'mesh')) {
-      const p = U.prefabByName(name);
-      if (p) lib[name] = { kind: 'prefab', source: p.path, parts: p.parts };
+      // A model file by name ("LeafSingle.fbx"), placed whole, or a prefab.
+      const model = /\.(fbx|obj)$/i.test(name) && Object.entries(index()).find(([, e]) => e.path.endsWith('/' + name));
+      const p = model ? U.modelInstance(model[0], []) : U.prefabByName(name);
+      if (p) lib[name] = { kind: model ? 'model' : 'prefab', source: p.path, parts: p.parts, takesText: Boolean(p.takesText) };
     }
     if (lib[name]) out[name] = { ...lib[name], parts: Config.visibleParts(cfg, name, lib[name].parts, materialName) };
   }
@@ -256,7 +268,7 @@ function prepare(names, extraParts = []) {
     }
   }
   // FBX models: one OBJ per model used, named by the file's blob and the model.
-  const fbxParts = allParts.filter(p => p.mesh.kind === 'model' && p.mesh.blob && /\.fbx$/i.test(p.mesh.path));
+  const fbxParts = allParts.filter(p => p.mesh.kind === 'model' && !p.mesh.whole && p.mesh.blob && /\.fbx$/i.test(p.mesh.path));
   const fbxKey = p => `${p.mesh.blob}-${crypto.createHash('sha1').update(`${p.mesh.listed ? p.mesh.name : ''}|${p.object || ''}|${p.mesh.fileID || ''}`).digest('hex').slice(0, 8)}`;
   const fbxWanted = fbxParts.filter(p => !fs.existsSync(path.join(MESHES, fbxKey(p) + '.obj')));
   const fbxFiles = blobs([...new Set(fbxWanted.map(p => p.mesh.blob))]);
@@ -274,7 +286,32 @@ function prepare(names, extraParts = []) {
       problems.push(`${p.mesh.path}: ${error.message}`);
     }
   }
+  // Model files placed whole (FBX or OBJ): one OBJ per file and root-scale choice.
+  const wholeParts = allParts.filter(p => p.mesh.kind === 'model' && p.mesh.whole && p.mesh.blob);
+  const wholeKey = p => `${p.mesh.blob}-${crypto.createHash('sha1').update(`whole|${p.mesh.keepRootScale ? 1 : 0}`).digest('hex').slice(0, 8)}`;
+  const wholeWanted = wholeParts.filter(p => !fs.existsSync(path.join(MESHES, wholeKey(p) + '.obj')));
+  const wholeFiles = blobs([...new Set(wholeWanted.map(p => p.mesh.blob))]);
+  for (const p of wholeWanted) {
+    try {
+      const data = wholeFiles.get(p.mesh.blob);
+      if (!data) throw new Error('could not fetch');
+      const settings = (idx[p.mesh.guid] || {}).import || {};
+      let obj;
+      if (/\.obj$/i.test(p.mesh.path)) obj = objModelToObj(data.toString(), settings.globalScale ?? 1, p.mesh.path);
+      else if (/\.fbx$/i.test(p.mesh.path)) {
+        const scene = FBX.readScene(data);
+        obj = FBX.wholeModelToObj(scene, FBX.importScale(scene, settings), p.mesh.keepRootScale, p.mesh.path);
+      } else throw new Error('only FBX and OBJ models are read');
+      fs.writeFileSync(path.join(MESHES, wholeKey(p) + '.obj'), obj);
+    } catch (error) {
+      problems.push(`${p.mesh.path}: ${error.message}`);
+    }
+  }
   for (const part of allParts) {
+    if (wholeParts.includes(part)) {
+      part.obj = fs.existsSync(path.join(MESHES, wholeKey(part) + '.obj')) ? `meshes/${wholeKey(part)}.obj` : null;
+      continue;
+    }
     if (fbxParts.includes(part)) {
       part.obj = fs.existsSync(path.join(MESHES, fbxKey(part) + '.obj')) ? `meshes/${fbxKey(part)}.obj` : null;
       continue;
@@ -466,7 +503,7 @@ function clipObj(text, M, center, half) {
   return lines.filter(l => !l.startsWith('f ') || inside(l.split(/\s+/).slice(1).map(t => +t.split('/')[0] - 1))).join('\n');
 }
 
-module.exports = { ROOT, AREAS, MESHES, TEXTURES, parseMaterial, parsePieceLines, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };
+module.exports = { REPO: U.REPO, ROOT, AREAS, MESHES, TEXTURES, blobs, parseMaterial, parsePieceLines, areaLine, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };
 
 if (require.main === module) {
   const [command, ...args] = process.argv.slice(2);

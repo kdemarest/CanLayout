@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const S = require('./tools/scene.js');
 const Config = require('./tools/config.js');
+const Texts = require('./tools/texts.js');
+const Shapes = require('./tools/shapes.js');
 
 const PORT = +process.env.PORT || 8080;
 const DEV = path.join(__dirname, '..');
@@ -24,24 +26,65 @@ const safeName = name => {
   return name.trim();
 };
 
-// New assets from docs Asset lines (🔴 or 🟡); existing ones are Unity prefabs.
-function newAssetNames() {
-  const names = new Set();
-  (function walk(dir) {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (e.name.startsWith('.') || ['source', 'build'].includes(e.name)) continue;
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (e.name.endsWith('.md')) {
-        for (const m of fs.readFileSync(p, 'utf8').matchAll(/^\s*- Asset: (?:🔴|🟡) \w+: (.+?)(?: x\d+)? - /gmu)) names.add(m[1].trim());
+// From docs Asset lines: new assets (🔴 or 🟡; existing ones are Unity prefabs) and the
+// placeholder shapes of any asset (tools/shapes.js). Text assets are left out of newAssets:
+// texts go on tablets (Add while carrying one).
+function docsAssets() {
+  const docs = Shapes.readDocs(DOCS);
+  const newAssets = Object.entries(docs.assets).filter(([, a]) => a.chip !== '🟢' && a.type !== 'Text').map(([name]) => name).sort();
+  return { newAssets, shapes: docs.shapes, sources: docs.sources, shapeErrors: docs.errors, unity: docs.assets };
+}
+// Adds placeholder shapes to a prepare result for names with no Unity prefab or mesh, and what
+// their "use" shapes name: other assets' shapes, or Unity prefabs (prepared here).
+function withShapes(result, names) {
+  const docs = docsAssets();
+  const problems = [...(result.problems || []), ...docs.shapeErrors];
+  const add = (name, trail) => {
+    if (result.library[name]) return;
+    if (trail.includes(name)) return problems.push(`Shape use loops: ${[...trail, name].join(' -> ')}`);
+    // Once the asset has a Unity prefab under its Unity name (Burl shard -> BurlShard), that wins;
+    // not a generated placeholder (tools/make-shapes.js), which only copies the shapes.
+    const unity = Shapes.unityName(name, docs.unity[name] && docs.unity[name].unity);
+    if (unity !== name) {
+      const prefab = S.prepare([unity]);
+      const found = prefab.library[unity];
+      if (found && !(docs.shapes[name] && String(found.source).startsWith('Assets/Placeholder/'))) {
+        result.library[name] = found;
+        Object.assign(result.materials, prefab.materials);
+        return;
       }
     }
-  })(DOCS);
-  return [...names].sort();
+    if (!docs.shapes[name]) return;
+    result.library[name] = { kind: 'shapes', source: docs.sources[name], shapes: docs.shapes[name], parts: [] };
+    for (const shape of docs.shapes[name]) {
+      if (shape.kind !== 'use') continue;
+      if (docs.shapes[shape.name]) add(shape.name, [...trail, name]);
+      else if (!result.library[shape.name]) {
+        const prefab = S.prepare([shape.name]);
+        if (!prefab.library[shape.name]) problems.push(`docs/${docs.sources[name]}: ${name} uses ${shape.name}, which is neither an asset with shapes nor a Unity prefab`);
+        Object.assign(result.library, prefab.library);
+        Object.assign(result.materials, prefab.materials);
+        problems.push(...prefab.problems);
+      }
+    }
+  };
+  for (const name of new Set(names)) add(name, []);
+  result.problems = problems;
+  return result;
 }
 function prefabNames() {
   const index = JSON.parse(fs.readFileSync(path.join(__dirname, 'cache', 'guid-index.json'), 'utf8')).entries;
   return [...new Set(Object.values(index).filter(e => e.path.endsWith('.prefab')).map(e => path.basename(e.path, '.prefab')))].sort();
+}
+
+// An imported area, re-imported first when unity.json changed since (its show/hide rules shape it).
+function loadArea(name) {
+  let area = JSON.parse(fs.readFileSync(path.join(S.AREAS, safeName(name) + '.json'), 'utf8'));
+  if (area.source.config !== Config.mtime()) {
+    area = S.extractArea(area.source.scene, area.source.center, area.source.half);
+    S.saveArea(name, area);
+  }
+  return area;
 }
 
 const api = {
@@ -50,30 +93,34 @@ const api = {
     areas: listNames(S.AREAS, '.json'),
     unityScenes: listNames(UNITY_SCENES, '.unity')
   }),
-  'GET /api/palette': () => ({ newAssets: newAssetNames(), prefabs: prefabNames() }),
+  'GET /api/palette': () => {
+    const docs = docsAssets();
+    return { newAssets: docs.newAssets, shaped: Object.keys(docs.shapes), shapeErrors: docs.shapeErrors, prefabs: prefabNames() };
+  },
+  'GET /api/texts': () => ({ file: Texts.FILE, texts: Texts.loadTexts(S.REPO, JSON.parse(fs.readFileSync(path.join(__dirname, 'cache', 'guid-index.json'), 'utf8')).entries, S.blobs) }),
   'GET /api/scene': q => {
     const name = safeName(q.get('name'));
-    let pieces, editable;
+    let pieces, editable, area = null, base = [];
     if (q.get('kind') === 'area') {
-      let area = JSON.parse(fs.readFileSync(path.join(S.AREAS, name + '.json'), 'utf8'));
-      // Re-import when unity.json changed since (its show/hide rules shape the area).
-      if (area.source.config !== Config.mtime()) {
-        area = S.extractArea(area.source.scene, area.source.center, area.source.half);
-        S.saveArea(name, area);
-      }
-      pieces = area.pieces;
+      pieces = loadArea(name).pieces;
       editable = false;
     } else {
-      const parsed = S.parsePieceLines(fs.readFileSync(path.join(SCENES, name + '.md'), 'utf8'));
+      // A composed scene may sit on an imported area ("- Area: <name>"), drawn read-only beneath it.
+      const text = fs.readFileSync(path.join(SCENES, name + '.md'), 'utf8');
+      const parsed = S.parsePieceLines(text);
       if (parsed.errors.length) throw new Error(`${name}: ${parsed.errors[0]}`);
       pieces = parsed.pieces;
       editable = true;
+      area = S.areaLine(text);
+      if (area) base = loadArea(area).pieces;
     }
     // Pieces with their own parts (trees, overridden instances) are not resolved as whole prefabs.
-    const { library, materials, problems } = S.prepare(pieces.filter(p => !p.parts).map(p => p.name), pieces.flatMap(p => p.parts || []));
-    return { name, editable, pieces, library, materials, problems };
+    const all = [...base, ...pieces];
+    const names = all.filter(p => !p.parts).map(p => p.name);
+    const { library, materials, problems } = withShapes(S.prepare(names, all.flatMap(p => p.parts || [])), names);
+    return { name, editable, pieces, area, base, library, materials, problems };
   },
-  'POST /api/prepare': body => S.prepare(body.names || []),
+  'POST /api/prepare': body => withShapes(S.prepare(body.names || []), body.names || []),
   // Page errors, so they can be read in layout.log.
   'POST /api/log': body => {
     console.error(`page error: ${String(body.text).slice(0, 2000)}`);
@@ -89,7 +136,9 @@ const api = {
     const file = path.join(SCENES, name + '.md');
     if (fs.existsSync(file)) throw new Error(`${name} already exists`);
     fs.mkdirSync(SCENES, { recursive: true });
-    fs.writeFileSync(file, `---\nname: ${name}\ntype: scene\n---\n# Scene\n\n`);
+    const area = body.area ? `- Area: ${safeName(body.area)}\n` : '';
+    if (area && !fs.existsSync(path.join(S.AREAS, body.area.trim() + '.json'))) throw new Error(`no area ${body.area}`);
+    fs.writeFileSync(file, `---\nname: ${name}\ntype: scene\n---\n# Scene\n\n${area}`);
     return { name };
   },
   'POST /api/extract': body => {

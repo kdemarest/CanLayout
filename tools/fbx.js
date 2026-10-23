@@ -227,6 +227,59 @@ function modelToObj(scene, model, importScale, label) {
   }
   return L.concat(vs, vts, vns, fs).join('\n') + '\n';
 }
+// A model file used whole (placed directly in a prefab), as one OBJ in its root's space: every
+// mesh with its node transforms, pivots reset as Unity does. A file with one top node becomes
+// that node (Unity makes it the prefab's root); else the root is the file itself. The root's own
+// scale is kept in the mesh when keepRootScale (the instance didn't set its own scale).
+function wholeModelToObj(scene, importScale, keepRootScale, label) {
+  const local = p => {
+    const v = (k, d) => p[k] || d;
+    const pre = R(v('PreRotation', [0, 0, 0])), post = R(v('PostRotation', [0, 0, 0]));
+    const rp = v('RotationPivot', [0, 0, 0]), sp = v('ScalingPivot', [0, 0, 0]);
+    return [T(v('Lcl Translation', [0, 0, 0])), T(v('RotationOffset', [0, 0, 0])), T(rp), pre, R(v('Lcl Rotation', [0, 0, 0])), transpose3(post),
+      T(neg(rp)), T(v('ScalingOffset', [0, 0, 0])), T(sp), S(v('Lcl Scaling', [1, 1, 1])), T(neg(sp))].reduce(mul);
+  };
+  const world = new Map();
+  const W = m => {
+    if (!world.has(m.id)) world.set(m.id, m.parent ? mul(W(scene.models.get(m.parent)), local(m.props)) : local(m.props));
+    return world.get(m.id);
+  };
+  const tops = [...scene.models.values()].filter(m => !m.parent);
+  let base = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  if (tops.length === 1) {
+    const r = tops[0], pivot = r.props.RotationPivot || r.props.ScalingPivot || [0, 0, 0];
+    const rw = mul(W(r), T(pivot));
+    base = invert4(rw);
+    if (keepRootScale) base = mul(S([0, 1, 2].map(c => Math.hypot(rw[c], rw[4 + c], rw[8 + c]))), base);
+  }
+  const L = ['# from ' + label + ' (whole file)'];
+  const vs = [], vts = [], vns = [], fs = [];
+  const f6 = x => +x.toFixed(6);
+  let i = 0;
+  for (const model of scene.meshOrder) {
+    const m = mul(base, mul(W(model), geometricMatrix(model.props)));
+    const nm = transpose3(invert3(m));
+    for (const tri of triangles(scene.geometries.get(model.geometry))) {
+      const ids = [];
+      for (const c of tri) {
+        const p = apply(m, c.p);
+        vs.push('v ' + p.map(x => f6(x * importScale)).join(' '));
+        if (c.t) vts.push('vt ' + c.t.map(f6).join(' '));
+        if (c.n) vns.push('vn ' + normalize(apply3(nm, c.n)).map(f6).join(' '));
+        ids.push(++i);
+      }
+      fs.push('f ' + ids.map(k => `${k}/${tri[0].t ? k : ''}/${tri[0].n ? k : ''}`).join(' '));
+    }
+  }
+  if (!i) throw new Error('no meshes in the file');
+  return L.concat(vs, vts, vns, fs).join('\n') + '\n';
+}
+function invert4(m) {
+  const r = invert3(m);
+  const t = apply3(r, [m[3], m[7], m[11]]);
+  r[3] = -t[0]; r[7] = -t[1]; r[11] = -t[2];
+  return r;
+}
 const apply = (m, p) => [m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3], m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7], m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11]];
 const apply3 = (m, p) => [m[0] * p[0] + m[1] * p[1] + m[2] * p[2], m[4] * p[0] + m[5] * p[1] + m[6] * p[2], m[8] * p[0] + m[9] * p[1] + m[10] * p[2]];
 const normalize = v => { const l = Math.hypot(...v) || 1; return v.map(x => x / l); };
@@ -261,7 +314,7 @@ function importScale(scene, settings) {
   return (s.globalScale ?? 1) * (s.useFileScale === 0 ? 1 : scene.unitScale / 100);
 }
 
-module.exports = { parseBinary, readScene, triangles, modelToObj, findModel, importScale, mul, T, R, S, neg };
+module.exports = { parseBinary, readScene, triangles, modelToObj, wholeModelToObj, findModel, importScale, mul, T, R, S, neg };
 
 if (require.main === module) {
   const scene = readScene(fs.readFileSync(process.argv[2]));
