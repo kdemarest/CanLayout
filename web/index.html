@@ -21,6 +21,7 @@
   .bar { position: fixed; left: 0; right: 0; display: flex; gap: 0.4em; padding: 0.5em; align-items: center; flex-wrap: wrap; pointer-events: none; }
   .bar > * { pointer-events: auto; }
   #top { top: 0; }
+  #lodLegend { position: fixed; right: 0.6em; top: 3.4em; display: none; padding: 0.3em 0.6em; border-radius: 8px; background: rgba(0, 0, 0, 0.55); font-size: 0.85em; font-weight: 600; }
   #status { position: fixed; left: 0.6em; top: 3.4em; max-width: 70%; padding: 0.3em 0.6em; border-radius: 8px; background: rgba(0, 0, 0, 0.45); font-size: 0.85em; }
   #actions { bottom: 0; justify-content: flex-start; }
   /* A keyboard's WASD cluster: Q W E over A S D. */
@@ -71,6 +72,7 @@ window.addEventListener("unhandledrejection", function (e) {
 </div>
 <svg id="reticle" viewBox="0 0 22 22" aria-hidden="true"><g stroke="rgba(0,0,0,0.6)" stroke-width="3"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g><g stroke="#ffffff" stroke-width="1.2"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g></svg>
 <div id="status">Loading…</div>
+<div id="lodLegend"></div>
 <div id="menu">
   <button id="newBtn">New</button>
   <button id="saveBtn">Save</button>
@@ -78,6 +80,11 @@ window.addEventListener("unhandledrejection", function (e) {
   <button id="foldersBtn">Folders</button>
   <button id="snapBtn">Snap</button>
   <button id="labelsBtn">Labels</button>
+  <button id="fogBtn" class="on">Fog</button>
+  <button id="fogClipBtn">Fog far clip</button>
+  <button id="cullingBtn">Culling</button>
+  <button id="lodTintBtn">LOD tint</button>
+  <button id="candidatesBtn" hidden>Candidate trees</button>
 </div>
 
 <div id="scalebar"><span>Scale</span><input id="scale" type="range" min="-2" max="5.615" step="0.005" value="0"><span id="scaleValue">×1.00</span></div>
@@ -115,6 +122,7 @@ window.addEventListener("unhandledrejection", function (e) {
 
 <script src="three.js"></script>
 <script src="space.js"></script>
+<script src="surface.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -8,6 +8,7 @@ const S = require('./tools/scene.js');
 const Config = require('./tools/config.js');
 const Texts = require('./tools/texts.js');
 const Shapes = require('./tools/shapes.js');
+const Timing = require('./tools/timing.js');
 
 const PORT = +process.env.PORT || 8080;
 const DEV = path.join(__dirname, '..');
@@ -30,7 +31,7 @@ const safeName = name => {
 // placeholder shapes of any asset (tools/shapes.js). Text assets are left out of newAssets:
 // texts go on tablets (Add while carrying one).
 function docsAssets() {
-  const docs = Shapes.readDocs(DOCS);
+  const docs = Timing.time('docs', () => Shapes.readDocs(DOCS));
   const newAssets = Object.entries(docs.assets).filter(([, a]) => a.chip !== '🟢' && a.type !== 'Text').map(([name]) => name).sort();
   return { newAssets, shapes: docs.shapes, sources: docs.sources, shapeErrors: docs.errors, unity: docs.assets };
 }
@@ -55,7 +56,19 @@ function withShapes(result, names) {
       }
     }
     if (!docs.shapes[name]) return;
-    result.library[name] = { kind: 'shapes', source: docs.sources[name], shapes: docs.shapes[name], parts: [] };
+    // A shape's "material" (a Unity material's name) comes as materialGuid, with its description.
+    const shapes = docs.shapes[name].map(shape => {
+      if (!shape.material) return shape;
+      try {
+        const guid = S.materialGuid(shape.material);
+        Object.assign(result.materials, S.shapeMaterials([guid], problems));
+        return { ...shape, materialGuid: guid };
+      } catch (error) {
+        problems.push(`docs/${docs.sources[name]}: ${name}: ${error.message}`);
+        return shape;
+      }
+    });
+    result.library[name] = { kind: 'shapes', source: docs.sources[name], shapes, parts: [] };
     for (const shape of docs.shapes[name]) {
       if (shape.kind !== 'use') continue;
       if (docs.shapes[shape.name]) add(shape.name, [...trail, name]);
@@ -81,10 +94,25 @@ function prefabNames() {
 function loadArea(name) {
   let area = JSON.parse(fs.readFileSync(path.join(S.AREAS, safeName(name) + '.json'), 'utf8'));
   if (area.source.config !== Config.mtime()) {
-    area = S.extractArea(area.source.scene, area.source.center, area.source.half);
+    area = Timing.time('area re-import', () => S.extractArea(area.source.scene, area.source.center, area.source.half));
     S.saveArea(name, area);
   }
   return area;
+}
+
+// unity.json's environment for a Unity scene, its sky and sea named materials made descriptions.
+function environment(unityScene, problems) {
+  const env = { ...Config.load(unityScene).environment };
+  for (const key of ['sky', 'sea']) {
+    try {
+      const guid = S.materialGuid(env[key]);
+      env[key] = S.shapeMaterials([guid], problems)[guid];
+    } catch (error) {
+      problems.push(`unity.json environment ${key}: ${error.message}`);
+      env[key] = null;
+    }
+  }
+  return env;
 }
 
 const api = {
@@ -104,9 +132,11 @@ const api = {
   'GET /api/texts': () => ({ file: Texts.FILE, texts: Texts.loadTexts(S.REPO, JSON.parse(fs.readFileSync(path.join(__dirname, 'cache', 'guid-index.json'), 'utf8')).entries, S.blobs) }),
   'GET /api/scene': q => {
     const name = safeName(q.get('name'));
-    let pieces, editable, area = null, base = [];
+    let pieces, editable, area = null, base = [], unityScene = null;
     if (q.get('kind') === 'area') {
-      pieces = loadArea(name).pieces;
+      const loaded = loadArea(name);
+      pieces = loaded.pieces;
+      unityScene = loaded.source.scene;
       editable = false;
     } else {
       // A composed scene may sit on an imported area ("- Area: <name>"), drawn read-only beneath it.
@@ -116,15 +146,32 @@ const api = {
       pieces = parsed.pieces;
       editable = true;
       area = S.areaLine(text);
-      if (area) base = loadArea(area).pieces;
+      if (area) {
+        const loaded = loadArea(area);
+        base = loaded.pieces;
+        unityScene = loaded.source.scene;
+      }
     }
     // Pieces with their own parts (trees, overridden instances) are not resolved as whole prefabs.
     const all = [...base, ...pieces];
+    const candidates = S.withCandidates(all);
     const names = all.filter(p => !p.parts).map(p => p.name);
     const { library, materials, problems } = withShapes(S.prepare(names, all.flatMap(p => p.parts || [])), names);
-    return { name, editable, pieces, area, base, library, materials, problems };
+    console.log(`load: ${name}: server ${Timing.report()}; ${pieces.length} pieces${area ? ` on ${area} (${base.length})` : ''}`);
+    const cfg = Config.load(unityScene || null);
+    for (const p of [...base, ...pieces]) p.cull = Config.cullDistance(cfg, { ...p, source: p.source || (library[p.name] && library[p.name].source) || '' });
+    return { name, editable, pieces, area, base, library, materials, problems, environment: environment(unityScene, problems), lod: { fov: cfg.lodFov, bias: cfg.lodBias }, clip: { near: cfg.near, far: cfg.far, fog: cfg.farClip }, culling: { perFrame: cfg.culling.perFrame, margin: cfg.culling.margin }, candidates };
   },
-  'POST /api/prepare': body => withShapes(S.prepare(body.names || []), body.names || []),
+  'POST /api/prepare': body => {
+    const result = withShapes(S.prepare(body.names || []), body.names || []);
+    console.log(`load: prepare ${(body.names || []).join(', ')}: server ${Timing.report()}`);
+    return result;
+  },
+  // The page's side of a load: the scene's JSON, then every mesh and texture it shows.
+  'POST /api/loaded': body => {
+    console.log(`load: ${String(body.name).slice(0, 200)}: page ${String(body.text).slice(0, 500)}`);
+    return {};
+  },
   // Page errors, so they can be read in layout.log.
   'POST /api/log': body => {
     console.error(`page error: ${String(body.text).slice(0, 2000)}`);
@@ -172,6 +219,8 @@ http.createServer((req, res) => {
     });
     req.on('end', () => {
       try {
+        S.beginRequest();
+        Timing.begin();
         const result = route(req.method === 'POST' ? JSON.parse(body || '{}') : url.searchParams);
         send(res, 200, 'application/json', JSON.stringify(result));
       } catch (error) {
@@ -189,7 +238,8 @@ http.createServer((req, res) => {
     return;
   }
   if (url.pathname === '/') return serveFile(res, path.join(WEB, 'index.html'));
-  const mesh = /^\/meshes\/([0-9a-f]{40}(?:-[0-9a-f]{8})?\.obj)$/.exec(url.pathname);
+  // Meshes by blob (40 hex), cut variants (-8 hex), and candidates (cand-20 hex; see scene.js withCandidates).
+  const mesh = /^\/meshes\/((?:[0-9a-f]{40}|cand-[0-9a-f]{20})(?:-[0-9a-f]{8})?\.obj)$/.exec(url.pathname);
   if (mesh) return serveFile(res, path.join(S.MESHES, mesh[1]));
   const texture = /^\/textures\/((?:wt)?[0-9a-f]{38,40}-\d+\.(png|jpg))$/.exec(url.pathname);
   if (texture) return serveFile(res, path.join(S.TEXTURES, texture[1]));

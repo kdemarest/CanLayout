@@ -9,7 +9,8 @@
 // "at x y z" and turned by "turn rx ry rz" (degrees, Unity order); "color #rrggbb" tints it;
 // "sides N" makes a cylinder or cone N-sided; "tip f" cuts a cone or pyramid off flat, its top
 // f times the base (a snub nose); "scale x y z" stretches it; "arc degrees" keeps a wedge of a
-// hemisphere.
+// hemisphere; "material <Name>" draws it with that Unity material (its file name, one word, e.g.
+// a modl shader's material "ModlMana") instead of a color.
 // "use <Name>" draws another asset's shapes, or a Unity prefab, e.g. "use Wood boards at 0 1 0";
 // with "color" every part of it takes that color; "bare" (Unity prefabs) keeps only its look:
 // scripts, rigidbodies, colliders and audio are removed from the placed copy.
@@ -21,10 +22,13 @@ const KINDS = {
   sphere: ['radius'],
   hemisphere: ['radius'], // a dome, flat side down
   dodecahedron: ['size'],
+  octahedron: ['size'], // point to point, a point up (stretch it with scale)
+  icosahedron: ['size'], // point to point, an edge up
+  ico60: ['size'], // a triakis icosahedron (60 faces), point to point, an edge up
   prism: ['width', 'height', 'depth'], // a triangle, width wide and height tall, extruded depth thick
   use: [] // followed by a name
 };
-const OPTIONS = ['at', 'turn', 'color', 'sides', 'tip', 'scale', 'arc', 'bare'];
+const OPTIONS = ['at', 'turn', 'color', 'sides', 'tip', 'scale', 'arc', 'bare', 'material'];
 
 // "prism 0.05 0.22 0.006 at 0 0.12 0" -> { kind, size: [...], at, turn, color }; throws if bad.
 function parseShape(text) {
@@ -49,6 +53,7 @@ function parseShape(text) {
     if (key === 'at') shape.at = numbers(3);
     else if (key === 'turn') shape.turn = numbers(3);
     else if (key === 'color' && /^#[0-9a-f]{6}$/i.test(words[0] || '')) shape.color = words.shift();
+    else if (key === 'material' && kind !== 'use' && /^[\w.-]+$/.test(words[0] || '')) shape.material = words.shift();
     else if (key === 'sides' && (kind === 'cylinder' || kind === 'cone') && /^\d+$/.test(words[0] || '') && +words[0] >= 3) shape.sides = +words.shift();
     else if (key === 'tip' && (kind === 'cone' || kind === 'pyramid') && +words[0] >= 0 && +words[0] < 1) shape.tip = +words.shift();
     else if (key === 'scale') {
@@ -56,7 +61,7 @@ function parseShape(text) {
       if (shape.scale.some(v => v <= 0)) throw new Error('scale must be above 0');
     } else if (key === 'bare' && kind === 'use') shape.bare = true;
     else if (key === 'arc' && kind === 'hemisphere' && +words[0] > 0 && +words[0] <= 360) shape.arc = +words.shift();
-    else throw new Error(`unexpected "${key}"; after the sizes use at x y z, turn rx ry rz, color #rrggbb, scale x y z, bare (use), sides N (cylinder, cone; 3 or more), tip f (cone, pyramid; 0 to below 1), arc degrees (hemisphere)`);
+    else throw new Error(`unexpected "${key}"; after the sizes use at x y z, turn rx ry rz, color #rrggbb, material Name, scale x y z, bare (use), sides N (cylinder, cone; 3 or more), tip f (cone, pyramid; 0 to below 1), arc degrees (hemisphere)`);
   }
   return shape;
 }

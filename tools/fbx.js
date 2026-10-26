@@ -2,6 +2,7 @@
 // usage: node tools/fbx.js file.fbx   (prints what it found)
 const fs = require('fs');
 const zlib = require('zlib');
+const { unityId } = require('./xxhash64');
 
 // ---------- binary node tree ----------
 // Each node is { name, props: [...], children: [...] }. Arrays come back as typed arrays.
@@ -77,28 +78,46 @@ const children = (n, name) => (n ? n.children.filter(c => c.name === name) : [])
 function properties(n) {
   const out = {};
   for (const p of children(child(n, 'Properties70'), 'P')) out[p.props[0]] = p.props.slice(4);
+  for (const p of children(child(n, 'Properties60'), 'Property')) out[p.props[0]] = p.props.slice(3); // FBX 6
   return out;
 }
 
 // ---------- scene ----------
 // { unitScale (cm per unit), upAxis, models: Map(id -> model), geometries: Map(id -> geometry) }
 // model: { id, name, parent (id or null), props, geometry (id or null) }
+const ARRAYS = new Set(['Vertices', 'PolygonVertexIndex', 'Normals', 'NormalsIndex', 'UV', 'UVIndex', 'Colors', 'ColorIndex']);
 function readScene(buf) {
   const root = parseBinary(buf);
   const gs = properties(child(root, 'GlobalSettings'));
   const objects = child(root, 'Objects');
   const models = new Map(), geometries = new Map();
+  // FBX 6 (Bowl.FBX): a model is named, not numbered, holds its own mesh, and links by name, the
+  // scene's root being the model "Scene".
+  const v6 = root.version < 7000;
   for (const n of children(objects, 'Model')) {
-    models.set(String(n.props[0]), { id: String(n.props[0]), name: String(n.props[1]).split('\u0000')[0].replace(/^Model::/, ''), kind: n.props[2], props: properties(n), parent: null, geometry: null });
+    const id = String(n.props[0]);
+    const name = String(n.props[v6 ? 0 : 1]).split('\u0000')[0].replace(/^Model::/, '');
+    models.set(id, { id, name, kind: n.props[v6 ? 1 : 2], props: properties(n), parent: null, geometry: null });
+    if (v6 && child(n, 'Vertices')) {
+      // its arrays are lists of plain values: packed, as FBX 7's are
+      const pack = node => {
+        if (ARRAYS.has(node.name) && node.props.every(x => typeof x === 'number')) node.props = [(/Index$/.test(node.name) ? Int32Array : Float64Array).from(node.props)];
+        for (const c of node.children || []) pack(c);
+      };
+      pack(n);
+      geometries.set(id, { id, name, node: n });
+      models.get(id).geometry = id;
+    }
   }
   for (const n of children(objects, 'Geometry')) {
     if (n.props[2] !== 'Mesh') continue;
     geometries.set(String(n.props[0]), { id: String(n.props[0]), name: String(n.props[1]).split('\u0000')[0].replace(/^Geometry::/, ''), node: n });
   }
   const kids = new Map(); // parent id ('0' for the scene root) -> child model ids, in file order
-  for (const c of children(child(root, 'Connections'), 'C')) {
+  const sceneRoot = to => (v6 && (to === 'Scene' || to === 'Model::Scene' || to.startsWith('Scene\u0000')) ? '0' : to);
+  for (const c of [...children(child(root, 'Connections'), 'C'), ...children(child(root, 'Connections'), 'Connect')]) {
     if (c.props[0] !== 'OO') continue;
-    const from = String(c.props[1]), to = String(c.props[2]);
+    const from = String(c.props[1]), to = sceneRoot(String(c.props[2]));
     if (geometries.has(from) && models.has(to)) models.get(to).geometry = from;
     else if (models.has(from) && (models.has(to) || to === '0')) {
       if (to !== '0') models.get(from).parent = to;
@@ -124,8 +143,7 @@ function readScene(buf) {
 }
 
 // ---------- geometry ----------
-// Triangles of one FBX mesh in its own space: { positions: [[x,y,z]...], normals, uvs } per
-// triangle corner. Polygons are fanned; normals and UVs follow their mapping/reference modes.
+// Triangles of one FBX mesh in its own space: { p, n, t (uv), c (color) } per triangle corner. Polygons are fanned; normals and UVs follow their mapping/reference modes.
 function triangles(geometry) {
   const n = geometry.node;
   const v = child(n, 'Vertices').props[0];
@@ -138,11 +156,12 @@ function triangles(geometry) {
       index: child(l, indexName) ? child(l, indexName).props[0] : null,
       mapping: child(l, 'MappingInformationType').props[0],
       reference: child(l, 'ReferenceInformationType').props[0],
-      size: dataName === 'UV' ? 2 : 3
+      size: dataName === 'UV' ? 2 : dataName === 'Colors' ? 4 : 3
     };
   };
   const normals = layer('LayerElementNormal', 'Normals', 'NormalsIndex');
   const uvs = layer('LayerElementUV', 'UV', 'UVIndex');
+  const colors = layer('LayerElementColor', 'Colors', 'ColorIndex');
   const fetch = (l, polyVertex, controlPoint, polygon) => {
     if (!l) return null;
     let i = l.mapping === 'ByPolygonVertex' ? polyVertex : l.mapping === 'ByPolygon' ? polygon : l.mapping === 'AllSame' ? 0 : controlPoint;
@@ -155,7 +174,7 @@ function triangles(geometry) {
     let cp = pvi[k];
     const last = cp < 0;
     if (last) cp = ~cp;
-    poly.push({ p: [v[cp * 3], v[cp * 3 + 1], v[cp * 3 + 2]], n: fetch(normals, k, cp, polygon), t: fetch(uvs, k, cp, polygon) });
+    poly.push({ p: [v[cp * 3], v[cp * 3 + 1], v[cp * 3 + 2]], n: fetch(normals, k, cp, polygon), t: fetch(uvs, k, cp, polygon), c: fetch(colors, k, cp, polygon) });
     if (last) {
       for (let i = 1; i < poly.length - 1; i++) out.push([poly[0], poly[i], poly[i + 1]]);
       poly = [];
@@ -227,6 +246,39 @@ function modelToObj(scene, model, importScale, label) {
   }
   return L.concat(vs, vts, vns, fs).join('\n') + '\n';
 }
+// One model's mesh as Unity imports it (normals imported, vertices welded): Unity's left-handed
+// axes (the OBJ's x negated, each triangle's corners reversed), colors as 8-bit (Color32), and
+// vertices shared where position, normal, UV and color all match. Returns { positions, normals,
+// uvs, colors, triangles }. Tangents are left to the caller (Unity computes them on import).
+function modelMesh(scene, model, importScale) {
+  const g = scene.geometries.get(model.geometry);
+  if (!g) throw new Error(`model ${model.name} has no mesh`);
+  const pivot = model.props.RotationPivot || model.props.ScalingPivot || [0, 0, 0];
+  const m = mul(T(neg(pivot)), geometricMatrix(model.props));
+  const nm = transpose3(invert3(m));
+  const out = { positions: [], normals: [], uvs: [], colors: [], triangles: [] };
+  const ids = new Map();
+  const f32 = Math.fround;
+  for (const tri of triangles(g)) {
+    for (const c of [tri[0], tri[2], tri[1]]) {
+      const p = apply(m, c.p).map((x, a) => f32((a === 0 ? -x : x) * importScale));
+      const nn = c.n ? normalize(apply3(nm, c.n)) : [0, 1, 0];
+      const n = [f32(-nn[0]), f32(nn[1]), f32(nn[2])];
+      const t = c.t ? c.t.map(f32) : [0, 0];
+      const col = c.c ? c.c.map(x => Math.round(Math.max(0, Math.min(1, x)) * 255) / 255) : [1, 1, 1, 1];
+      const k = [...p, ...n, ...t, ...col].join();
+      if (!ids.has(k)) {
+        ids.set(k, out.positions.length);
+        out.positions.push(p);
+        out.normals.push(n);
+        out.uvs.push(t);
+        out.colors.push(col);
+      }
+      out.triangles.push(ids.get(k));
+    }
+  }
+  return out;
+}
 // A model file used whole (placed directly in a prefab), as one OBJ in its root's space: every
 // mesh with its node transforms, pivots reset as Unity does. A file with one top node becomes
 // that node (Unity makes it the prefab's root); else the root is the file itself. The root's own
@@ -291,15 +343,24 @@ function invert3(m) {
 }
 
 // The model for a mesh reference: by the mesh name Unity listed (meta table), else by the
-// name of the game object holding it, else the file's only mesh, or its only one that is not
-// a lower LOD (LOD1 and beyond). Failing all that, a guess: the mesh with the most triangles.
-// (Newer Unity .meta files no longer list which internal id is which mesh.)
+// id (older Unity numbers meshes in reading order; newer hashes their names, see xxhash64.js),
+// else by the name of the game object holding it, else the file's only mesh, or its only one
+// that is not a lower LOD (LOD1 and beyond). Failing all that, a guess: the mesh with the most
+// triangles.
 function findModel(scene, meshName, objectName, fileID) {
   const withMesh = [...scene.models.values()].filter(m => m.geometry);
   // Older Unity ids number a model's meshes 4300000, 4300002, ... in reading order.
   const old = /^43(\d{5})$/.exec(String(fileID || ''));
   if (old && +old[1] % 2 === 0 && scene.meshOrder[+old[1] / 2]) return scene.meshOrder[+old[1] / 2];
   const byName = name => name && withMesh.find(m => m.name === name || scene.geometries.get(m.geometry).name === name);
+  if (fileID && !old) {
+    const seen = new Map();
+    for (const m of withMesh) {
+      const n = seen.get(m.name) || 0;
+      seen.set(m.name, n + 1);
+      if (unityId('Mesh', m.name, n) === String(fileID)) return m;
+    }
+  }
   const top = withMesh.filter(m => !/lod[1-9]\d*$/i.test(m.name));
   const largest = () => top.slice().sort((a, b) => triangleCount(scene, b) - triangleCount(scene, a))[0] || null;
   return byName(meshName) || byName(objectName) || (withMesh.length === 1 ? withMesh[0] : top.length === 1 ? top[0] : largest());
@@ -314,7 +375,7 @@ function importScale(scene, settings) {
   return (s.globalScale ?? 1) * (s.useFileScale === 0 ? 1 : scene.unitScale / 100);
 }
 
-module.exports = { parseBinary, readScene, triangles, modelToObj, wholeModelToObj, findModel, importScale, mul, T, R, S, neg };
+module.exports = { parseBinary, readScene, triangles, modelToObj, modelMesh, wholeModelToObj, findModel, importScale, mul, T, R, S, neg };
 
 if (require.main === module) {
   const scene = readScene(fs.readFileSync(process.argv[2]));

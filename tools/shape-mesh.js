@@ -67,6 +67,46 @@ function dodecahedron(size) {
   return tris.map(tri => tri.map(p => [p[0] * s, p[1] * s + size / 2, p[2] * s]));
 }
 
+// An octahedron (a point up) or icosahedron (an edge up), with Three.js's corners: every face is
+// three corners an edge apart, the solid's shortest distance. Scaled to size point to point,
+// resting on its lowest corners.
+function deltahedron(corners, size) {
+  const s = size / 2 / Math.hypot(...corners[0]), dist = (p, q) => Math.hypot(...sub(p, q));
+  const edge = Math.min(...corners.slice(1).map(p => dist(corners[0], p))), near = (p, q) => Math.abs(dist(p, q) - edge) < 1e-9;
+  const tris = [];
+  corners.forEach((p, i) => corners.forEach((q, j) => corners.forEach((r, k) => {
+    if (i < j && j < k && near(p, q) && near(q, r) && near(p, r)) tris.push([p, q, r]);
+  })));
+  const lift = -Math.min(...corners.map(p => p[1])) * s;
+  return tris.map(tri => tri.map(p => [p[0] * s, p[1] * s + lift, p[2] * s]));
+}
+const OCTAHEDRON = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+const GOLDEN = (1 + Math.sqrt(5)) / 2;
+const ICOSAHEDRON = [-1, 1].flatMap(a => [-1, 1].flatMap(b => [[a, b * GOLDEN, 0], [0, a, b * GOLDEN], [b * GOLDEN, 0, a]]));
+// A triakis icosahedron: an icosahedron with a low three-sided pyramid on each face, 60
+// triangles. Its corners are the icosahedron's (Three.js's, an edge up) and, over the middle of
+// each face, an apex; as the Catalan solid, the apexes are ICO60_APEX (0.855) as far out: the
+// corners (0, ±1, ±φ) against a dodecahedron's (±1, ±1, ±1) times (5 + 7√5) / 22 (checked against
+// the dual of the truncated dodecahedron). Scaled to size point to point, resting on its lowest
+// corners.
+const ICO60_APEX = (5 + 7 * Math.sqrt(5)) / 22 * Math.sqrt(3) / Math.hypot(1, GOLDEN);
+function ico60(size) {
+  // The icosahedron's faces: three corners each 2 apart, its edge.
+  const near = (p, q) => Math.abs(Math.hypot(...sub(p, q)) - 2) < 1e-9, faces = [];
+  ICOSAHEDRON.forEach((p, i) => ICOSAHEDRON.forEach((q, j) => ICOSAHEDRON.forEach((r, k) => {
+    if (i < j && j < k && near(p, q) && near(q, r) && near(p, r)) faces.push([p, q, r]);
+  })));
+  const unit = p => p.map(x => x / Math.hypot(...p));
+  const tris = [];
+  for (const f of faces) {
+    const apex = unit([0, 1, 2].map(i => f[0][i] + f[1][i] + f[2][i])).map(x => x * ICO60_APEX);
+    const corner = f.map(unit);
+    for (let k = 0; k < 3; k++) tris.push([apex, corner[k], corner[(k + 1) % 3]]);
+  }
+  const s = size / 2, lift = -Math.min(...tris.flat().map(p => p[1])) * s;
+  return tris.map(tri => tri.map(p => [p[0] * s, p[1] * s + lift, p[2] * s]));
+}
+
 // Triangles of one shape in its own space, before scale, turn and at.
 function solid(shape) {
   const [a, b, c] = shape.size, tip = shape.tip || 0;
@@ -85,6 +125,9 @@ function solid(shape) {
       return tris;
     }
     case 'dodecahedron': return dodecahedron(a);
+    case 'octahedron': return deltahedron(OCTAHEDRON, a);
+    case 'icosahedron': return deltahedron(ICOSAHEDRON, a);
+    case 'ico60': return ico60(a);
     case 'prism': {
       const corner = (x, y, z) => [x, y, z], z = c / 2;
       const f = [corner(-a / 2, 0, -z), corner(a / 2, 0, -z), corner(0, b, -z)], k = f.map(p => [p[0], p[1], z]);

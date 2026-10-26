@@ -6,6 +6,7 @@
 //   <Name>.prefab          an empty root holding the models below and any "use" prefabs
 //   Models/<Name>.obj      the shapes of one color (<Name>_2.obj ... for more colors)
 //   Materials/Shape_<rrggbb>.mat   one material per color, on Canopy/General (Assets/Shaders)
+// A shape with "material <Name>" uses that Unity material instead of a color's (one model each).
 // <Name> is the asset's Unity name: its "as" specifier, else its name in PascalCase (Burl shard
 // -> BurlShard). Guids come from each file's path, so rerunning keeps every reference. Once a
 // prefab of that name exists elsewhere in the project (real art), the asset is skipped and
@@ -163,11 +164,17 @@ function actingComponents(guid, depth = 0) {
   return out;
 }
 
+let index = null;
+const loadIndex = () => index || (index = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cache', 'guid-index.json'), 'utf8')).entries);
+// A Unity material's guid by its file name, or null if no material, or more than one, has it.
+function namedMaterial(name) {
+  const hits = Object.entries(loadIndex()).filter(([, e]) => e.path.endsWith('.mat') && path.basename(e.path, '.mat').toLowerCase() === name.toLowerCase());
+  return hits.length === 1 ? hits[0][0] : null;
+}
 // The project's own prefab with this name, outside Assets/Placeholder, or a model file named
 // with its extension: { guid, rootT, rootGo, path }.
-let index = null;
 function realPrefab(name) {
-  if (!index) index = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cache', 'guid-index.json'), 'utf8')).entries;
+  loadIndex();
   // A model file by name ("LeafSingle.fbx"): its root has Unity's fixed model ids.
   if (/\.(fbx|obj)$/i.test(name)) {
     const model = Object.entries(index).find(([, e]) => e.path.endsWith('/' + name));
@@ -207,18 +214,20 @@ function plan() {
       continue;
     }
     const children = [];
-    // Own shapes, one model per color in order of first use.
+    // Own shapes, one model per color (or named material) in order of first use.
     const byColor = new Map();
     for (const s of shapes.filter(s => s.kind !== 'use')) {
-      const hex = (s.color || DEFAULT_COLOR).toLowerCase();
-      if (!byColor.has(hex)) byColor.set(hex, []);
-      byColor.get(hex).push(...Mesh.triangles(s));
+      if (s.material && !namedMaterial(s.material)) notes.push(`${name}: no single Unity material is named ${s.material}; drawn in its color`);
+      const key = s.material && namedMaterial(s.material) ? 'material:' + s.material : (s.color || DEFAULT_COLOR).toLowerCase();
+      if (!byColor.has(key)) byColor.set(key, []);
+      byColor.get(key).push(...Mesh.triangles(s));
     }
-    [...byColor].forEach(([hex, tris], i) => {
+    [...byColor].forEach(([key, tris], i) => {
       const model = byColor.size > 1 ? `${unity}_${i + 1}` : unity, file = `${DIR}/Models/${model}.obj`;
+      const material = key.startsWith('material:') ? namedMaterial(key.slice(9)) : materialFor(key);
       put(file, Mesh.toObj(tris, model));
       put(file + '.meta', OBJ_META.replace('{{guid}}', guidOf(file)));
-      children.push({ guid: guidOf(file), rootT: MODEL.t, rootGo: MODEL.go, name: model, at: [0, 0, 0], turn: [0, 0, 0], material: materialFor(hex) });
+      children.push({ guid: guidOf(file), rootT: MODEL.t, rootGo: MODEL.go, name: model, at: [0, 0, 0], turn: [0, 0, 0], material });
     });
     // "use": the other asset's prefab (real or placeholder), or a Unity prefab by name.
     for (const s of shapes.filter(s => s.kind === 'use')) {

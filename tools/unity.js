@@ -93,9 +93,20 @@ function modifications(body) {
 function parse(text) {
   const d = documents(text.replace(/\r\n/g, '\n')); // some files have Windows line endings
   const t = {}, go = {}, mesh = {}, inst = {}, strippedT = {}, strippedGo = {}, textId = {}, shown = {}, material = {};
+  const lodGroup = {}, rendererGo = {}; // LODGroups by game object; renderer id -> its game object
+  const scripts = []; // [game object, script guid, body] of every MonoBehaviour
   let takesText = false; // has a script that declares a textId field (Tablet, Sign, Note)
   for (const x of d) {
     // A mesh is drawn only by an enabled MeshRenderer (23) or SkinnedMeshRenderer (137).
+    if ((x.cls === 23 || x.cls === 137) && !x.stripped) rendererGo[x.id] = ref(x.body, 'm_GameObject');
+    // An LODGroup (205): its reference point and size (in its object's space), and per level the
+    // screen height it shows down to and its renderers.
+    if (x.cls === 205 && !x.stripped && !/\n {2}m_Enabled: 0/.test(x.body)) {
+      const levels = x.body.split(/\n {2}- screenRelativeHeight: /).slice(1).map(l => ({
+        height: parseFloat(l), renderers: [...l.matchAll(/- renderer: \{fileID: (-?\d+)\}/g)].map(m => m[1])
+      }));
+      lodGroup[ref(x.body, 'm_GameObject')] = { point: vec(x.body, 'm_LocalReferencePoint') || { x: 0, y: 0, z: 0 }, size: num((/m_Size: (\S+)/.exec(x.body) || [])[1]) || 1, levels };
+    }
     if ((x.cls === 23 || x.cls === 137) && !x.stripped && !/\n {2}m_Enabled: 0/.test(x.body)) {
       shown[ref(x.body, 'm_GameObject')] = true;
       // The first material; meshes with several submeshes use only it for now.
@@ -117,6 +128,7 @@ function parse(text) {
       if (r) mesh[ref(x.body, 'm_GameObject')] = r;
     } else if (x.cls === 114) {
       const script = guidRef(x.body, 'm_Script');
+      if (script && !x.stripped) scripts.push([ref(x.body, 'm_GameObject'), script.guid, x.body]);
       if (script && scriptTakesText(script.guid)) takesText = true;
       const m = /\n {2}textId: (.+)/.exec(x.body);
       if (m && m[1].trim()) textId[ref(x.body, 'm_GameObject')] = m[1].trim();
@@ -125,7 +137,14 @@ function parse(text) {
       inst[x.id] = { src: src && src.guid, parent: ref(x.body, 'm_TransformParent'), mods: modifications(x.body) };
     }
   }
-  return { t, go, mesh, inst, strippedT, strippedGo, textId, material, shown, takesText };
+  // Scripts added to a prefab instance here sit on its stripped root game object.
+  const addedScripts = {}, addedScriptBodies = {};
+  for (const [g, guid, body] of scripts) {
+    if (!strippedGo[g]) continue;
+    (addedScripts[strippedGo[g]] = addedScripts[strippedGo[g]] || []).push(guid);
+    (addedScriptBodies[strippedGo[g]] = addedScriptBodies[strippedGo[g]] || []).push({ guid, body });
+  }
+  return { t, go, mesh, inst, strippedT, strippedGo, textId, material, shown, takesText, lodGroup, rendererGo, scripts, addedScripts, addedScriptBodies };
 }
 
 // ---------- repository lookups ----------
@@ -174,7 +193,8 @@ const prefabCache = new Map();
 // Nested prefabs and variants are followed. overrides (fileID -> { pos, rot, scl, active })
 // changes objects in this prefab, as a prefab instance's modifications do, including objects
 // inside its nested prefabs (their ids are XOR-combined; see xorId). Inactive objects are
-// left out, and of sibling LOD meshes only the most detailed one present is kept.
+// left out. Meshes an LODGroup draws keep every level (part.lod; result.lodGroups); of sibling
+// LOD meshes without one, only the most detailed present is kept.
 function prefab(guid, depth = 0, overrides = null) {
   if (!overrides && prefabCache.has(guid)) return prefabCache.get(guid);
   const e = index()[guid];
@@ -270,7 +290,7 @@ function nodes(f, depth, overrides = null) {
     if (overridden && !sub.model) sub = prefab(x.src, depth + 1, inner);
     // Components added to the instance's stripped root game object (e.g. a MeshFilter).
     const addedGo = Object.keys(f.strippedGo).find(g => f.strippedGo[g] === id);
-    n['pi' + id] = { kind: 'pi', father: alias(x.parent), pos, rot, scl, name, active, sub, overridden, mesh: addedGo ? f.mesh[addedGo] || null : null, meshOff: addedGo ? !f.shown[addedGo] : false, material: addedGo ? f.material[addedGo] || null : null, textId };
+    n['pi' + id] = { kind: 'pi', father: alias(x.parent), pos, rot, scl, name, active, sub, overridden, mods: x.mods, addedScripts: f.addedScripts[id] || [], addedScriptBodies: f.addedScriptBodies[id] || [], mesh: addedGo ? f.mesh[addedGo] || null : null, meshOff: addedGo ? !f.shown[addedGo] : false, material: addedGo ? f.material[addedGo] || null : null, textId };
   }
   return n;
 }
@@ -283,25 +303,50 @@ function graph(f, depth, overrides = null, prefabName = '') {
     if (x.father === '0') root = root || id;
     else (children[x.father] = children[x.father] || []).push(id);
   }
-  if (!root) return { rootId: null, rootGoId: null, rootTrs: { pos: { x: 0, y: 0, z: 0 }, rot: { x: 0, y: 0, z: 0, w: 1 }, scl: { x: 1, y: 1, z: 1 } }, parts: [] };
+  if (!root) return { rootId: null, rootGoId: null, rootTrs: { pos: { x: 0, y: 0, z: 0 }, rot: { x: 0, y: 0, z: 0, w: 1 }, scl: { x: 1, y: 1, z: 1 } }, parts: [], lodGroups: {} };
   const parts = [];
   const lods = []; // [part, parent id, group name, lod index] for this file's own meshes
+  // LODGroups, by key (this file's transform id, or instance id / key inside a nested prefab):
+  // { center (prefab space), size (its world size there), heights (each level's lowest screen
+  // height, a fraction) }; a part drawn by one carries lod: { key, levels }.
+  const lodGroups = {}, lodOf = {};
   const visit = (id, m, parentOff) => {
     const x = n[id];
     const off = parentOff || !x.active;
+    const g = x.kind === 't' && f.lodGroup[x.go];
+    if (g) {
+      lodGroups[id] = { center: apply(m, g.point), size: g.size * maxScale(m), scale: maxScale(m), heights: g.levels.map(l => l.height) };
+      g.levels.forEach((l, level) => {
+        for (const r of l.renderers) {
+          const rgo = f.rendererGo[r];
+          if (!rgo) continue;
+          const o = lodOf[rgo] = lodOf[rgo] || { key: id, levels: [] };
+          if (o.key === id) o.levels.push(level);
+        }
+      });
+    }
     if (x.mesh) {
       const mesh = describeMesh(x.mesh);
-      const part = { mesh, m, material: x.material, object: x.name, prefab: prefabName, off: off || x.meshOff };
-      // LODs are named on the object (Lod0, ring_LOD1) or on the mesh (Rock_Lod2).
-      const lod = lodIndex(x.name) >= 0 ? lodIndex(x.name) : lodIndex(mesh.name);
-      if (lod >= 0) lods.push([part, x.father, (x.name || '').replace(/(?:^|[_ ])l(?:od)?\d+$/i, ''), lod]);
+      // off: not drawn (an inactive object, or no enabled renderer); rendererOff: no enabled
+      // renderer, which is all GridRender checks (it draws a tree's chunks under its inactive Parts).
+      const part = { mesh, m, material: x.material, object: x.name, prefab: prefabName, off: off || x.meshOff, rendererOff: Boolean(x.meshOff) };
+      if (lodOf[x.go]) part.lod = lodOf[x.go];
+      else {
+        // LODs are named on the object (Lod0, ring_LOD1) or on the mesh (Rock_Lod2).
+        const lod = lodIndex(x.name) >= 0 ? lodIndex(x.name) : lodIndex(mesh.name);
+        if (lod >= 0) lods.push([part, x.father, (x.name || '').replace(/(?:^|[_ ])l(?:od)?\d+$/i, ''), lod]);
+      }
       parts.push(part);
     }
-    if (x.kind === 'pi' && x.sub) for (const p of x.sub.parts) parts.push({ ...p, m: mul(m, p.m), off: off || p.off });
+    if (x.kind === 'pi' && x.sub) {
+      const inst = id.slice(2);
+      for (const p of x.sub.parts) parts.push({ ...p, m: mul(m, p.m), off: off || p.off, ...(p.lod ? { lod: { key: inst + '/' + p.lod.key, levels: p.lod.levels } } : {}) });
+      for (const [k, sg] of Object.entries(x.sub.lodGroups || {})) lodGroups[inst + '/' + k] = { center: apply(m, sg.center), size: sg.size * maxScale(m), scale: sg.scale * maxScale(m), heights: sg.heights };
+    }
     for (const c of children[id] || []) visit(c, mul(m, trs(n[c].pos, n[c].rot, n[c].scl)), off);
   };
   visit(root, I(), false);
-  // Of sibling LODs keep the most detailed present (a prefab may hold only its Lod3).
+  // Of sibling LODs no LODGroup covers, keep the most detailed present (a prefab may hold only its Lod3).
   const best = {};
   for (const [, parent, group, lod] of lods) best[parent + '|' + group] = Math.min(best[parent + '|' + group] ?? Infinity, lod);
   const drop = new Set(lods.filter(([, parent, group, lod]) => lod > best[parent + '|' + group]).map(l => l[0]));
@@ -312,8 +357,11 @@ function graph(f, depth, overrides = null, prefabName = '') {
   const instId = r.kind === 'pi' ? root.slice(2) : null;
   const rootId = r.kind === 't' ? root : (Object.keys(f.strippedT).find(s => 'pi' + f.strippedT[s] === root) || (r.sub && r.sub.rootId ? xorId(instId, r.sub.rootId) : null));
   const rootGoId = r.kind === 't' ? r.go : (Object.keys(f.strippedGo).find(g => 'pi' + f.strippedGo[g] === root) || (r.sub && r.sub.rootGoId ? xorId(instId, r.sub.rootGoId) : null));
-  return { rootId, rootGoId, rootTrs: { pos: r.pos, rot: r.rot, scl: r.scl }, parts };
+  return { rootId, rootGoId, rootTrs: { pos: r.pos, rot: r.rot, scl: r.scl }, parts, lodGroups };
 }
+// A point through a row-major 4x4 matrix, and the matrix's largest axis scale.
+const apply = (m, p) => { const [x, y, z] = Array.isArray(p) ? p : [p.x, p.y, p.z]; return [0, 1, 2].map(r => m[r * 4] * x + m[r * 4 + 1] * y + m[r * 4 + 2] * z + m[r * 4 + 3]); };
+const maxScale = m => Math.max(...[0, 1, 2].map(c => Math.hypot(m[c], m[4 + c], m[8 + c])));
 
 // ---------- scenes ----------
 // Every scene object that is a piece: each prefab instance, and each plain object with a mesh,
@@ -346,7 +394,7 @@ function scenePieces(sceneFile) {
   for (const [id, x] of Object.entries(n)) {
     if (x.kind === 't' && !x.mesh) continue;
     const w = world(id);
-    if (x.kind === 'pi') out.push({ piece: x.sub ? x.sub.name : x.name, prefab: x.sub, overridden: x.overridden, ...w, textId: x.textId });
+    if (x.kind === 'pi') out.push({ piece: x.sub ? x.sub.name : x.name, prefab: x.sub, overridden: x.overridden, mods: x.mods, addedScripts: x.addedScripts, addedScriptBodies: x.addedScriptBodies, ...w, textId: x.textId });
     else {
       const mesh = describeMesh(x.mesh);
       if (isLodBeyondZero(mesh.name)) continue;
@@ -356,11 +404,46 @@ function scenePieces(sceneFile) {
   return out;
 }
 
+// A gridded tree's LOD settings, from the prefab file holding its chunks (by name): its GridGroup's
+// objectSize and cutoffArray (percent of screen height per level), and whether a GridRender draws
+// the chunks itself (Canopy's GridRender.TestLoDs) instead of their LODGroups. A scene's instance
+// may override GridGroup's values (mods) or add the GridRender (addedScripts).
+const scriptGuid = name => Object.entries(index()).find(([, e]) => e.path === `Assets/Scripts/${name}.cs`)?.[0];
+function gridSettings(prefabName, mods = [], addedScripts = []) {
+  const e = Object.values(index()).find(x => x.path.endsWith('/' + prefabName + '.prefab'));
+  if (!e) return null;
+  const f = parse(fs.readFileSync(path.join(REPO, e.path), 'utf8'));
+  const group = scriptGuid('GridGroup'), render = scriptGuid('GridRender');
+  const g = f.scripts.find(x => x[1] === group);
+  if (!g) return null;
+  const body = g[2];
+  let objectSize = num((/\n {2}objectSize: (\S+)/.exec(body) || [])[1]) ?? 1;
+  const list = /\n {2}cutoffArray:\n((?: {2}- .*\n)*)/.exec(body);
+  const cutoffs = list ? [...list[1].matchAll(/- (\S+)/g)].map(m => parseFloat(m[1])) : [];
+  for (const m of mods) {
+    if (m.path === 'objectSize') objectSize = parseFloat(m.value);
+    const k = /^cutoffArray\.Array\.data\[(\d+)\]$/.exec(m.path);
+    if (k) cutoffs[+k[1]] = parseFloat(m.value);
+  }
+  const manual = f.scripts.some(x => x[1] === render && !/\n {2}m_Enabled: 0/.test(x[2]) && !/\n {2}useManualRender: 0/.test(x[2])) || addedScripts.includes(render);
+  return { objectSize, cutoffs, manual, prefab: e.path };
+}
+
 // The prefab with this name (file basename), or null; warns when several share it.
+// Prefab guids by file name (several prefabs may share one), built once with the index.
+let prefabGuids = null;
 function prefabByName(name) {
-  const hits = Object.entries(index()).filter(([, e]) => e.path.endsWith('/' + name + '.prefab'));
+  if (!prefabGuids) {
+    prefabGuids = new Map();
+    for (const [guid, e] of Object.entries(index())) {
+      if (!e.path.endsWith('.prefab')) continue;
+      const base = path.basename(e.path, '.prefab');
+      prefabGuids.set(base, [...(prefabGuids.get(base) || []), [guid, e]]);
+    }
+  }
+  const hits = prefabGuids.get(name) || [];
   if (hits.length > 1) console.warn(`several prefabs named ${name}; using ${hits[0][1].path}`);
   return hits.length ? prefab(hits[0][0]) : null;
 }
 
-module.exports = { REPO, I, mul, trs, qmul, eulerToQuat, quatToEuler, parse, prefab, prefabByName, modelInstance, scenePieces, describeMesh, isLodBeyondZero };
+module.exports = { REPO, I, mul, trs, qmul, eulerToQuat, quatToEuler, parse, prefab, prefabByName, modelInstance, scenePieces, describeMesh, isLodBeyondZero, gridSettings, maxScale, scriptGuid };

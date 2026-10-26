@@ -1,6 +1,17 @@
 {
   "defaults": {
-    "treeLod": 0,
+    "near": 0.03,
+    "far": 400,
+    "lodFov": 90,
+    "culling": { "perFrame": 0.05, "margin": 6, "default": "fog", "rules": [
+      { "rule": "prefab:Tree*", "distance": 400 },
+      { "rule": "prefab:TutTree*", "distance": 400 },
+      { "rule": "prefab:Grid*", "distance": 400 }
+    ] },
+    "lodBias": 1,
+    "gridDrawsInactiveParts": true,
+    "gridLodByDistance": true,
+    "leafThinning": { "start": 40, "end": 200, "keep": 0.3, "grow": true },
     "treeChunks": "Meshes/Grid*",
     "maxTexture": 1024,
     "show": [
