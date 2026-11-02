@@ -13,7 +13,9 @@
     "gridLodByDistance": true,
     "leafThinning": { "start": 40, "end": 200, "keep": 0.3, "grow": true },
     "treeChunks": "Meshes/Grid*",
+    "tweakWorkers": { "Assets/Modl/": ["python3", "../modl/obj/serve.py"] },
     "maxTexture": 1024,
+    "include": ["World"],
     "show": [
       "mesh:ForestTreeLeaves*"
     ],

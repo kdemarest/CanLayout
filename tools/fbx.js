@@ -1,4 +1,5 @@
-// Binary FBX reader: the node tree, then its models and meshes, and OBJ output in Unity's terms.
+// FBX reader (binary, and ASCII since 2026-10-29): the node tree, then its models and meshes, and
+// OBJ output in Unity's terms.
 // usage: node tools/fbx.js file.fbx   (prints what it found)
 const fs = require('fs');
 const zlib = require('zlib');
@@ -7,7 +8,7 @@ const { unityId } = require('./xxhash64');
 // ---------- binary node tree ----------
 // Each node is { name, props: [...], children: [...] }. Arrays come back as typed arrays.
 function parseBinary(buf) {
-  if (buf.toString('latin1', 0, 20) !== 'Kaydara FBX Binary  ') throw new Error('not a binary FBX (ASCII FBX is not supported)');
+  if (buf.toString('latin1', 0, 20) !== 'Kaydara FBX Binary  ') throw new Error('not a binary FBX');
   const version = buf.readUInt32LE(23);
   const wide = version >= 7500; // 64-bit record offsets
   let at = 27;
@@ -71,6 +72,82 @@ function parseBinary(buf) {
   }
   return { version, children: top };
 }
+// ---------- ASCII node tree ----------
+// The same tree from an ASCII FBX (Ken, 2026-10-29: the Tangle's Fae lantern is one): lines of
+// "Name: value, value {" with children inside braces, strings in quotes, ";" comments. An array
+// is "Name: *count { a: v,v,... }": its node's one prop becomes a typed array, of integers for
+// indices (Int32Array) and doubles otherwise, as binary FBX stores them. Ids (integers too big for
+// a double) are kept exact as BigInt, as binary FBX's are.
+function parseAscii(text) {
+  let at = 0;
+  const n = text.length;
+  const skip = () => {
+    for (;;) {
+      while (at < n && /\s/.test(text[at])) at++;
+      if (text[at] !== ';') return;
+      while (at < n && text[at] !== '\n') at++;
+    }
+  };
+  const NAME = /[A-Za-z_][\w|.-]*(?=:)/y, NUMBER = /[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?/y, WORD = /[A-Za-z_][\w|.-]*/y;
+  const match = re => { re.lastIndex = at; const m = re.exec(text); if (m) at = re.lastIndex; return m && m[0]; };
+  const value = () => {
+    if (text[at] === '"') {
+      const end = text.indexOf('"', at + 1);
+      const s = text.slice(at + 1, end);
+      at = end + 1;
+      return s;
+    }
+    if (text[at] === '*') { at++; return { count: +match(NUMBER) }; }
+    const num = match(NUMBER);
+    if (num !== null) {
+      if (/[.eE]/.test(num)) return parseFloat(num);
+      const v = Number(num);
+      return Number.isSafeInteger(v) ? v : BigInt(num);
+    }
+    return match(WORD); // a bare word: T, Y, W (booleans and flags)
+  };
+  const nodes = () => {
+    const out = [];
+    for (;;) {
+      skip();
+      if (at >= n || text[at] === '}') return out;
+      const name = match(NAME);
+      if (name === null) throw new Error(`ASCII FBX: no node name at ${at}`);
+      at++; // the colon
+      const props = [];
+      skip();
+      if (text[at] !== '{' && text[at] !== '}' && !(NAME.lastIndex = at, NAME.test(text))) {
+        for (;;) {
+          props.push(value());
+          skip();
+          if (text[at] !== ',') break;
+          at++;
+          skip();
+        }
+      }
+      let kids = [];
+      if (text[at] === '{') {
+        at++;
+        kids = nodes();
+        skip();
+        at++; // the closing brace
+      }
+      const node = { name, props, children: kids };
+      if (props.length === 1 && props[0] && props[0].count !== undefined) {
+        const values = (kids.find(k => k.name === 'a') || { props: [] }).props.map(Number);
+        node.props = [(/Index$|^Edges$|^Materials$|^Smoothing$|^KeyAttrFlags$|^KeyAttrRefCount$|^KeyTime$/.test(name) ? (/^KeyTime$/.test(name) ? Float64Array : Int32Array) : Float64Array).from(values)];
+        node.children = [];
+      }
+      out.push(node);
+    }
+  };
+  const top = nodes();
+  const header = top.find(t => t.name === 'FBXHeaderExtension');
+  const version = header && header.children.find(c => c.name === 'FBXVersion');
+  return { version: version ? Number(version.props[0]) : 7400, children: top };
+}
+// Either kind, by its first bytes.
+const parse = buf => (buf.toString('latin1', 0, 18) === 'Kaydara FBX Binary' ? parseBinary(buf) : parseAscii(buf.toString('utf8')));
 const child = (n, name) => n && n.children.find(c => c.name === name);
 const children = (n, name) => (n ? n.children.filter(c => c.name === name) : []);
 
@@ -87,7 +164,7 @@ function properties(n) {
 // model: { id, name, parent (id or null), props, geometry (id or null) }
 const ARRAYS = new Set(['Vertices', 'PolygonVertexIndex', 'Normals', 'NormalsIndex', 'UV', 'UVIndex', 'Colors', 'ColorIndex']);
 function readScene(buf) {
-  const root = parseBinary(buf);
+  const root = parse(buf);
   const gs = properties(child(root, 'GlobalSettings'));
   const objects = child(root, 'Objects');
   const models = new Map(), geometries = new Map();
@@ -375,7 +452,7 @@ function importScale(scene, settings) {
   return (s.globalScale ?? 1) * (s.useFileScale === 0 ? 1 : scene.unitScale / 100);
 }
 
-module.exports = { parseBinary, readScene, triangles, modelToObj, modelMesh, wholeModelToObj, findModel, importScale, mul, T, R, S, neg };
+module.exports = { parseBinary, parseAscii, readScene, triangles, modelToObj, modelMesh, wholeModelToObj, findModel, importScale, mul, T, R, S, neg };
 
 if (require.main === module) {
   const scene = readScene(fs.readFileSync(process.argv[2]));

@@ -1,39 +1,21 @@
 // Builds cache/guid-index.json from the Canopy repo's .meta files, read from git (no checkout),
-// plus uncommitted changes in the working tree.
+// plus uncommitted changes in the working tree. The committed part is kept per commit in
+// cache/guid-index-head.json, so a rerun on the same commit only rereads the working tree
+// (seconds; the server reruns it when uncommitted Canopy files change).
 // usage (cwd = layout/): node tools/guid-index.js
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const GIT = ['--git-dir=' + process.env.HOME + '/git-repos/Canopy.git'];
 const git = (args, input) => execFileSync('git', GIT.concat(args), { input, maxBuffer: 1 << 30 });
+const HEAD_CACHE = 'cache/guid-index-head.json';
+// Bump when what an entry holds changes, so the committed part is read again.
+const ENTRIES = 2;
 
 const commit = git(['rev-parse', 'HEAD']).toString().trim();
-const tree = git(['ls-tree', '-r', 'HEAD']).toString().trim().split('\n').map(l => {
-  const [meta, path] = l.split('\t');
-  return { path, blob: meta.split(' ')[2] };
-});
-const blobOf = new Map(tree.map(t => [t.path, t.blob]));
-const metas = tree.filter(t => t.path.endsWith('.meta'));
+const head = fs.existsSync(HEAD_CACHE) ? JSON.parse(fs.readFileSync(HEAD_CACHE, 'utf8')) : null;
+const { entries, blobOf } = head && head.commit === commit && head.entriesVersion === ENTRIES ? { entries: head.entries, blobOf: new Map(Object.entries(head.blobOf)) } : committed();
 
-// fetch any meta blobs still missing, in one request
-const missing = git(['cat-file', '--batch-check'], metas.map(m => m.blob).join('\n') + '\n')
-  .toString().split('\n').filter(l => l.endsWith(' missing')).map(l => l.split(' ')[0]);
-if (missing.length) {
-  console.log('fetching', missing.length, 'meta blobs');
-  git(['-c', 'fetch.negotiationAlgorithm=noop', 'fetch', 'origin', '--no-tags', '--no-write-fetch-head',
-    '--recurse-submodules=no', '--filter=blob:none', '--stdin'], missing.join('\n') + '\n');
-}
-
-// read all meta blobs in one batch
-const out = git(['cat-file', '--batch'], metas.map(m => m.blob).join('\n') + '\n');
-const text = new Map();
-for (let i = 0; i < out.length;) {
-  const nl = out.indexOf(10, i);
-  const [oid, , size] = out.slice(i, nl).toString().split(' ');
-  text.set(oid, out.slice(nl + 1, nl + 1 + +size).toString());
-  i = nl + 1 + +size + 1;
-}
-
-// One .meta's entry: { path, blob, folder?, meshes?, import? }.
+// One .meta's entry: { path, blob, folder?, meshes?, import?, alpha? }.
 function entryFor(path, t, blob) {
   const g = /^guid: (\w+)/m.exec(t);
   if (!g) return null;
@@ -50,13 +32,54 @@ function entryFor(path, t, blob) {
     const field = k => { const m = new RegExp('^\\s+' + k + ': (\\S+)', 'm').exec(t); return m ? +m[1] : undefined; };
     e.import = { globalScale: field('globalScale'), useFileScale: field('useFileScale'), useFileUnits: field('useFileUnits'), bakeAxisConversion: field('bakeAxisConversion') };
   }
+  // A texture's Alpha Source (Ken, 2026-10-30: the gems' glow is an RGB PNG whose alpha Unity makes
+  // from its brightness): 0 None (its alpha dropped), 2 From Gray Scale (the average of its RGB);
+  // Input Texture Alpha, Unity's default, isn't noted. Older metas say grayScaleToAlpha instead.
+  if (/^TextureImporter:/m.test(t)) {
+    const usage = /^\s+alphaUsage: (\d)/m.exec(t);
+    const a = usage ? +usage[1] : /^\s+grayScaleToAlpha: 1/m.test(t) ? 2 : 1;
+    if (a !== 1) e.alpha = a;
+  }
   return [g[1], e];
 }
-const entries = {};
-for (const m of metas) {
-  const path = m.path.slice(0, -5);
-  const found = entryFor(path, text.get(m.blob), blobOf.get(path) || null);
-  if (found) entries[found[0]] = found[1];
+
+// The committed part: every .meta in HEAD, read from git (missing blobs fetched).
+function committed() {
+  const tree = git(['ls-tree', '-r', 'HEAD']).toString().trim().split('\n').map(l => {
+    const [meta, path] = l.split('\t');
+    return { path, blob: meta.split(' ')[2] };
+  });
+  const blobOf = new Map(tree.map(t => [t.path, t.blob]));
+  const metas = tree.filter(t => t.path.endsWith('.meta'));
+
+  // fetch any meta blobs still missing, in one request
+  const missing = git(['cat-file', '--batch-check'], metas.map(m => m.blob).join('\n') + '\n')
+    .toString().split('\n').filter(l => l.endsWith(' missing')).map(l => l.split(' ')[0]);
+  if (missing.length) {
+    console.log('fetching', missing.length, 'meta blobs');
+    git(['-c', 'fetch.negotiationAlgorithm=noop', 'fetch', 'origin', '--no-tags', '--no-write-fetch-head',
+      '--recurse-submodules=no', '--filter=blob:none', '--stdin'], missing.join('\n') + '\n');
+  }
+
+  // read all meta blobs in one batch
+  const out = git(['cat-file', '--batch'], metas.map(m => m.blob).join('\n') + '\n');
+  const text = new Map();
+  for (let i = 0; i < out.length;) {
+    const nl = out.indexOf(10, i);
+    const [oid, , size] = out.slice(i, nl).toString().split(' ');
+    text.set(oid, out.slice(nl + 1, nl + 1 + +size).toString());
+    i = nl + 1 + +size + 1;
+  }
+
+  const entries = {};
+  for (const m of metas) {
+    const path = m.path.slice(0, -5);
+    const found = entryFor(path, text.get(m.blob), blobOf.get(path) || null);
+    if (found) entries[found[0]] = found[1];
+  }
+  fs.mkdirSync('cache', { recursive: true });
+  fs.writeFileSync(HEAD_CACHE, JSON.stringify({ commit, entriesVersion: ENTRIES, entries, blobOf: Object.fromEntries(blobOf) }));
+  return { entries: JSON.parse(JSON.stringify(entries)), blobOf };
 }
 
 // Uncommitted changes in the working tree overlay HEAD, as Unity would see them: added or changed

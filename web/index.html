@@ -20,7 +20,9 @@
   button svg { display: block; }
   .bar { position: fixed; left: 0; right: 0; display: flex; gap: 0.4em; padding: 0.5em; align-items: center; flex-wrap: wrap; pointer-events: none; }
   .bar > * { pointer-events: auto; }
-  #top { top: 0; }
+  #top { top: 0; flex-wrap: nowrap; }
+  /* The scene list gives way, so ⛶ always fits beside it. */
+  #sceneSelect { min-width: 0; flex: 0 1 auto; max-width: calc(100vw - 12em); text-overflow: ellipsis; }
   #lodLegend { position: fixed; right: 0.6em; top: 3.4em; display: none; padding: 0.3em 0.6em; border-radius: 8px; background: rgba(0, 0, 0, 0.55); font-size: 0.85em; font-weight: 600; }
   #status { position: fixed; left: 0.6em; top: 3.4em; max-width: 70%; padding: 0.3em 0.6em; border-radius: 8px; background: rgba(0, 0, 0, 0.45); font-size: 0.85em; }
   #actions { bottom: 0; justify-content: flex-start; }
@@ -37,10 +39,22 @@
   .panel .row { display: flex; gap: 0.4em; align-items: center; flex-wrap: wrap; }
   .panel .row input { width: 5em; }
   #folders label { display: block; padding: 0.35em 0; }
+  /* Folders and Inspect layers can outgrow the screen: the list scrolls, Close stays in reach. */
+  #folders { overflow-y: auto; }
+  #folders > button { position: sticky; bottom: 0; flex: none; }
   /* The camera looks through the screen's exact center; W and S keep what is under it there. */
   #reticle { position: fixed; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px; pointer-events: none; z-index: 2; }
   #menu { position: fixed; top: 3.2em; left: 0.5em; display: none; flex-direction: column; gap: 0.3em; padding: 0.4em; border-radius: 10px; background: var(--panel); z-index: 6; }
-  #menu button { text-align: left; min-width: 9em; }
+  #menu button, #viewMenu button { text-align: left; min-width: 9em; }
+  /* ☰ View: the view toggles, beside ☰, open while you flip several */
+  #viewMenu { position: fixed; top: 3.2em; left: 0.5em; display: none; flex-direction: column; gap: 0.3em; padding: 0.4em; border-radius: 10px; background: var(--panel); z-index: 6; }
+  /* Tweak: its list, and the dragged value. */
+  /* ⛶ and Tweak sit at the right end of the top bar. */
+  #fullBtn { margin-left: auto; }
+  #probeBtn { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } /* held 1.2 s: back to the probe */
+  #tweakList div.on { background: #2a3344; border-left: 3px solid var(--accent); }
+  #tweakList small { color: var(--dim); }
+  #tweakHud { position: fixed; left: 50%; top: 3.4em; transform: translateX(-50%); display: none; padding: 0.35em 0.8em; border-radius: 8px; background: var(--panel); border: 1px solid var(--accent); font-weight: 600; z-index: 4; }
 </style>
 </head>
 <body>
@@ -66,25 +80,42 @@ window.addEventListener("unhandledrejection", function (e) {
 <div id="top" class="bar">
   <button id="menuBtn">☰</button>
   <select id="sceneSelect"></select>
-  <button id="texturesBtn" class="on">Textures</button>
-  <button id="fullBtn">⛶</button>
   <button id="reloadBtn" style="display:none" class="on">Reload</button>
+  <button id="fullBtn">⛶</button>
+  <button id="probeBtn" title="Probe: what is under the reticle (hold: back to where the probe was taken)" aria-label="Probe"><svg viewBox="0 0 24 24" width="1.3em" height="1.3em" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></button>
+  <button id="switchBtn" hidden class="on" title="Switch: show the next set of layers (the scene's Switch line)"></button>
+  <button id="tweakBtn" hidden title="Tweak" aria-label="Tweak"><svg viewBox="0 0 24 24" width="1.3em" height="1.3em" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg></button>
 </div>
 <svg id="reticle" viewBox="0 0 22 22" aria-hidden="true"><g stroke="rgba(0,0,0,0.6)" stroke-width="3"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g><g stroke="#ffffff" stroke-width="1.2"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g></svg>
 <div id="status">Loading…</div>
 <div id="lodLegend"></div>
+<div id="tweakHud"></div>
 <div id="menu">
   <button id="newBtn">New</button>
   <button id="saveBtn">Save</button>
   <button id="importBtn">Import area</button>
   <button id="foldersBtn">Folders</button>
+  <button id="inspectBtn" hidden>Inspect layers ▸</button>
   <button id="snapBtn">Snap</button>
+  <button id="refCubeBtn">Reference cube</button>
+  <button id="viewBtn">View ▸</button>
+</div>
+<div id="viewMenu">
+  <button id="texturesBtn" class="on">Textures</button>
   <button id="labelsBtn">Labels</button>
+  <button id="wireframeBtn">Wireframe</button>
+  <button id="lodTintBtn">LOD tint</button>
   <button id="fogBtn" class="on">Fog</button>
   <button id="fogClipBtn">Fog far clip</button>
   <button id="cullingBtn">Culling</button>
-  <button id="lodTintBtn">LOD tint</button>
+  <button id="originBtn">Origin</button>
   <button id="candidatesBtn" hidden>Candidate trees</button>
+  <button id="tickBtn" class="on">Tick</button>
+  <button id="conditionsBtn">Conditions: met</button>
+  <button id="inactiveBtn">Inactive</button>
+  <button id="windBtn">Wind: light</button>
+  <button id="gustBtn">Gusts: medium</button>
+  <button id="gustKindBtn">Gusts as: cylinders</button>
 </div>
 
 <div id="scalebar"><span>Scale</span><input id="scale" type="range" min="-2" max="5.615" step="0.005" value="0"><span id="scaleValue">×1.00</span></div>
@@ -104,7 +135,7 @@ window.addEventListener("unhandledrejection", function (e) {
 </div>
 
 <div id="palette" class="panel">
-  <div class="row"><input id="paletteFilter" placeholder="Filter pieces" style="flex:1; width:auto"><button id="paletteClose">Close</button></div>
+  <div class="row"><button id="palettePieces">Pieces</button><button id="paletteScenes">Scenes</button><input id="paletteFilter" placeholder="Filter pieces" style="flex:1; width:auto"><button id="paletteClose">Close</button></div>
   <div id="paletteList" class="list"></div>
 </div>
 
@@ -114,15 +145,25 @@ window.addEventListener("unhandledrejection", function (e) {
   <div class="row">Center <input id="cx" placeholder="x"><input id="cy" placeholder="y"><input id="cz" placeholder="z"></div>
   <div class="row">Half-size (m) <input id="half" value="20"></div>
   <div class="row">Name <input id="areaName" placeholder="e.g. Rings" style="width:10em"></div>
+  <div class="row"><label><input type="checkbox" id="terrainOnly"> Terrain only (its trees, nothing else)</label></div>
   <div class="row"><button id="extractBtn">Extract</button></div>
   <div style="color: var(--dim); font-size: 0.85em">Imported areas are read-only copies of Unity. Compose in a scene of your own (New).</div>
 </div>
 
 <div id="folders" class="panel"></div>
 
+<div id="tweakPanel" class="panel">
+  <div class="row"><b>Tweak</b><span style="flex:1; color: var(--dim); font-size: 0.85em">tap one, then drag left and right; tap it again to look around</span><button id="tweakClose">Close</button></div>
+  <div id="tweakList" class="list"></div>
+</div>
+
 <script src="three.js"></script>
 <script src="space.js"></script>
 <script src="surface.js"></script>
+<script src="ticker.js"></script>
+<script src="conditions.js"></script>
+<script src="tickable.js"></script>
+<script src="pfx.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

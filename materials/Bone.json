@@ -1,0 +1,5 @@
+{
+  "about": "Bone, in place of bark (Ken, 2026-10-28): a bone photo made seamless by tools/tile-texture.js, then tools/texture-maps.js <tile> 1024 materials Bone --depth 8 (baked lighting reduced, mean luma 150; normal map from brightness). Drawn as Canopy's BarkSimple draws, so no tint.",
+  "map": "BoneA.png",
+  "normal": "BoneN.png"
+}

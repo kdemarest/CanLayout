@@ -16,7 +16,7 @@
         materials: {},        // Unity material guid -> description (colors, texture URLs)
         textures: true,
         fog: true,            // Canopy's fog (unity.json environment), on every material
-        environment: null,    // the scene's unity.json environment: sun, ambient, fog, sky, sea
+        environment: null,    // the scene's unity.json environment: sun, ambient, fog, the sky's material and settings
         undo: [],
         redo: [],
         dirty: false,
@@ -47,70 +47,15 @@
     // Fog by distance from the camera, as Canopy's shaders have it, not by depth along the view.
     THREE.ShaderChunk.fog_vertex = THREE.ShaderChunk.fog_vertex.replace("- mvPosition.z", "length( mvPosition.xyz )");
     const scene = new THREE.Scene();
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x404040, 0.9));
+    // The plain lights, for scenes without a Sun piece (layout/scripts/Sun.js turns them off).
+    const hemisphere = new THREE.HemisphereLight(0xffffff, 0x404040, 0.9);
     const sun = new THREE.DirectionalLight(0xffffff, 0.9);
     sun.position.set(0.4, 1, 0.6);
-    scene.add(sun);
-    // The sea: one big plane at sea level that follows the camera (frame), drawn after the
-    // opaque pieces, as Unity's sea queue (2950) is.
-    const sea = new THREE.Mesh(new THREE.PlaneGeometry(10000, 10000).rotateX(-Math.PI / 2), Surface.sea(null, 70));
-    sea.frustumCulled = false;
-    sea.renderOrder = -1;
-    sea.visible = false;
-    scene.add(sea);
-    let skyFor; // the sky texture the background shows (its URL)
-    // The sky: Canopy's CanSky.shader on a dome around the camera (drawn first, behind everything).
-    // A sky point's height is the camera's plus its direction's y times skyRadius; below the black
-    // line it is black, else the fog color blended to the sky texture from BlendMax, then tinted.
-    const skyUniforms = {
-        skyMap: { value: null }, skyHasMap: { value: 0 }, skyBlue: { value: new THREE.Color("#87a9c9") },
-        skyFloor: { value: new THREE.Color() }, skyTint: { value: new THREE.Color() }, skyTintLevel: { value: 0 },
-        skyBlendMin: { value: 0 }, skyBlendMax: { value: 0 }, skyBlackY: { value: -1e9 }, skyRadius: { value: 400 }
-    };
-    const skyDome = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 24), new THREE.ShaderMaterial({
-        uniforms: skyUniforms, side: THREE.BackSide, depthWrite: false, depthTest: false, fog: false,
-        vertexShader: `varying vec3 vDir;
-void main() {
-    vDir = position;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-}`,
-        fragmentShader: `uniform sampler2D skyMap;
-uniform float skyHasMap, skyTintLevel, skyBlendMin, skyBlendMax, skyBlackY, skyRadius;
-uniform vec3 skyBlue, skyFloor, skyTint;
-varying vec3 vDir;
-void main() {
-    vec3 d = normalize(vDir);
-    float y = cameraPosition.y + d.y * skyRadius;
-    vec3 c = vec3(0.0);
-    if (y >= skyBlackY) {
-        // the panorama the way Layout's background showed it (Three.js's equirectangular mapping)
-        vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, asin(clamp(d.y, -1.0, 1.0)) * 0.31830989 + 0.5);
-        vec3 sky = skyHasMap > 0.5 ? texture2D(skyMap, uv).rgb : skyBlue;
-        float t = clamp((y - skyBlendMax) / max(skyBlendMax - skyBlendMin, 0.0001), 0.0, 1.0);
-        c = mix(skyFloor, sky, t);
-        if (y > skyBlendMax) c = mix(c, skyTint, skyTintLevel);
-    }
-    gl_FragColor = vec4(c, 1.0);
-    #include <colorspace_fragment>
-}`
-    }));
-    skyDome.frustumCulled = false;
-    skyDome.renderOrder = -2;
-    scene.add(skyDome);
-    // Each frame, from the camera's height (the game uses the player's head).
-    function updateSky() {
-        const env = state.environment;
-        if (!env) return;
-        const y = camera.position.y;
-        skyDome.position.copy(camera.position);
-        skyDome.scale.setScalar(Math.min(10, camera.far * 0.5));
-        skyUniforms.skyBlendMin.value = y + env.skyBlendMin;
-        skyUniforms.skyBlendMax.value = y + env.skyBlendMax;
-        skyUniforms.skyBlackY.value = env.skyBlackMult * y + env.skyBlackAdd;
-    }
-    // The scene's unity.json environment: the sun's direction and color, Canopy's fog (it keeps
-    // exp2(-(density * distance)^2) of a color, Three.js exp(-(d * distance)^2)), the sky (a
-    // panorama, sky blue until it loads) and the sea at its level.
+    hemisphere.userData.plainLight = sun.userData.plainLight = true;
+    scene.add(hemisphere, sun);
+    // The scene's unity.json environment: the sun's direction and color and Canopy's fog (it keeps
+    // exp2(-(density * distance)^2) of a color, Three.js exp(-(d * distance)^2)). The sky and the
+    // sea are pieces with scripts (the Sky and Sea prefabs, which World brings).
     function applyEnvironment() {
         const env = state.environment;
         if (!env) return;
@@ -119,39 +64,33 @@ void main() {
         sun.color.set(env.sunColor);
         scene.fog = state.fog ? new THREE.FogExp2(env.fogColor, env.fogDensity * Math.sqrt(Math.LN2)) : null;
         Surface.setEnvironment(env, state.fog);
-        skyUniforms.skyFloor.value.set(env.fogColor);
-        skyUniforms.skyTint.value.set(env.skyTint);
-        skyUniforms.skyTintLevel.value = env.skyTintLevel;
-        skyUniforms.skyRadius.value = env.skyRadius || 10 * camera.far; // see tools/config.js; applyClip keeps it
-        const skyUrl = (env.sky && env.sky.map && env.sky.map.url) || null;
-        if (skyFor !== skyUrl) {
-            skyFor = skyUrl;
-            scene.background = null;
-            skyUniforms.skyHasMap.value = 0;
-            texture(env.sky && env.sky.map, true).then(t => {
-                if (!t || skyFor !== skyUrl) return;
-                t.wrapS = THREE.RepeatWrapping;
-                t.wrapT = THREE.ClampToEdgeWrapping;
-                skyUniforms.skyMap.value = t;
-                skyUniforms.skyHasMap.value = 1;
-            });
+        const w = env.leafWind;
+        if (w) {
+            leafWindUniforms.leafWind.value.set(w.sway, w.flutter, w.frequency, w.fadeDistance);
+            leafWindUniforms.leafGust.value.set(w.gustLength, w.gustSpeed, w.gustShape);
+            leafWindUniforms.leafNear.value.set(w.near, w.nearDistance);
         }
-        const seaKey = JSON.stringify([env.sea, env.seaTile]);
-        if (sea.userData.for !== seaKey) {
-            sea.userData.for = seaKey;
-            const material = sea.material = Surface.sea(env.sea, env.seaTile);
-            texture(env.sea && env.sea.normal, false).then(t => {
-                if (t) material.uniforms.seaNormal.value = t;
-            });
-        }
-        sea.position.y = env.seaLevel;
-        sea.visible = true;
+        leafWindUniforms.leafWaveGusts.value = state.gustKind === "waves" ? 1 : 0;
     }
     const world = new THREE.Group();
     scene.add(world);
+    // Wireframe: every visible triangle's edges drawn over the lit surfaces (a second pass of the
+    // world alone, so the sky and sea stay plain).
+    const wireScene = new THREE.Scene();
+    wireScene.overrideMaterial = new THREE.MeshBasicMaterial({ color: 0x111111, wireframe: true, transparent: true, opacity: 0.55 });
+    function drawWireframe() {
+        wireScene.add(world);
+        wireScene.fog = scene.fog;
+        renderer.autoClear = false;
+        renderer.render(wireScene, camera);
+        renderer.autoClear = true;
+        scene.add(world);
+    }
     // Near and far planes: the game's, from unity.json (near, far) when a scene loads; the game's
     // 0.03 to 400 m also keeps enough depth precision that far crossings (trunks at the sea) don't flicker.
     const camera = new THREE.PerspectiveCamera(55, 1, 0.03, 400);
+    // What scripts (web/tickable.js) work with.
+    Tickable.use({ THREE, scene, camera, environment: () => state.environment, leafWind: () => leafWindUniforms, windLevels: () => ({ constantLevel: state.windLevel, gustLevel: state.gustLevel, cylinderGusts: state.gustKind === "cylinders" }), texture, material: guid => materialFor(guid, false), describe: guid => (state.materials || {})[guid] || null, textures: () => state.textures });
     camera.position.set(0, 5, 15);
     camera.lookAt(0, 0, 0);
     const highlight = new THREE.BoxHelper(undefined, 0x4fb3ff);
@@ -239,25 +178,83 @@ void main() {
         return (h & 0xFFFFFF) / 16777216;
     };
     // A LeafSplit tree's leaf mesh with each leaf's rank and middle on its vertices, for the
-    // thinning in the leaf material (thinPatch). Leaves are runs of faces, in LeafSplit's order.
+    // thinning in the leaf material (thinPatch), and its stem, tip and face, for the wind
+    // (windPatch). Leaves are runs of faces, in LeafSplit's order. The stem is the middle of the
+    // leaf's corners at uv.y 0 and the tip of those at 1, as LeafSplit places its leaves.
     function leafGeometry(base, split) {
         const g = base.clone();
         const count = g.attributes.position.count, tris = count / 3;
         const per = base.userData.leaves ? base.userData.leaves.per : tris / split.leafCount;
         const list = base.userData.leaves ? base.userData.leaves.list : Array.from({ length: Math.round(tris / per) }, (_, i) => i);
-        const p = g.attributes.position.array, rank = new Float32Array(count), centre = new Float32Array(count * 3);
+        const p = g.attributes.position.array, uv = g.attributes.uv && g.attributes.uv.array;
+        const rank = new Float32Array(count), centre = new Float32Array(count * 3);
+        const stems = new Float32Array(count * 3), tips = new Float32Array(count * 3), faces = new Float32Array(count * 3);
         list.forEach((leaf, j) => {
             const first = j * per * 3, last = (j + 1) * per * 3;
             const c = [0, 0, 0];
             for (let k = first; k < last; k++) for (let a = 0; a < 3; a++) c[a] += p[k * 3 + a] / (last - first);
+            const end = want => { // the middle of the corners at uv.y want (0 the stem, 1 the tip)
+                const e = [0, 0, 0];
+                let n = 0;
+                for (let k = first; k < last; k++) {
+                    if (Math.abs(uv[k * 2 + 1] - want) > 0.01) continue;
+                    for (let a = 0; a < 3; a++) e[a] += p[k * 3 + a];
+                    n++;
+                }
+                return n ? e.map(v => v / n) : c;
+            };
+            const stem = uv ? end(0) : c, tip = uv ? end(1) : c;
+            const q = first * 3, u = [p[q + 3] - p[q], p[q + 4] - p[q + 1], p[q + 5] - p[q + 2]], w = [p[q + 6] - p[q], p[q + 7] - p[q + 1], p[q + 8] - p[q + 2]];
+            const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+            const len = Math.hypot(...n) || 1;
             for (let k = first; k < last; k++) {
                 rank[k] = leafRank(leaf);
                 centre.set(c, k * 3);
+                stems.set(stem, k * 3);
+                tips.set(tip, k * 3);
+                faces.set(n.map(v => v / len), k * 3);
             }
         });
         g.setAttribute("leafRank", new THREE.BufferAttribute(rank, 1));
         g.setAttribute("leafCenter", new THREE.BufferAttribute(centre, 3));
+        g.setAttribute("leafStem", new THREE.BufferAttribute(stems, 3));
+        g.setAttribute("leafTip", new THREE.BufferAttribute(tips, 3));
+        g.setAttribute("leafFace", new THREE.BufferAttribute(faces, 3));
         return g;
+    }
+    // Downloads, a few at a time, each tried up to three times (Claude, 2026-10-29: the whole Tangle
+    // asked for 1806 meshes at once and the phone's browser failed some with "Failed to fetch"). A
+    // response that is an error status isn't retried; resolves to the Response, or null.
+    const fetchQueue = [];
+    let fetching = 0;
+    function queuedFetch(url) {
+        return new Promise(resolve => {
+            fetchQueue.push({ url, resolve, tries: 0 });
+            pumpFetches();
+        });
+    }
+    function pumpFetches() {
+        while (fetching < 12 && fetchQueue.length) {
+            const job = fetchQueue.shift();
+            fetching++;
+            fetch(job.url).then(r => {
+                fetching--;
+                job.resolve(r);
+                pumpFetches();
+            }, error => {
+                fetching--;
+                if (++job.tries < 3) setTimeout(() => { fetchQueue.push(job); pumpFetches(); }, 500 * job.tries);
+                else {
+                    job.resolve(null);
+                    reportFailedFetch(job.url, error);
+                }
+                pumpFetches();
+            });
+        }
+    }
+    let failedFetches = 0;
+    function reportFailedFetch(url, error) {
+        if (failedFetches++ === 0) setTimeout(() => window.layoutError(`${failedFetches} download${failedFetches === 1 ? "" : "s"} failed after three tries (the first: ${url}: ${error.message})`), 3000);
     }
     function geometryFor(part) {
         if (part.mesh && part.mesh.kind === "builtin") {
@@ -267,7 +264,7 @@ void main() {
             return Promise.resolve(null);
         }
         if (!geometries.has(part.obj)) {
-            geometries.set(part.obj, fetch(part.obj).then(r => (r.ok ? r.text() : null)).then(t => (t ? parseObj(t) : null)));
+            geometries.set(part.obj, queuedFetch(part.obj).then(r => (r && r.ok ? r.text() : null)).then(t => (t ? parseObj(t) : null)));
         }
         if (part.leafSplit) {
             const key = part.obj + "|leaves";
@@ -428,11 +425,14 @@ void main() {
         if (!t || !t.url) return Promise.resolve(null);
         const key = `${t.url}|${t.scale}|${t.offset}|${srgb}`;
         if (!textures.has(key)) {
-            textures.set(key, fetch(t.url).then(r => (r.ok ? r.blob() : null)).then(async blob => {
+            textures.set(key, queuedFetch(t.url).then(r => (r && r.ok ? r.blob() : null)).then(async blob => {
                 if (!blob) return null;
-                const full = await createImageBitmap(blob);
+                // Colors as the file has them, not multiplied by alpha (the browser's default): Unity
+                // and Three.js keep them apart, and a texture whose alpha its shader ignores (the
+                // flamers' Lava.tga, alpha mostly near 0) came out black (Claude, 2026-10-29).
+                const full = await createImageBitmap(blob, { premultiplyAlpha: "none", colorSpaceConversion: "none" });
                 const k = Math.min(1, MAX_TEXTURE / Math.max(full.width, full.height));
-                const bitmap = await createImageBitmap(full, { resizeWidth: Math.round(full.width * k), resizeHeight: Math.round(full.height * k), resizeQuality: "medium", imageOrientation: "flipY" });
+                const bitmap = await createImageBitmap(full, { resizeWidth: Math.round(full.width * k), resizeHeight: Math.round(full.height * k), resizeQuality: "medium", imageOrientation: "flipY", premultiplyAlpha: "none", colorSpaceConversion: "none" });
                 full.close();
                 const tex = new THREE.Texture(bitmap);
                 tex.flipY = false; // flipped while decoding
@@ -467,6 +467,65 @@ void main() {
 \t\tsize *= clamp((leafMax - leafD) / (0.1 * leafMax), 0.0, 1.0);
 \t\tif (leafThin.w > 0.5 && leafThin.z < 1.0) size *= inversesqrt(keep);
 \t\ttransformed = leafCenter + (transformed - leafCenter) * size;
+\t}`);
+    };
+    // LeafSplit's leaves in the wind, as Canopy's iLeafCutWind shader moves them (see it for the
+    // why): blown, each leaf turns about its stem, rigidly, its tip toward its own axis plus some of
+    // downwind (leaning) and of its face's direction (fluttering), each leaf at its own rate and
+    // phase; only a share of it near the eye, none far away. The wind is a steady one everywhere plus
+    // gusts, added and never past strong; lean, wobble and flutter all follow their sum.
+    // LeafGust (scripts/LeafGust.js) sets leafWindNow (the steady wind's direction x and z, its
+    // strength, the gusts', in Unity's XZ) and its cylinders (leafGusts: centre, radius, life;
+    // leafGustDirs: heading, soft edge), tested by squared distance; ☰ View's gusts as waves turns on
+    // the wave gusts instead, travelling downwind and lulling to stillness between them. Its settings
+    // are unity.json's environment leafWind (applyEnvironment); the levels ☰ View's (windLevels).
+    const leafWindUniforms = {
+        leafWindNow: { value: new THREE.Vector4(1, 0, 0, 0) },  // LeafGust's: the steady wind's direction x, z (Unity), its strength, the gusts'
+        leafWind: { value: new THREE.Vector4(0, 0, 1, 1000) }, // sway, flutter, frequency, fadeDistance
+        leafGust: { value: new THREE.Vector3(12, 4, 2) },       // gustLength, gustSpeed, gustShape (the wave gusts)
+        leafNear: { value: new THREE.Vector2(1, 8) },           // near, nearDistance
+        leafWaveGusts: { value: 0 },
+        leafGusts: { value: [0, 1, 2].map(() => new THREE.Vector4()) },   // LeafGust's: centre x, z, radius, life (Unity)
+        leafGustDirs: { value: [0, 1, 2].map(() => new THREE.Vector4()) } // heading x, z, soft edge (Unity)
+    };
+    const windPatch = shader => {
+        Object.assign(shader.uniforms, leafWindUniforms, { canopyTime: Surface.uniforms.canopyTime });
+        shader.vertexShader = "attribute vec3 leafStem;\nattribute vec3 leafTip;\nattribute vec3 leafFace;\nuniform vec4 leafWindNow;\nuniform vec4 leafWind;\nuniform vec3 leafGust;\nuniform vec2 leafNear;\nuniform float leafWaveGusts;\nuniform vec4 leafGusts[3];\nuniform vec4 leafGustDirs[3];\nuniform float canopyTime;\n" + shader.vertexShader.replace("#include <begin_vertex>", `#include <begin_vertex>
+\t{
+\t\tvec3 stem = (modelMatrix * vec4(leafStem, 1.0)).xyz;
+\t\tvec3 axis = normalize((modelMatrix * vec4(leafTip, 1.0)).xyz - stem);
+\t\tvec3 face = normalize(mat3(modelMatrix) * leafFace);
+\t\tfloat h = fract(sin(dot(stem, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+\t\tfloat t = canopyTime;
+\t\tfloat d = distance(cameraPosition, stem);
+\t\tvec2 stemU = vec2(-stem.x, stem.z); // in Unity's XZ, as LeafGust's wind is
+\t\tvec2 calm = leafWindNow.xy;
+\t\tfloat steady = leafWindNow.z, gusts = leafWindNow.w;
+\t\tfloat inGust = leafWaveGusts * pow(clamp(0.5 + 0.5 * sin(6.2832 * (dot(stemU, calm) - leafGust.y * t) / max(leafGust.x, 0.01)), 0.0, 1.0), leafGust.z);
+\t\tvec2 down = (steady + gusts * inGust) * calm;
+\t\tfor (int i = 0; i < 3; i++) {
+\t\t\tvec4 g = leafGusts[i];
+\t\t\tvec2 off = stemU - g.xy;
+\t\t\tfloat inner = max(g.z - leafGustDirs[i].z, 0.0);
+\t\t\tfloat e = clamp((dot(off, off) - inner * inner) / max(g.z * g.z - inner * inner, 1e-4), 0.0, 1.0);
+\t\t\tfloat s = g.w * (1.0 - e * e * (3.0 - 2.0 * e));
+\t\t\tinGust = max(inGust, s);
+\t\t\tdown += gusts * s * leafGustDirs[i].xy;
+\t\t}
+\t\tfloat gust = min(gusts * inGust, 1.7 - steady); // added to the steady wind, never past strong (LeafGust's 1.7)
+\t\tif (steady + gust > 0.0) {
+\t\tvec3 windDir = dot(down, down) > 1e-8 ? normalize(vec3(-down.x, 0.0, down.y)) : vec3(-calm.x, 0.0, calm.y);
+\t\tfloat wind = steady + gust;
+\t\tfloat lean = leafWind.x * wind * (1.0 + 0.3 * sin(3.1416 * leafWind.z * t + 6.2832 * h));
+\t\tfloat flap = leafWind.y * wind * sin(6.2832 * (leafWind.z * (0.8 + 0.4 * h) * t + h));
+\t\tfloat share = mix(leafNear.x, 1.0, clamp(d / max(leafNear.y, 0.01), 0.0, 1.0)) * clamp(2.0 * (1.0 - d / max(leafWind.w, 0.01)), 0.0, 1.0);
+\t\tvec3 blown = normalize(axis + share * (windDir * lean + face * flap));
+\t\tvec3 k = cross(axis, blown);
+\t\tfloat c = dot(axis, blown);
+\t\tvec3 v = (modelMatrix * vec4(transformed, 1.0)).xyz - stem;
+\t\tvec3 move = (c - 1.0) * v + cross(k, v) + k * (dot(k, v) / max(1.0 + c, 1e-4));
+\t\ttransformed += inverse(mat3(modelMatrix)) * move;
+\t\t}
 \t}`);
     };
     // Branch strips (tools/tree-build.js): each vertex is a ring's centre, its normal the branch's
@@ -510,6 +569,16 @@ void main() {
         }
         return materials.get(key);
     }
+    // An inspection model's look: lit in its color, both sides, see-through below opacity 1.
+    function inspectMaterial(look) {
+        const key = `inspect|${look.color}|${look.opacity}|${look.side}`;
+        if (!materials.has(key)) {
+            const see = look.opacity < 1;
+            const side = look.side === "front" ? THREE.FrontSide : look.side === "back" ? THREE.BackSide : THREE.DoubleSide;
+            materials.set(key, new THREE.MeshStandardMaterial({ color: look.color, roughness: 0.7, metalness: 0, side, transparent: see, opacity: look.opacity, depthWrite: !see }));
+        }
+        return materials.get(key);
+    }
     function materialFor(guid, faint, split, strip) {
         const d = guid && state.materials[guid];
         if (!state.textures || !d) {
@@ -528,19 +597,33 @@ void main() {
         // Faces as the Unity shader culls them (tools/scene.js cullOf); strips and LeafSplit's
         // leaves draw both sides, as the game does (front and back instances).
         const side = strip || split || d.cull === 'Off' ? THREE.DoubleSide : d.cull === 'Front' ? THREE.BackSide : THREE.FrontSide;
+        // Some of Canopy's own shaders, drawn by name (web/surface.js byShader: the sea's surfaces,
+        // Water, Force Field, CloudTextured, Goop), with their textures.
+        const own = !faint && d.shaderName && Surface.byShader(d, { side });
+        if (own) {
+            own.userData.drawnBy = d.shaderName; // the probe says which of layout's ports drew it
+            if (own.uniforms.seaNormal) texture(d.normal1 || d.normal, false).then(t => { if (t) own.uniforms.seaNormal.value = t; });
+            if (own.uniforms.fieldMap) texture(d.map, true).then(t => { if (t) own.uniforms.fieldMap.value = t; });
+            if (own.uniforms.noiseMap) texture(d.noise, true).then(t => { if (t) own.uniforms.noiseMap.value = t; });
+            if (own.uniforms.normalMap) texture(d.normal, false).then(t => { if (t) own.uniforms.normalMap.value = t; });
+            materials.set(key, own);
+            return own;
+        }
         // A surface shader's material (web/surface.js); faint ones stay plain.
         if (d.surface && !faint) {
             materials.set(key, Surface.material(d, { side }));
             return materials.get(key);
         }
-        let c = d.color.slice(0, 3).map(v => v * (d.brightness || 1));
+        // untinted: its shader never reads the color (tools/scene.js prepareMaterials). A see-through
+        // one still takes its alpha as opacity, a stand-in for blending layout doesn't draw.
+        let c = (d.untinted ? [1, 1, 1] : d.color.slice(0, 3)).map(v => v * (d.brightness || 1));
         const top = Math.max(...c);
         if (top > 1) c = c.map(v => v / top);
         const opacity = faint ? 0.35 : d.transparent ? Math.min(1, d.color[3]) : 1;
         const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(...c), roughness: 0.85, metalness: 0, side, transparent: opacity < 1, opacity });
-        // Shader patches, applied in order: darkening under the sea, LeafSplit's thinning, the detail texture.
+        // Shader patches, applied in order: darkening under the sea, LeafSplit's thinning and wind, the detail texture.
         const patches = [["sea", Surface.underSea]];
-        if (split) patches.push(["thin", thinPatch(split)]);
+        if (split) patches.push(["thin", thinPatch(split)], ["wind", windPatch]);
         if (strip) patches.push(["strip", stripPatch]);
         const usePatches = () => {
             m.onBeforeCompile = shader => patches.forEach(([, p]) => p(shader));
@@ -601,21 +684,68 @@ void main() {
         if (boxes[key]) boxes[key].union(box);
         else boxes[key] = box;
     }
+    // ---------- conditions ----------
+    // ☰ View Conditions (Ken, 2026-10-29; web/conditions.js): which objects are on, and where, as the
+    // game has them with its conditions met (met), as a new game starts the scene's stage (start), or
+    // as the scene was saved (saved). An imported piece or part carries its gate (never, or when:
+    // terms over the scene's symbols, which the server sends) and moved (where its triggers put it).
+    // An object off in the mode is hidden; with ☰ View Inactive it is drawn faint instead, scripts off.
+    const symbolsNow = () => ((state.symbols || {})[state.conditions] || {});
+    const gateOf = x => (x.never ? false : x.when ? Conditions.allHold(x.when, symbolsNow()) : null);
+    function pieceOn(piece) {
+        const saved = !/\binactive\b/.test(piece.extra || "");
+        if (state.conditions === "saved") return saved;
+        const gate = gateOf(piece);
+        return gate === null ? saved : gate;
+    }
+    function partOn(part) {
+        if (state.conditions === "saved") return !part.offSaved;
+        const gate = gateOf(part);
+        return gate === null ? true : gate;
+    }
+    // The piece, placed where the mode has it.
+    function placed(piece) {
+        const mv = piece.moved;
+        if (!mv || state.conditions === "saved" || !Conditions.allHold(mv.when, symbolsNow())) return piece;
+        return { ...piece, position: mv.position, rotation: mv.rotation, scale: mv.scale };
+    }
+    // A gate as text, for the probe: "when SkyIsle (holds)".
+    function gateText(x) {
+        if (x.never) return "never on in the game";
+        if (!x.when) return null;
+        return `when ${x.when.map(Conditions.describe).join(" and ")} (${Conditions.allHold(x.when, symbolsNow()) ? "holds" : "doesn't hold"} in ${state.conditions})`;
+    }
+
     // A Three.js group for one piece; its parts load asynchronously. tint replaces its materials.
     function buildObject(piece, tint) {
         const group = new THREE.Group();
         group.matrixAutoUpdate = false;
-        group.matrix.copy(Space.pieceMatrix(THREE, piece));
+        group.matrix.copy(Space.pieceMatrix(THREE, placed(piece)));
         const entry = state.library[piece.name];
         group.userData.folder = folderOf(entry || (piece.source ? { source: piece.source } : null));
+        const on = pieceOn(piece);
+        group.userData.off = !on && !state.inactive; // hidden (shown() checks it)
         group.visible = shown(group);
-        const faint = /\binactive\b/.test(piece.extra || "");
+        const faint = !on;
         const parts = piece.parts || (entry ? entry.parts : []); // an imported instance may carry its own
         // LOD groups (see updateLods): meshes that are one level of a group start hidden.
         const lodGroups = piece.lodGroups || (entry && entry.lodGroups) || null;
         if (lodGroups && Object.keys(lodGroups).length) group.userData.lodGroups = lodGroups;
+        // Its scripts (web/tickable.js): a layout prefab's, and a Unity prefab's C# ones with stand-ins
+        // (an imported piece carries its own).
+        const scripted = piece.parts ? piece : entry;
+        if (scripted && scripted.scripts && on) Tickable.attach(scripted, group, piece);
         if (!piece.parts && entry && entry.shapes) {
-            for (const shape of entry.shapes) group.add(shapeMesh(shape, tint));
+            // Prefabs its "use" shapes nest, with LOD groups or sets: updateLods reaches them
+            // through this piece (Ken, 2026-11-02: Cocoon Basket's basket and cocoons never showed).
+            const lodChildren = [];
+            for (const shape of entry.shapes) {
+                const child = shapeMesh(shape, tint);
+                group.add(child);
+                if (child.userData.lodGroups || child.userData.sets) lodChildren.push(child);
+                lodChildren.push(...(child.userData.lodChildren || []));
+            }
+            if (lodChildren.length) group.userData.lodChildren = lodChildren;
             return group;
         }
         if (!parts.length) {
@@ -623,11 +753,25 @@ void main() {
             return group;
         }
         for (const part of parts) {
+            const partFaint = faint || !partOn(part);
+            if (partFaint && !faint && !state.inactive) continue; // off in this mode
             const local = Space.partMatrix(THREE, part.m);
+            const material = piece.material || part.material; // "material <Name>" in the piece's settings wins
             geometryFor(part).then(geometry => {
                 if (geometry) {
-                    const mesh = new THREE.Mesh(geometry, tint || (part.debug ? debugMaterial(part.debug, part.strip) : materialFor(part.material, faint, part.leafSplit, part.strip)));
-                    if (part.debug) mesh.userData.debug = true;
+                    const mesh = new THREE.Mesh(geometry, tint || (part.inspect ? (material && state.textures ? materialFor(material, partFaint) : inspectMaterial(part.inspect)) : part.debug ? debugMaterial(part.debug, part.strip) : materialFor(material, partFaint, part.leafSplit, part.strip)));
+                    if (part.debug || part.inspect) mesh.userData.debug = true;
+                    // Unity draws by render queue, then distance; three.js by renderOrder, then depth.
+                    // Queues past 2500 keep their order around the particles' 3000, which is
+                    // renderOrder 0, as are the wind's ribbons and the markers (Ken, 2026-10-30: the
+                    // sea, at 2950, drew over particles when its origin, under the camera, sorted
+                    // nearer). Opaque meshes keep 0. The sky goes before all of them (renderOrder
+                    // -1000: it tests no depth, so it covers anything drawn first; Ken, 2026-10-31:
+                    // LeafOakMat, at 2902, is -98, and was covered when the sky was -2).
+                    const queue = material && state.materials[material] && state.materials[material].queue;
+                    if (queue > 2500) mesh.renderOrder = queue - 3000;
+                    if (part.mesh && part.mesh.name) mesh.userData.model = part.mesh.name; // Tweak swaps meshes by model
+                    mesh.userData.part = part; // what Probe reports
                     if (part.strip) {
                         mesh.frustumCulled = false; // its points are branch centres; the shader widens it
                         mesh.userData.strip = true;
@@ -736,9 +880,10 @@ void main() {
         if (select) sel.value = select;
         return list;
     }
-    // Textures, ☰ Snap, ☰ Labels, ☰ Fog and ☰ LOD tint are remembered per scene, in this browser; a scene not
-    // seen before starts with these.
-    const TOGGLES = { textures: true, snap: false, labels: false, fog: true, lodTint: false, candidates: false, fogClip: false, culling: false };
+    // Textures, ☰ Snap, ☰ Labels, ☰ Fog, ☰ LOD tint, ☰ Tick and the rest are remembered per scene, in this
+    // browser; a scene not seen before starts with these.
+    const GUST_KINDS = ["cylinders", "waves"];
+    const TOGGLES = { textures: true, snap: false, labels: false, fog: true, lodTint: false, candidates: false, fogClip: false, culling: false, refCube: false, showOrigin: false, wireframe: false, ticking: true, inactive: false, conditions: "met", windLevel: 1, gustLevel: 2, gustKind: "cylinders" };
     const togglesKey = () => `layout.toggles.${state.scene.kind}:${state.scene.name}`;
     function loadToggles() {
         let saved;
@@ -747,7 +892,10 @@ void main() {
         } catch {
             saved = {}; // unreadable or blocked storage: start fresh
         }
-        for (const [name, start] of Object.entries(TOGGLES)) state[name] = typeof saved[name] === "boolean" ? saved[name] : start;
+        for (const [name, start] of Object.entries(TOGGLES)) state[name] = typeof saved[name] === typeof start ? saved[name] : start;
+        if (!Conditions.MODES.includes(state.conditions)) state.conditions = TOGGLES.conditions;
+        for (const name of ["windLevel", "gustLevel"]) if (!(state[name] >= 0 && state[name] <= 3)) state[name] = TOGGLES[name];
+        if (!GUST_KINDS.includes(state.gustKind)) state.gustKind = TOGGLES.gustKind;
     }
     function saveToggles() {
         if (!state.scene) return;
@@ -780,6 +928,7 @@ void main() {
             camera.position.fromArray(v, 0);
             camera.quaternion.fromArray(v, 3);
             cameraSaved = JSON.stringify(v);
+            nearScene();
             return true;
         } catch {
             return false;
@@ -798,13 +947,19 @@ void main() {
         const data = await call("GET", `/api/scene?kind=${kind}&name=${encodeURIComponent(name)}`);
         const fetched = performance.now();
         state.scene = { name, kind, editable: data.editable };
+        loadHidden();
         loadToggles();
         state.pieces = data.pieces;
+        state.origin = data.origin || null; // an assemblage's root, "- Origin: x y z" (Unity axes)
+        state.switch = data.switch || null; // "- Switch: ...": sets of inspect layers, one shown at a time
+        if (state.switch && switchAt() < 0) showSwitch(0); // none of its sets shown alone yet: the first
+        else updateSwitch();
         state.area = data.area || null;
         state.base = data.base || [];
         Object.assign(state.library, data.library);
         Object.assign(state.materials, data.materials || {});
         state.environment = data.environment || null;
+        state.symbols = data.symbols || { met: {}, start: {} };
         state.lodView = data.lod || { fov: 90, bias: 1 };
         state.clip = data.clip || { near: 0.03, far: 400 };
         state.cullSettings = data.culling || { perFrame: 0.05, margin: 6 };
@@ -819,11 +974,18 @@ void main() {
         rebuildWorld();
         sceneExtent();
         if (!keepCamera && !restoreCamera()) frameAll();
+        else if (!keepCamera) {
+            const scene = state.scene;
+            Promise.allSettled(geometries.values()).then(() => { if (state.scene === scene) nearScene(); });
+        }
         localStorage.setItem("layout.scene", value);
         updateUi();
         const on = state.area ? `, on ${state.area} (${state.base.length}, read-only)` : "";
         say(`${name}: ${data.pieces.length} pieces${on}${data.problems.length ? `; ${data.problems.length} meshes failed` : ""}${data.editable ? "" : " (read-only; Add starts a scene on it)"}`);
         logLoad(name, started, fetched, before).catch(() => {});
+        findTweaks().catch(fail);
+        showRefCube();
+        showOrigin();
     }
     // Tells layout.log how long the page took: the scene's JSON, then its meshes and textures,
     // which load after the scene appears (textures once their mesh is in).
@@ -837,6 +999,8 @@ void main() {
     }
     // Shown: not in a folder ☰ Folders hides, and not culled (☰ Culling).
     function shown(o) {
+        if (o.userData.duplicate) return false; // a second of a singleton (web/tickable.js)
+        if (o.userData.off) return false; // off in ☰ View Conditions' mode
         return !state.hiddenFolders.has(o.userData.folder) && !(state.culling && o.userData.culled);
     }
     // Where the fog hides farClip.threshold of the light (FarClipManager's distance; see applyClip).
@@ -887,8 +1051,7 @@ void main() {
         }
         camera.near = lodCamera.near = clip.near;
         camera.far = lodCamera.far = far;
-        camera.updateProjectionMatrix();
-        if (env) skyUniforms.skyRadius.value = env.skyRadius || 10 * far;
+        camera.updateProjectionMatrix(); // the Sky follows the far clip (layout/scripts/Skybox.js)
         return far;
     }
     // The scene's middle and size; its size sets how far the camera frames it from and how fast
@@ -900,6 +1063,17 @@ void main() {
         const size = Math.max(4, box.getSize(new THREE.Vector3()).length());
         state.orbitDistance = size * 0.8;
         return box.getCenter(new THREE.Vector3());
+    }
+    // A remembered camera kept near enough to see the scene (Ken: after a restart it was too far off
+    // to see at all; under the sea is fine): within what the scene draws, once its meshes are in,
+    // widened by half its size or 100 m.
+    function nearScene() {
+        const box = new THREE.Box3();
+        for (const o of allObjects()) box.expandByObject(o);
+        if (box.isEmpty()) return;
+        const margin = Math.max(100, box.getSize(new THREE.Vector3()).length() / 2), was = camera.position.clone();
+        camera.position.clamp(box.min.clone().subScalar(margin), box.max.clone().addScalar(margin));
+        if (!camera.position.equals(was)) say(`Brought back near ${state.scene.name}: the camera was ${Math.round(was.distanceTo(camera.position))} m away.`);
     }
     function frameAll() {
         const center = sceneExtent();
@@ -939,6 +1113,7 @@ void main() {
             factor: 1,
             base: index >= 0 ? uniformScale(state.pieces[index].scale) : 1, // its size when picked up, x base size
             original: object.matrix.clone(),
+            camera: { position: camera.position.clone(), quaternion: camera.quaternion.clone() }, // where Cancel returns to
             extra: index >= 0 ? state.pieces[index].extra || "" : "" // settings, e.g. a tablet's text id
         };
         showScale(state.carried.base);
@@ -1016,6 +1191,12 @@ void main() {
     function drop() {
         const c = state.carried;
         if (!c) return;
+        if (c.index === REF_CUBE) {
+            refCube.matrix.copy(carriedMatrix());
+            saveRefCube();
+            endCarry();
+            return say("Reference cube placed (kept in this browser, not in the scene).");
+        }
         const placement = Space.placementOf(THREE, carriedMatrix());
         commit(() => {
             if (c.index < 0) {
@@ -1027,6 +1208,7 @@ void main() {
             }
             c.object.matrix.copy(Space.pieceMatrix(THREE, c.index < 0 ? state.pieces[state.pieces.length - 1] : state.pieces[c.index]));
         });
+        if (c.index < 0) findTweaks().catch(fail); // a modl piece brings its tweaks
         endCarry();
         refreshLabels();
         say("Dropped.");
@@ -1034,11 +1216,16 @@ void main() {
     function cancel() {
         const c = state.carried;
         if (!c) return;
-        if (c.index < 0) {
+        if (c.index === REF_CUBE) {
+            c.object.matrix.copy(c.original);
+        } else if (c.index < 0) {
             world.remove(c.object);
         } else {
             c.object.matrix.copy(c.original);
         }
+        // back where the carry began: carrying moves the camera (to move the piece, or circle it)
+        camera.position.copy(c.camera.position);
+        camera.quaternion.copy(c.camera.quaternion);
         endCarry();
         refreshLabels();
         say("Cancelled.");
@@ -1129,7 +1316,7 @@ void main() {
     // forward and back like W and S, at their speed (spreading 200 px is a second of W); a tap selects.
     const pointers = new Map();
     let gesture = null;
-    let pinchStart = null; // the fingers' spread when the pinch began
+    let pinchStart = null; // when the pinch last moved (its speed sets how far it goes)
     canvas.addEventListener("pointerdown", e => {
         canvas.setPointerCapture(e.pointerId);
         pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now() });
@@ -1141,6 +1328,11 @@ void main() {
         if (!p) return;
         const dx = e.clientX - p.x, dy = e.clientY - p.y;
         if (pointers.size === 1) {
+            if (tweakDragging(e.clientX - p.x0)) {
+                p.x = e.clientX;
+                p.y = e.clientY;
+                return;
+            }
             if (state.carried) orbit(dx, dy);
             else look(dx, dy);
         } else if (pointers.size === 2) {
@@ -1149,11 +1341,14 @@ void main() {
             p.x = e.clientX;
             p.y = e.clientY;
             const after = Math.hypot(a.x - b.x, a.y - b.y);
-            // Faster the farther the fingers have spread (or closed) since the pinch began: up to
-            // four times at 300 px (Ken, 2026-10-26).
-            if (pinchStart === null) pinchStart = before;
-            const ramp = 1 + 3 * Math.min(1, Math.abs(after - pinchStart) / 300);
-            move("forward", (after - before) / 200 * speed() * ramp);
+            // The faster the fingers move, the farther each pixel goes (Ken, 2026-10-28): slow
+            // pinches stay fine, a quick one travels: 1 + (speed / 400 px/s)^1.5, at most 12, all
+            // four times over (Ken, 2026-10-28).
+            const now = performance.now();
+            const dt = Math.max(8, now - (pinchStart === null ? now - 16 : pinchStart)) / 1000;
+            pinchStart = now;
+            const gain = Math.min(12, 1 + Math.pow(Math.abs(after - before) / dt / 400, 1.5));
+            move("forward", 4 * (after - before) / 200 * speed() * gain);
             gesture = "two";
             return;
         }
@@ -1164,17 +1359,26 @@ void main() {
         const p = pointers.get(e.pointerId);
         pointers.delete(e.pointerId);
         pinchStart = null;
+        if (pointers.size === 0) tweakReleased();
         if (p && pointers.size === 0 && gesture !== "two" && Math.hypot(e.clientX - p.x0, e.clientY - p.y0) < 8 && performance.now() - p.t0 < 350) {
             tap(e.clientX, e.clientY);
         }
     };
     canvas.addEventListener("pointerup", release);
-    canvas.addEventListener("pointercancel", e => pointers.delete(e.pointerId));
+    canvas.addEventListener("pointercancel", e => {
+        pointers.delete(e.pointerId);
+        if (pointers.size === 0) tweakReleased();
+    });
     function tap(x, y) {
-        if (state.carried || !state.scene || !state.scene.editable) return;
+        if (state.carried || state.tweak || !state.scene) return;
         const ray = new THREE.Raycaster();
         const r = canvas.getBoundingClientRect();
         ray.setFromCamera(new THREE.Vector2((x - r.left) / r.width * 2 - 1, -((y - r.top) / r.height) * 2 + 1), camera);
+        if (refCube.visible && ray.intersectObject(refCube, true).length) {
+            startCarry(REF_CUBE, refCube);
+            return say("Carrying the reference cube. Drop or Cancel.");
+        }
+        if (!state.scene.editable) return;
         const hit = ray.intersectObjects(state.objects.filter(o => o.visible), true)[0];
         if (!hit) return;
         let o = hit.object;
@@ -1278,7 +1482,9 @@ void main() {
         lodCamera.updateMatrixWorld();
         lodFrustum.setFromProjectionMatrix(lodProj.multiplyMatrices(lodCamera.projectionMatrix, lodCamera.matrixWorldInverse));
         const tanHalf = Math.tan(view.fov * Math.PI / 360);
-        const objects = state.carried ? [...allObjects(), state.carried.object] : allObjects();
+        const tops = state.carried ? [...allObjects(), state.carried.object] : allObjects();
+        // each piece, then the prefabs nested in it (buildObject lodChildren), parents first
+        const objects = tops.flatMap(o => (o.userData.lodChildren && o.visible ? [o, ...o.userData.lodChildren] : [o]));
         for (const o of objects) {
             const groups = o.userData.lodGroups || {};
             if (!(o.userData.lodGroups || o.userData.sets) || !o.visible) continue;
@@ -1307,6 +1513,10 @@ void main() {
                     delete mesh.userData.untinted;
                 }
             }
+            // Groups scripts watch (a particle system drawn only at its level): their levels too,
+            // kept for them (web/tickable.js lodLevelOf).
+            for (const key of o.userData.lodWatch || []) if (!(key in chosen)) chosen[key] = lodLevel(groups[key], o.matrixWorld, scale, tanHalf, view.bias, boxes[key + ":" + active] || boxes[key + ":"]);
+            o.userData.lodChosen = chosen;
         }
     }
     $("lodLegend").innerHTML = LOD_COLORS.map((c, i) => `<span style="color:${c}">L${i}</span>`).join(" ") + ' <span id="lodTris"></span>';
@@ -1319,17 +1529,16 @@ void main() {
         last = now;
         // A and D sidestep at half speed (Ken, 2026-10-22); carrying, they spin the piece a quarter
         // turn a second (Ken, 2026-10-25).
-        // Over 1.4 s of holding, W and S speed up from a third of the speed to four times it, Q and E
-        // from a sixth to twice it (Ken, 2026-10-26).
-        const RAMPS = { forward: [1 / 3, 4], back: [1 / 3, 4], up: [1 / 6, 2], down: [1 / 6, 2] };
+        // Over 2 s of holding, every move key (W S A D Q E) speeds up from a third of the speed to
+        // twenty times it, A and D at half that as sidesteps (Ken, 2026-10-28).
+        const RAMP = [1 / 3, 20], RAMP_SECONDS = 2;
         for (const d of [...heldFor.keys()]) if (!held.has(d)) heldFor.delete(d);
         for (const direction of held) {
             heldFor.set(direction, (heldFor.get(direction) || 0) + dt);
             const sideways = direction === "left" || direction === "right";
-            const [from, to] = RAMPS[direction] || [1, 1];
-            const ramp = from + (to - from) * Math.min(1, heldFor.get(direction) / 1.4);
+            const ramp = RAMP[0] + (RAMP[1] - RAMP[0]) * Math.min(1, heldFor.get(direction) / RAMP_SECONDS);
             if (state.carried && sideways) spin((direction === "left" ? -1 : 1) * Math.PI / 2 * dt); // A clockwise from above (Ken, 2026-10-25)
-            else move(direction, speed() * dt * (sideways ? 0.5 : ramp));
+            else move(direction, speed() * dt * (sideways ? 0.5 : 1) * ramp);
         }
         if (state.carried) {
             state.carried.object.matrix.copy(carriedMatrix());
@@ -1338,16 +1547,15 @@ void main() {
             highlight.setFromObject(state.carried.object);
             highlight.visible = true;
         }
-        Surface.uniforms.canopyTime.value = now / 1000;
-        // Canopy darkens what is under the sea only while the eye is above it.
-        Surface.uniforms.canopyHeadUnder.value = camera.position.y < sea.position.y ? 1 : 0;
-        sea.position.x = camera.position.x;
-        sea.position.z = camera.position.z;
+        Ticker.tick(state.ticking ? dt : 0); // scripts: the sea, the sky, effects (☰ Tick off freezes them)
+        Surface.uniforms.canopyTime.value = Ticker.time;
+        // Canopy darkens what is under the sea only while the eye is above it (no sea: never).
+        Surface.uniforms.canopyHeadUnder.value = camera.position.y < Surface.uniforms.canopySeaLevel.value ? 1 : 0;
         updateCulling();
         updateLods();
-        updateSky();
         saveCamera(now);
         renderer.render(scene, camera);
+        if (state.wireframe) drawWireframe();
         if (state.lodTint && now - lodShown > 500) {
             lodShown = now;
             const culled = state.culling ? allObjects().filter(o => o.userData.culled).length : 0;
@@ -1356,6 +1564,519 @@ void main() {
         requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
+
+    // ---------- reference cube ----------
+    // ☰ Reference cube: a 1 m cube to judge sizes by. Tap it to carry it (Drop, Cancel); where it
+    // is, per scene, stays in this browser and never goes into the scene.
+    const REF_CUBE = -2; // its carried "index"
+    const refCube = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0xff7a1a, roughness: 0.6 }));
+    refCube.add(new THREE.LineSegments(new THREE.EdgesGeometry(refCube.geometry), new THREE.LineBasicMaterial({ color: 0x1a0d00 })));
+    refCube.matrixAutoUpdate = false;
+    refCube.visible = false;
+    refCube.userData.pieceName = "Reference cube";
+    world.add(refCube);
+    const refCubeKey = () => state.scene && `layout.refCube.${state.scene.kind}:${state.scene.name}`;
+    function saveRefCube() {
+        try { localStorage.setItem(refCubeKey(), JSON.stringify(refCube.matrix.elements)); } catch { /* private mode */ }
+    }
+    function showRefCube() {
+        refCube.visible = Boolean(state.refCube && state.scene);
+        if (!refCube.visible) return;
+        let saved = null;
+        try { saved = JSON.parse(localStorage.getItem(refCubeKey())); } catch { /* none */ }
+        if (Array.isArray(saved) && saved.length === 16) return refCube.matrix.fromArray(saved);
+        // first time in this scene: where the reticle points, else 4 m ahead
+        const ray = new THREE.Raycaster();
+        ray.setFromCamera(new THREE.Vector2(0, 0), camera);
+        const hit = ray.intersectObjects([...state.baseObjects, ...state.objects].filter(o => o.visible), true)[0];
+        const at = hit ? hit.point.clone().add(new THREE.Vector3(0, 0.5, 0)) : camera.position.clone().addScaledVector(camera.getWorldDirection(new THREE.Vector3()), 4);
+        refCube.matrix.makeTranslation(at.x, at.y, at.z);
+        saveRefCube();
+    }
+
+    // Folders switched off (☰ Folders, ☰ Inspect layers), kept per scene in this browser between
+    // runs (Ken, 2026-10-28).
+    const hiddenKey = () => state.scene && `layout.hiddenFolders.${state.scene.kind}:${state.scene.name}`;
+    function loadHidden() {
+        let saved = [];
+        try { saved = JSON.parse(localStorage.getItem(hiddenKey())) || []; } catch { /* none */ }
+        state.hiddenFolders = new Set(Array.isArray(saved) ? saved : []);
+    }
+    function saveHidden() {
+        try { localStorage.setItem(hiddenKey(), JSON.stringify([...state.hiddenFolders])); } catch { /* private mode */ }
+    }
+
+    // ---------- switch ----------
+    // A scene's "- Switch: Before = A B | After = C": a top-bar button showing the set of inspect
+    // layers now shown; a tap shows the next set alone (the same switch as ☰ Inspect layers).
+    function switchAt() {
+        const sw = state.switch;
+        if (!sw) return -1;
+        const i = sw.findIndex(s => s.layers.every(l => !state.hiddenFolders.has(`Inspect/${l}`)) && sw.every(o => o === s || o.layers.every(l => s.layers.includes(l) || state.hiddenFolders.has(`Inspect/${l}`))));
+        return i;
+    }
+    function showSwitch(i) {
+        const sw = state.switch;
+        for (const s of sw) for (const l of s.layers) state.hiddenFolders.add(`Inspect/${l}`);
+        for (const l of sw[i].layers) state.hiddenFolders.delete(`Inspect/${l}`);
+        saveHidden();
+        for (const o of allObjects()) if (o.userData.folder && o.userData.folder.startsWith("Inspect/")) o.visible = shown(o);
+        updateSwitch();
+    }
+    function updateSwitch() {
+        const btn = $("switchBtn");
+        btn.hidden = !state.switch;
+        if (state.switch) btn.textContent = state.switch[Math.max(0, switchAt())].label;
+    }
+    $("switchBtn").onclick = () => showSwitch((switchAt() + 1) % state.switch.length);
+
+    // ---------- probe ----------
+    // The reticle button: a ray from the camera through the screen's center; the first piece it
+    // hits (visible meshes only) is marked and reported: on the page, and to the server, which
+    // keeps it in cache/probes.jsonl (for Claude: "what about this?"). Points are Unity's. For a
+    // mesh-clean layer the server adds the branch and ring and the changes near it (tools/mesh-why.js).
+    const probeMark = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffe14d, depthTest: false }));
+    probeMark.renderOrder = 11;
+    probeMark.visible = false;
+    world.add(probeMark);
+    const unityOf = v => [-v.x, v.y, v.z].map(x => +x.toFixed(3));
+    const visibleUp = o => { for (let x = o; x; x = x.parent) if (!x.visible) return false; return true; };
+    // Holding the probe button 1.2 s goes back to where the current probe (the last one taken, from
+    // any page) was taken, facing the way it faced, and shows its mark.
+    let probeHold = null, probeHeld = false;
+    $("probeBtn").addEventListener("pointerdown", () => {
+        probeHeld = false;
+        clearTimeout(probeHold);
+        probeHold = setTimeout(() => { probeHeld = true; backToProbe().catch(fail); }, 1200);
+    });
+    for (const type of ["pointerup", "pointerleave", "pointercancel"]) $("probeBtn").addEventListener(type, () => clearTimeout(probeHold));
+    $("probeBtn").addEventListener("contextmenu", e => e.preventDefault()); // a long press is ours, not the browser's menu
+    async function backToProbe() {
+        const probe = await call("GET", "/api/probe");
+        if (!probe.camera) return say("No probe taken yet.");
+        const [x, y, z] = probe.camera.position, [dx, dy, dz] = probe.camera.direction;
+        camera.position.set(-x, y, z);
+        camera.lookAt(camera.position.clone().add(new THREE.Vector3(-dx, dy, dz)));
+        const h = probe.hit;
+        if (h) {
+            probeMark.position.set(-h.point[0], h.point[1], h.point[2]);
+            probeMark.scale.setScalar(Math.max(0.03, h.distance * 0.006));
+        }
+        probeMark.visible = Boolean(h);
+        const scene = state.scene ? `${state.scene.kind}:${state.scene.name}` : null;
+        say(`Back where the probe was taken${probe.scene && probe.scene !== scene ? ` (in ${probe.scene.split(":").slice(1).join(":")})` : ""}${h ? `: ${h.piece}` : ""}.`);
+    }
+    // The hit triangle's corners and the 6 vertices of the hit mesh nearest the hit point (positions
+    // in the piece's own frame, Unity axes, as "local"; d: metres from the hit point), copies at
+    // the same place (UV seams) counted once (Ken, 2026-10-28: so a probe says which vertices).
+    function probeVertices(hit, top) {
+        const pos = hit.object.geometry && hit.object.geometry.attributes.position;
+        if (!pos) return {};
+        const toLocal = top.matrixWorld.clone().invert().multiply(hit.object.matrixWorld), v = new THREE.Vector3();
+        const at = i => {
+            v.fromBufferAttribute(pos, i);
+            const local = unityOf(v.clone().applyMatrix4(toLocal));
+            return { local, d: +v.applyMatrix4(hit.object.matrixWorld).distanceTo(hit.point).toFixed(3) };
+        };
+        const corners = hit.face ? [hit.face.a, hit.face.b, hit.face.c].map(at) : null;
+        const best = new Map();
+        for (let i = 0; i < pos.count; i++) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(hit.object.matrixWorld);
+            const d = v.distanceTo(hit.point);
+            if (best.size >= 6 && d >= Math.max(...[...best.values()].map(b => b.d))) continue;
+            const one = at(i), key = one.local.join(",");
+            if (!best.has(key) || best.get(key).d > one.d) best.set(key, one);
+            if (best.size > 6) best.delete([...best.entries()].sort((x, y) => y[1].d - x[1].d)[0][0]);
+        }
+        return { corners, nearest: [...best.values()].sort((x, y) => x.d - y.d) };
+    }
+    $("probeBtn").onclick = () => {
+        if (probeHeld) return void (probeHeld = false); // that press was a hold
+        const ray = new THREE.Raycaster();
+        ray.setFromCamera(new THREE.Vector2(0, 0), camera);
+        const objects = [...state.baseObjects, ...state.objects].filter(o => o.visible);
+        const hit = ray.intersectObjects(objects, true).find(h => h.object.isMesh && h.object !== probeMark && visibleUp(h.object));
+        const forward = camera.getWorldDirection(new THREE.Vector3());
+        const report = { scene: state.scene ? `${state.scene.kind}:${state.scene.name}` : null, camera: { position: unityOf(camera.position), direction: unityOf(forward) }, hit: null };
+        if (hit) {
+            let top = hit.object;
+            while (top.parent && top.parent !== world) top = top.parent;
+            const index = state.objects.indexOf(top), baseIndex = state.baseObjects.indexOf(top);
+            const piece = index >= 0 ? state.pieces[index] : baseIndex >= 0 ? state.base[baseIndex] : null;
+            const part = hit.object.userData.part || {};
+            const local = hit.point.clone().applyMatrix4(top.matrixWorld.clone().invert());
+            const normal = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : null;
+            const materialKey = (piece && piece.material) || part.material, material = materialKey && state.materials[materialKey];
+            const scripts = piece ? scriptsIn(piece.name) : [];
+            report.hit = {
+                piece: piece ? piece.name : top.userData.pieceName || null,
+                pieceIndex: index >= 0 ? index : null, base: baseIndex >= 0,
+                placed: piece ? { position: piece.position, rotation: piece.rotation, scale: piece.scale } : null,
+                folder: top.userData.folder || null,
+                model: (part.mesh && (part.mesh.path || part.mesh.name)) || hit.object.userData.model || null,
+                object: part.object || null, material: material ? material.name : part.inspect ? `inspect ${part.inspect.color}` : null,
+                drawnBy: (hit.object.material && hit.object.material.userData && hit.object.material.userData.drawnBy) || (hit.object.material && hit.object.material.type) || null,
+                lod: hit.object.userData.lod ? hit.object.userData.lod.levels : null,
+                ...(scripts.length ? { scripts } : {}),
+                ...(piece && (piece.when || piece.never) ? { gate: gateText(piece) } : {}),
+                ...(part.when || part.never ? { partGate: gateText(part) } : {}),
+                ...(piece && piece.moved ? { moved: { when: piece.moved.when.map(Conditions.describe), position: piece.moved.position } } : {}),
+                point: unityOf(hit.point), local: unityOf(local), normal: normal ? unityOf(normal) : null,
+                distance: +hit.distance.toFixed(2), triangle: hit.faceIndex, ...probeVertices(hit, top)
+            };
+            probeMark.position.copy(hit.point);
+            probeMark.scale.setScalar(Math.max(0.03, hit.distance * 0.006));
+            probeMark.visible = true;
+        } else probeMark.visible = false;
+        call("POST", "/api/probe", report).catch(fail);
+        const h = report.hit;
+        say(h ? `Probe: ${h.piece}${h.model ? " · " + h.model.split("/").pop() : ""} at (${h.point.join(", ")}), ${h.distance} m. Sent: say "what about this?"` : "Probe: nothing along the ray.");
+    };
+
+    // A piece's scripts, by name, for the probe report: its own (a layout prefab's Script lines, a
+    // Unity prefab's C# ones) and those of what it uses; C# ones without a stand-in say so.
+    function scriptsIn(name, seen = new Set()) {
+        const e = state.library[name];
+        if (!e || seen.has(name)) return [];
+        seen.add(name);
+        const own = (e.scripts || []).map(s => `${s.name}${s.url ? "" : " (no stand-in)"}${s.off ? " (off)" : ""}`);
+        return [...own, ...(e.shapes || []).filter(s => s.kind === "use").flatMap(s => scriptsIn(s.name, seen))];
+    }
+    // ---------- inspect layers ----------
+    // ☰ Inspect layers (shown when the scene has inspection models, "inspect:<Name>" pieces): each
+    // layer's color and an on/off box, the same switch as ☰ Folders. A layer with nothing in it
+    // (no triangles: say no orphans left) isn't listed.
+    function inspectFolders() {
+        const out = new Map(), filled = new Set();
+        for (const o of allObjects()) {
+            const f = o.userData.folder;
+            if (!f || !f.startsWith("Inspect/")) continue;
+            const entry = state.library[o.userData.pieceName] || {};
+            const look = ((entry.parts || [])[0] || {}).inspect || {};
+            out.set(f, look.color || "#ffffff");
+            o.traverse(m => {
+                const g = m.isMesh && m.geometry;
+                if (g && (g.index ? g.index.count : (g.attributes.position || { count: 0 }).count)) filled.add(f);
+            });
+        }
+        for (const f of out.keys()) if (!filled.has(f)) out.delete(f);
+        return out;
+    }
+    $("inspectBtn").onclick = () => {
+        const panel = $("folders");
+        panel.innerHTML = "<div class='row'><b>Inspect layers</b></div>";
+        for (const [folder, color] of [...inspectFolders()].sort()) {
+            const row = document.createElement("label");
+            const box = document.createElement("input");
+            box.type = "checkbox";
+            box.checked = !state.hiddenFolders.has(folder);
+            box.onchange = () => {
+                if (box.checked) state.hiddenFolders.delete(folder);
+                else state.hiddenFolders.add(folder);
+                saveHidden();
+                for (const o of allObjects()) if (o.userData.folder === folder) o.visible = shown(o);
+            };
+            const swatch = document.createElement("span");
+            swatch.style.cssText = `display:inline-block;width:0.9em;height:0.9em;border-radius:3px;margin:0 0.4em;vertical-align:middle;background:${color}`;
+            row.append(box, swatch, folder.replace(/^Inspect\//, ""));
+            panel.appendChild(row);
+        }
+        const close = document.createElement("button");
+        close.textContent = "Close";
+        close.onclick = closePanels;
+        panel.appendChild(close);
+        toggle("folders");
+    };
+
+    // ---------- origin ----------
+    // ☰ Origin: the scene's "- Origin: x y z" (an assemblage's root) as axes 1.5 m long, drawn
+    // through everything: red Unity +X, green +Y, blue +Z (0 degrees; the Amphitheater's podium).
+    const originMark = new THREE.Group();
+    {
+        const axis = (to, color) => {
+            const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), to]), new THREE.LineBasicMaterial({ color, depthTest: false }));
+            const tip = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.2, 12), new THREE.MeshBasicMaterial({ color, depthTest: false }));
+            tip.position.copy(to);
+            tip.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), to.clone().normalize());
+            for (const o of [line, tip]) {
+                o.renderOrder = 10;
+                originMark.add(o);
+            }
+        };
+        // Three.js mirrors Unity's X (web/space.js): Unity +X is Three's -X
+        axis(new THREE.Vector3(-1.5, 0, 0), 0xff4040);
+        axis(new THREE.Vector3(0, 1.5, 0), 0x40ff40);
+        axis(new THREE.Vector3(0, 0, 1.5), 0x4080ff);
+        const dot = new THREE.Mesh(new THREE.SphereGeometry(0.08, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }));
+        dot.renderOrder = 10;
+        originMark.add(dot);
+    }
+    originMark.visible = false;
+    world.add(originMark);
+    function showOrigin() {
+        originMark.visible = Boolean(state.showOrigin && state.origin);
+        if (state.origin) originMark.position.setFromMatrixPosition(Space.pieceMatrix(THREE, { position: state.origin, rotation: [0, 0, 0], scale: [1, 1, 1] }));
+    }
+
+    // ---------- tweak ----------
+    // Tweak (the sliders button right of fullscreen) reshapes pieces live: their family's worker (server.js,
+    // unity.json tweakWorkers; modl's obj/serve.py) lists its tweakvars, the {name value unit}
+    // tags of the model's doc. Tap one in the list, then drag left and right: geometry follows
+    // the finger, textures follow when it lifts; a var that needs a full rebuild asks for a
+    // number and rebuilds at once. Undo and redo step through tweaks. Leaving Tweak writes the
+    // values into the doc and the full build into Canopy, and the scene reloads.
+    state.tweakFamilies = [];
+    state.tweak = null;
+    async function findTweaks() {
+        const sources = [...new Set([...state.base, ...state.pieces].map(p => (state.library[p.name] || {}).source).filter(Boolean))];
+        state.tweakFamilies = sources.length ? (await call("POST", "/api/tweak/vars", { sources })).families : [];
+        if (state.tweak) {
+            // Reloaded mid-tweak (a rebuild, or the doc or script edited): the tweaks not yet
+            // written stay, over the doc's values, and are put back on the rebuilt pieces.
+            const doc = tweakDocValues();
+            for (const [folder, values] of Object.entries(doc)) {
+                const kept = state.tweak.values[folder] || {};
+                state.tweak.values[folder] = Object.fromEntries(Object.entries(values).map(([name, x]) => [name, name in kept ? kept[name] : x]));
+                if (JSON.stringify(state.tweak.values[folder]) !== JSON.stringify(values)) {
+                    tweakMeshes(folder);
+                    tweakTextures(folder);
+                }
+            }
+            renderTweaks();
+        }
+        updateUi();
+    }
+    const tweakDocValues = () => Object.fromEntries(state.tweakFamilies.map(f => [f.folder, Object.fromEntries(f.vars.map(v => [v.name, v.value]))]));
+    const tweakVars = () => state.tweakFamilies.flatMap(f => f.vars.map(v => ({ ...v, folder: f.folder, key: `${f.folder}|${v.name}`, label: state.tweakFamilies.length > 1 ? `${f.family}.${v.name}` : v.name })))
+        .sort((a, b) => a.label.localeCompare(b.label));
+    const tweakSelected = () => state.tweak && tweakVars().find(v => v.key === state.tweak.selected);
+    const tweakText = v => `${v.label} ${+state.tweak.values[v.folder][v.name].toFixed(4)}${v.unit ? " " + v.unit : ""}`;
+    $("tweakBtn").onclick = () => (state.tweak ? endTweak() : startTweak());
+    function startTweak() {
+        let selected = null;
+        try { selected = localStorage.getItem("layout.tweakSelected"); } catch { /* none */ }
+        state.tweak = { values: tweakDocValues(), undo: [], redo: [], selected, drag: null, busy: false, again: null };
+        state.tweak.start = JSON.stringify(state.tweak.values);
+        showTweakList();
+        updateUi();
+    }
+    async function endTweak() {
+        const t = state.tweak;
+        closePanels();
+        $("tweakHud").style.display = "none";
+        state.tweak = null;
+        updateUi();
+        if (JSON.stringify(t.values) === t.start) return say("Tweak: nothing changed.");
+        // anchored pieces moved with their rings: the scene keeps their new places
+        if (t.moved && state.scene && state.scene.editable) await call("POST", "/api/save", { name: state.scene.name, pieces: state.pieces }).catch(fail);
+        say("Tweak: writing the values and rebuilding…");
+        for (const f of state.tweakFamilies) {
+            try {
+                await call("POST", "/api/tweak/write", { folder: f.folder, values: t.values[f.folder] });
+            } catch (error) {
+                fail(error);
+            }
+        }
+        say("Tweak: written; the scene reloads when Canopy's files change.");
+    }
+    function showTweakList() {
+        closePanels();
+        renderTweaks();
+        $("tweakPanel").style.display = "flex";
+        let top = 0;
+        try { top = +localStorage.getItem("layout.tweakScroll") || 0; } catch { /* none */ }
+        $("tweakList").scrollTop = top;
+    }
+    $("tweakList").addEventListener("scroll", () => {
+        try { localStorage.setItem("layout.tweakScroll", String($("tweakList").scrollTop)); } catch { /* private mode */ }
+    });
+    $("tweakClose").onclick = () => closePanels();
+    $("tweakHud").onclick = () => showTweakList();
+    function renderTweaks() {
+        if (!state.tweak) return;
+        const list = $("tweakList");
+        const top = list.scrollTop;
+        list.innerHTML = "";
+        for (const v of tweakVars()) {
+            const row = document.createElement("div");
+            row.className = v.key === state.tweak.selected ? "on" : "";
+            row.textContent = tweakText(v);
+            const note = document.createElement("small");
+            note.textContent = v.rebuild ? "  · rebuild: enter a number" : v.geometry ? "" : "  · textures: shown when you lift your finger";
+            row.appendChild(note);
+            row.onclick = () => pickTweak(v);
+            list.appendChild(row);
+        }
+        list.scrollTop = top;
+        const v = tweakSelected();
+        $("tweakHud").textContent = v ? `${tweakText(v)} ⇆` : "";
+        $("tweakHud").style.display = v && $("tweakPanel").style.display !== "flex" ? "block" : "none";
+    }
+    // Tapping the selected var again deselects it, so one finger looks around again.
+    async function pickTweak(v) {
+        state.tweak.selected = v.key === state.tweak.selected && !v.rebuild ? null : v.key;
+        try { localStorage.setItem("layout.tweakSelected", state.tweak.selected || ""); } catch { /* private mode */ }
+        closePanels();
+        renderTweaks();
+        if (!v.rebuild || !state.tweak.selected) return;
+        const text = prompt(`${v.label}${v.unit ? ` (${v.unit})` : ""}: a full rebuild`, String(state.tweak.values[v.folder][v.name]));
+        if (text === null || text.trim() === "" || !Number.isFinite(+text)) return;
+        tweakRecord();
+        state.tweak.values[v.folder][v.name] = tweakClamp(v, +text);
+        renderTweaks();
+        say(`Tweak: rebuilding with ${tweakText(v)}…`);
+        // the full build is written at once; the scene reloads from it
+        await call("POST", "/api/tweak/write", { folder: v.folder, values: state.tweak.values[v.folder] }).catch(fail);
+    }
+    const tweakClamp = (v, x) => Math.min(v.max ?? Infinity, Math.max(v.min ?? -Infinity, Math.round(x / v.step) * v.step));
+    function tweakRecord() {
+        state.tweak.undo.push(JSON.stringify(state.tweak.values));
+        state.tweak.redo = [];
+        updateUi();
+    }
+    function tweakHistory(from, to) {
+        if (!from.length) return;
+        to.push(JSON.stringify(state.tweak.values));
+        state.tweak.values = JSON.parse(from.pop());
+        renderTweaks();
+        updateUi();
+        for (const f of state.tweakFamilies) {
+            tweakMeshes(f.folder);
+            tweakTextures(f.folder);
+        }
+    }
+    // A one-finger drag dx px from where it began, on the selected var: across the screen
+    // spans its range (at most twice its value, so small values stay fine). Returns whether the
+    // drag was the tweak's.
+    function tweakDragging(dx) {
+        const v = tweakSelected();
+        if (!v || v.rebuild || $("tweakPanel").style.display === "flex") return false;
+        const t = state.tweak;
+        if (!t.drag) {
+            t.drag = { from: t.values[v.folder][v.name], recorded: false };
+        }
+        let span = v.min != null && v.max != null ? v.max - v.min : 2 * Math.abs(t.drag.from) || 1;
+        span = Math.max(Math.min(span, 2 * Math.abs(t.drag.from) || span), 20 * v.step);
+        const value = tweakClamp(v, t.drag.from + dx / window.innerWidth * span);
+        if (value !== t.values[v.folder][v.name]) {
+            if (!t.drag.recorded) {
+                t.undo.push(JSON.stringify(t.values));
+                t.redo = [];
+                t.drag.recorded = true;
+                updateUi();
+            }
+            t.values[v.folder][v.name] = value;
+            $("tweakHud").textContent = `${tweakText(v)} ⇆`;
+            if (v.geometry) tweakMeshes(v.folder);
+        }
+        return true;
+    }
+    function tweakReleased() {
+        const t = state.tweak;
+        if (!t || !t.drag) return;
+        const changed = t.drag.recorded;
+        t.drag = null;
+        const v = tweakSelected();
+        renderTweaks();
+        if (t.reloadAfterDrag) {
+            t.reloadAfterDrag = false;
+            canopyReload(); // its reload puts the tweaks back, textures too
+        } else if (changed && v && v.textures) tweakTextures(v.folder);
+    }
+    // New meshes for a family's pieces; one request at a time, the latest values winning.
+    async function tweakMeshes(folder) {
+        const t = state.tweak;
+        if (!t) return;
+        if (t.busy) {
+            t.again = folder;
+            return;
+        }
+        t.busy = true;
+        try {
+            const reply = await call("POST", "/api/tweak/meshes", { folder, values: t.values[folder] });
+            // each model (an asset's LOD levels are models of their own) by name
+            const made = new Map();
+            const geometryOf = name => {
+                const m = reply.meshes[name];
+                if (!m) return null;
+                if (!made.has(name)) {
+                    const g = new THREE.BufferGeometry();
+                    g.setAttribute("position", new THREE.Float32BufferAttribute(m.v, 3));
+                    g.setAttribute("normal", new THREE.Float32BufferAttribute(m.n, 3));
+                    g.setAttribute("uv", new THREE.Float32BufferAttribute(m.uv, 2));
+                    g.setIndex(m.f);
+                    g.computeBoundingSphere();
+                    g.userData.tweak = true;
+                    made.set(name, g);
+                }
+                return made.get(name);
+            };
+            const family = state.tweakFamilies.find(f => f.folder === folder);
+            for (const o of allObjects()) {
+                if (!family || !family.assets.includes(o.userData.pieceName)) continue;
+                for (const mesh of o.children) {
+                    const g = mesh.isMesh && geometryOf(mesh.userData.model);
+                    if (!g) continue;
+                    if (mesh.geometry.userData.tweak && ![...made.values()].includes(mesh.geometry)) mesh.geometry.dispose();
+                    mesh.geometry = g;
+                }
+                // the asset's LODGroup: its size and each level's lowest screen height
+                const lod = (reply.lods || {})[o.userData.pieceName];
+                // Anchored on a ring (a curved bench at its row's radius): in a scene with an
+                // Origin, the piece keeps its angle (its Y turn) around the Origin and moves to
+                // the ring's new radius, so tweaked rows widen or narrow in place.
+                const anchor = (reply.anchors || {})[o.userData.pieceName];
+                const index = state.objects.indexOf(o);
+                if (anchor && state.origin && index >= 0) {
+                    const piece = state.pieces[index], turn = piece.rotation[1] * Math.PI / 180;
+                    const x = state.origin[0] + anchor.ring * Math.sin(turn), z = state.origin[2] + anchor.ring * Math.cos(turn);
+                    if (Math.abs(x - piece.position[0]) > 1e-4 || Math.abs(z - piece.position[2]) > 1e-4) {
+                        piece.position = [x, piece.position[1], z];
+                        o.matrix.copy(Space.pieceMatrix(THREE, piece));
+                        o.matrixWorldNeedsUpdate = true;
+                        t.moved = true;
+                    }
+                }
+                for (const g of Object.values(o.userData.lodGroups || {})) {
+                    if (!lod) break;
+                    g.size = lod.size * (g.scale || 1);
+                    g.heights = lod.heights;
+                }
+            }
+        } catch (error) {
+            fail(error);
+        } finally {
+            t.busy = false;
+        }
+        if (t.again && state.tweak === t) {
+            const next = t.again;
+            t.again = null;
+            tweakMeshes(next);
+        }
+    }
+    // Preview atlases for a family's pieces, after a drag (a couple of seconds).
+    async function tweakTextures(folder) {
+        const t = state.tweak;
+        const family = state.tweakFamilies.find(f => f.folder === folder);
+        if (!t || !family) return;
+        say("Tweak: redoing the textures…");
+        try {
+            const urls = await call("POST", "/api/tweak/textures", { folder, values: t.values[folder] });
+            const [map, normal] = await Promise.all([texture({ url: urls.map, scale: [1, 1], offset: [0, 0] }, true), texture({ url: urls.normal, scale: [1, 1], offset: [0, 0] }, false)]);
+            for (const o of allObjects()) {
+                if (!family.assets.includes(o.userData.pieceName)) continue;
+                for (const mesh of o.children) {
+                    if (!mesh.isMesh || !mesh.material || mesh.userData.untinted) continue;
+                    if (map) mesh.material.map = map;
+                    if (normal) mesh.material.normalMap = normal;
+                    mesh.material.needsUpdate = true;
+                }
+            }
+            say("Tweak: textures updated.");
+        } catch (error) {
+            fail(error);
+        }
+    }
 
     // ---------- panels and buttons ----------
     function updateUi() {
@@ -1370,6 +2091,15 @@ void main() {
         $("deleteBtn").hidden = !carrying || state.carried.index < 0;
         $("undoBtn").disabled = !state.undo.length || carrying;
         $("redoBtn").disabled = !state.redo.length || carrying;
+        // While tweaking, Add, Drop, Cancel and Delete hide, and undo and redo step through tweaks.
+        if (state.tweak) {
+            for (const id of ["addBtn", "dropBtn", "cancelBtn", "deleteBtn"]) $(id).hidden = true;
+            $("undoBtn").disabled = !state.tweak.undo.length;
+            $("redoBtn").disabled = !state.tweak.redo.length;
+        } else $("addBtn").hidden = false;
+        $("tweakBtn").hidden = !state.tweakFamilies.length;
+        $("tweakBtn").disabled = carrying;
+        $("tweakBtn").classList.toggle("on", Boolean(state.tweak));
         $("saveBtn").disabled = !editable || !state.dirty;
         $("saveBtn").textContent = state.dirty ? "Save ●" : "Save";
         $("menuBtn").textContent = state.dirty ? "☰ ●" : "☰";
@@ -1377,18 +2107,33 @@ void main() {
         $("labelsBtn").classList.toggle("on", state.labels);
         $("texturesBtn").classList.toggle("on", state.textures);
         $("fogBtn").classList.toggle("on", state.fog);
+        $("tickBtn").classList.toggle("on", state.ticking);
         $("lodTintBtn").classList.toggle("on", state.lodTint);
         $("fogClipBtn").classList.toggle("on", state.fogClip);
         $("cullingBtn").classList.toggle("on", state.culling);
         $("candidatesBtn").classList.toggle("on", state.candidates);
         $("candidatesBtn").hidden = !state.candidateCount;
         $("lodLegend").style.display = state.lodTint ? "block" : "none";
-        $("scalebar").style.display = carrying ? "flex" : "none";
+        $("scalebar").style.display = carrying && state.carried.index !== REF_CUBE ? "flex" : "none";
+        $("refCubeBtn").classList.toggle("on", state.refCube);
+        $("inspectBtn").hidden = !inspectFolders().size;
+        $("originBtn").classList.toggle("on", state.showOrigin);
+        $("wireframeBtn").classList.toggle("on", state.wireframe);
+        $("conditionsBtn").textContent = `Conditions: ${state.conditions}`;
+        $("inactiveBtn").classList.toggle("on", state.inactive);
+        $("windBtn").textContent = `Wind: ${WIND_LEVELS[state.windLevel]}`;
+        $("gustBtn").textContent = `Gusts: ${GUST_LEVELS[state.gustLevel]}`;
+        $("gustKindBtn").textContent = `Gusts as: ${state.gustKind}`;
+        $("originBtn").disabled = !state.origin;
     }
     function closePanels() {
-        for (const id of ["palette", "importPanel", "folders", "menu"]) $(id).style.display = "none";
+        for (const id of ["palette", "importPanel", "folders", "menu", "viewMenu", "tweakPanel"]) $(id).style.display = "none";
     }
-    // The ☰ menu holds New, Save, Import area, Folders, and the Snap and Labels toggles; choosing one closes it.
+    // The ☰ menu holds New, Save, Import area, Folders, Inspect layers, Snap, Reference cube and View;
+    // choosing one closes it. ☰ View (Ken, 2026-10-29) holds the view toggles (Textures, Labels,
+    // Wireframe, LOD tint, Fog, Fog far clip, Culling, Origin, Candidate trees, Tick, Conditions,
+    // Inactive), in its place,
+    // and stays open while they are flipped, until a tap elsewhere.
     $("menuBtn").onclick = e => {
         e.stopPropagation();
         const open = $("menu").style.display === "flex";
@@ -1396,8 +2141,13 @@ void main() {
         $("menu").style.display = open ? "none" : "flex";
     };
     for (const b of $("menu").querySelectorAll("button")) b.addEventListener("click", () => ($("menu").style.display = "none"));
+    $("viewBtn").onclick = e => {
+        e.stopPropagation();
+        $("viewMenu").style.display = "flex";
+    };
     document.addEventListener("pointerdown", e => {
         if ($("menu").style.display === "flex" && !$("menu").contains(e.target) && e.target !== $("menuBtn")) $("menu").style.display = "none";
+        if ($("viewMenu").style.display === "flex" && !$("viewMenu").contains(e.target) && e.target !== $("viewBtn")) $("viewMenu").style.display = "none";
     });
     function toggle(id) {
         const show = $(id).style.display !== "flex";
@@ -1426,6 +2176,14 @@ void main() {
                 list.appendChild(row);
             }
         };
+        // Add places a single piece, or with Scenes a whole assemblage scene (its prefab).
+        $("palettePieces").classList.toggle("on", paletteMode() === "pieces");
+        $("paletteScenes").classList.toggle("on", paletteMode() === "scenes");
+        if (paletteMode() === "scenes") {
+            section("Scenes (assemblages)", (palette.scenes || []).filter(s => !state.scene || s.name !== state.scene.name).map(s => ({ label: s.name, piece: s.prefab })));
+            return;
+        }
+        section("Modl models", palette.modl || []);
         // ◇: a placeholder shape (docs Shape lines); ▢: nothing yet, a labeled box.
         const shaped = new Set(palette.shaped);
         section("New assets (docs) ◇ shape, ▢ box", palette.newAssets, n => (shaped.has(n) ? " ◇" : " ▢"));
@@ -1478,6 +2236,15 @@ void main() {
         }
     };
     $("paletteFilter").oninput = renderPalette;
+    const paletteMode = () => {
+        try { return localStorage.getItem("layout.paletteMode") || "pieces"; } catch { return "pieces"; }
+    };
+    const setPaletteMode = mode => {
+        try { localStorage.setItem("layout.paletteMode", mode); } catch { /* private mode */ }
+        renderPalette();
+    };
+    $("palettePieces").onclick = () => setPaletteMode("pieces");
+    $("paletteScenes").onclick = () => setPaletteMode("scenes");
     $("paletteClose").onclick = closePanels;
     $("dropBtn").onclick = drop;
     $("cancelBtn").onclick = cancel;
@@ -1486,6 +2253,12 @@ void main() {
         state.labels = !state.labels;
         saveToggles();
         refreshLabels();
+        updateUi();
+    };
+    // ☰ Tick: off, scripts get dt 0, so the sea, wind and anything else animated stand still.
+    $("tickBtn").onclick = () => {
+        state.ticking = !state.ticking;
+        saveToggles();
         updateUi();
     };
     $("fogBtn").onclick = () => {
@@ -1523,17 +2296,76 @@ void main() {
         saveToggles();
         updateUi();
     };
+    $("originBtn").onclick = () => {
+        state.showOrigin = !state.showOrigin;
+        saveToggles();
+        showOrigin();
+        updateUi();
+    };
+    // ☰ View Conditions cycles met, start, saved; ☰ View Inactive draws what is off faint. Both rebuild.
+    const CONDITION_SAYS = { met: "the game's conditions met (its flags as the game sets them)", start: "as a new game starts the scene's stage", saved: "as saved in Unity, conditions ignored" };
+    $("conditionsBtn").onclick = () => {
+        state.conditions = Conditions.MODES[(Conditions.MODES.indexOf(state.conditions) + 1) % Conditions.MODES.length];
+        saveToggles();
+        rebuildBase();
+        rebuildWorld();
+        say(`Conditions: ${CONDITION_SAYS[state.conditions]}.`);
+        updateUi();
+    };
+    // ☰ View Wind and Gusts cycle the leaves' steady wind and gusts through their levels, added
+    // (LeafGust: scripts/LeafGust.js); Gusts as switches cylinders and waves. Nothing rebuilds.
+    const WIND_LEVELS = ["still", "light", "medium", "strong"], GUST_LEVELS = ["none", "light", "medium", "strong"];
+    $("windBtn").onclick = () => {
+        state.windLevel = (state.windLevel + 1) % 4;
+        saveToggles();
+        say(`Steady wind: ${WIND_LEVELS[state.windLevel]}.`);
+        updateUi();
+    };
+    $("gustBtn").onclick = () => {
+        state.gustLevel = (state.gustLevel + 1) % 4;
+        saveToggles();
+        say(`Gusts: ${GUST_LEVELS[state.gustLevel]}, added to the steady wind.`);
+        updateUi();
+    };
+    $("gustKindBtn").onclick = () => {
+        state.gustKind = GUST_KINDS[(GUST_KINDS.indexOf(state.gustKind) + 1) % GUST_KINDS.length];
+        saveToggles();
+        applyEnvironment();
+        say(state.gustKind === "waves" ? "Gusts as waves, travelling downwind." : "Gusts as cylinders, up to three at once.");
+        updateUi();
+    };
+    $("inactiveBtn").onclick = () => {
+        state.inactive = !state.inactive;
+        saveToggles();
+        rebuildBase();
+        rebuildWorld();
+        say(state.inactive ? "Inactive objects drawn faint." : "Inactive objects hidden.");
+        updateUi();
+    };
+    $("wireframeBtn").onclick = () => {
+        state.wireframe = !state.wireframe;
+        saveToggles();
+        updateUi();
+    };
+    $("refCubeBtn").onclick = () => {
+        state.refCube = !state.refCube;
+        saveToggles();
+        showRefCube();
+        updateUi();
+    };
     $("snapBtn").onclick = () => {
         state.snap = !state.snap;
         saveToggles();
         updateUi();
     };
     $("undoBtn").onclick = () => {
+        if (state.tweak) return tweakHistory(state.tweak.undo, state.tweak.redo);
         if (!state.undo.length) return;
         state.redo.push(snapshot());
         restore(state.undo.pop());
     };
     $("redoBtn").onclick = () => {
+        if (state.tweak) return tweakHistory(state.tweak.redo, state.tweak.undo);
         if (!state.redo.length) return;
         state.undo.push(snapshot());
         restore(state.redo.pop());
@@ -1573,7 +2405,8 @@ void main() {
                 scene: $("unityScene").value,
                 center: [$("cx").value, $("cy").value, $("cz").value],
                 half: $("half").value,
-                name: $("areaName").value
+                name: $("areaName").value,
+                terrainOnly: $("terrainOnly").checked
             });
             closePanels();
             await refreshList(`area:${result.name}`);
@@ -1595,6 +2428,7 @@ void main() {
             box.onchange = () => {
                 if (box.checked) state.hiddenFolders.delete(folder);
                 else state.hiddenFolders.add(folder);
+                saveHidden();
                 for (const o of allObjects()) if (o.userData.folder === folder) o.visible = shown(o);
                 refreshLabels();
             };
@@ -1636,6 +2470,19 @@ void main() {
             }
         }
     };
+    // An uncommitted Canopy file changed (e.g. modl's --write): reload the scene where it is,
+    // with materials made afresh (they hold their textures' URLs). Mid-drag in Tweak it waits for
+    // the finger to lift; in Tweak the values not yet written are kept and put back (findTweaks).
+    events.addEventListener("canopy", () => canopyReload());
+    function canopyReload() {
+        if (!state.scene || state.dirty) return;
+        if (state.tweak && state.tweak.drag) {
+            state.tweak.reloadAfterDrag = true;
+            return;
+        }
+        materials.clear();
+        loadScene(`${state.scene.kind}:${state.scene.name}`, true).then(() => say("Canopy files changed; reloaded.")).catch(fail);
+    }
     $("reloadBtn").onclick = () => {
         if (!state.dirty || confirm("Discard unsaved changes and reload?")) {
             state.dirty = false;

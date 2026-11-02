@@ -72,7 +72,9 @@ Material:
 }
 
 // One nested prefab or model in a placeholder prefab: { guid, rootT, rootGo, name, at, turn,
-// scale, material (a .mat guid, for models) }.
+// scale, material (a .mat guid, for models), renderer (for a model: also its renderer, as an
+// LODGroup refers to it; tools/assemblage.js) }. Returns { stripped (its transform here), yaml,
+// renderer (that renderer's id here) }.
 function instance(parentT, order, x) {
   const id = idOf(x.name, order, x.guid), stripped = xorId(id, x.rootT);
   const q = U.eulerToQuat({ x: x.turn[0], y: x.turn[1], z: x.turn[2] });
@@ -104,7 +106,13 @@ Transform:
   m_CorrespondingSourceObject: {fileID: ${x.rootT}, guid: ${x.guid}, type: 3}
   m_PrefabInstance: {fileID: ${id}}
   m_PrefabAsset: {fileID: 0}
-`
+` + (x.renderer ? `--- !u!23 &${xorId(id, MODEL.renderer)} stripped
+MeshRenderer:
+  m_CorrespondingSourceObject: {fileID: ${MODEL.renderer}, guid: ${x.guid}, type: 3}
+  m_PrefabInstance: {fileID: ${id}}
+  m_PrefabAsset: {fileID: 0}
+` : ''),
+    renderer: x.renderer ? xorId(id, MODEL.renderer) : null
   };
 }
 function prefabYaml(name, children) {
@@ -286,4 +294,4 @@ if (require.main === module) {
   for (const s of stale) console.log('stale: ' + s);
 }
 
-module.exports = { plan };
+module.exports = { plan, instance, meta, OBJ_META, MODEL, ROOT, idOf, n6 };

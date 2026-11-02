@@ -14,6 +14,8 @@ const { objModelToObj } = require('./obj-model.js');
 const FBX = require('./fbx.js');
 const Config = require('./config.js');
 const Timing = require('./timing.js');
+const Shapes = require('./shapes.js');
+const Gems = require('./gems.js');
 const crypto = require('crypto');
 
 const ROOT = path.join(__dirname, '..');
@@ -56,6 +58,77 @@ function areaLine(text) {
   const m = /^\s*-\s*Area:\s*(.+?)\s*$/m.exec(String(text || ''));
   return m ? m[1] : null;
 }
+// "- Origin: x y z": an assemblage's root (the point its prefab is built around), or null.
+function originLine(text) {
+  const m = /^\s*-\s*Origin:\s*(\S+)\s+(\S+)\s+(\S+)\s*$/m.exec(String(text || ''));
+  const o = m ? [+m[1], +m[2], +m[3]] : null;
+  return o && o.every(Number.isFinite) ? o : null;
+}
+// "- Switch: <Label> = <Layer> <Layer> | <Label> = <Layer> ...": an on-screen button cycling between
+// sets of inspection layers ("inspect:<Layer>" pieces), each shown alone (Ken, 2026-10-28: a before
+// and after in the same place): [{ label, layers }], or null.
+function switchLine(text) {
+  const m = /^\s*-\s*Switch:\s*(.+?)\s*$/m.exec(String(text || ''));
+  if (!m) return null;
+  const states = m[1].split('|').map(s => {
+    const [label, layers] = s.split('=');
+    return { label: (label || '').trim(), layers: (layers || '').trim().split(/\s+/).filter(Boolean) };
+  }).filter(s => s.label && s.layers.length);
+  return states.length >= 2 ? states : null;
+}
+// "- Include: <Scene>" lines: other composed scenes drawn beneath this one, read-only, scripts and all.
+const includeLines = text => [...String(text || '').matchAll(/^\s*-\s*Include:\s*(.+?)\s*$/gm)].map(m => m[1]);
+
+// Scripts (web/tickable.js). A script file's URL, its time in it so an edit loads afresh, or null.
+const scriptUrl = file => (fs.existsSync(path.join(ROOT, file)) ? `${file}?v=${Math.round(fs.statSync(path.join(ROOT, file)).mtimeMs)}` : null);
+// A Unity prefab's C# scripts for the page: those with stand-ins (layout/scripts/<Name>.js) with
+// their URL and saved fields, the rest only named (a probe lists them); and its objects, which
+// stand-ins move.
+function scriptsOf(p) {
+  if (!p.scripts || !p.scripts.length) return {};
+  const scripts = withScriptUrls(p.scripts.map(s => (s.fields ? s : { name: s.name, off: s.off })));
+  return { scripts, ...(p.scripts.some(s => s.fields) ? { objects: p.objects } : {}) };
+}
+// A prefab's parts as served: their object keys (part.go) only where a stand-in may move them.
+const servedParts = (p, parts) => ((p.scripts || []).some(s => s.fields) ? parts : parts.map(({ go, ...rest }) => rest));
+// Stand-ins' URLs, fresh (a piece of an imported area keeps its scripts without them).
+const withScriptUrls = scripts => scripts.map(s => (s.fields ? { ...s, url: scriptUrl(`scripts/${s.name}.js`) } : s));
+// Descriptions of the materials stand-ins' fields name (Cage.cs's liveMat and deadMat), by guid.
+function fieldMaterials(scripts, problems) {
+  const idx = index();
+  const guids = scripts.flatMap(s => Object.values(s.fields || {})).filter(v => v && v.asset && idx[v.asset] && idx[v.asset].path.endsWith('.mat')).map(v => v.asset);
+  return guids.length ? shapeMaterials([...new Set(guids)], problems) : {};
+}
+// Layout's own prefabs (Ken, 2026-10-29), for what Canopy doesn't have or that layout runs
+// differently (the Sea, Wind and Sky): layout/prefabs/<Name>.md, its "- Shape:" lines as a docs
+// asset's (tools/shapes.js; "use X.prefab" nests that Unity prefab) and "- Script: <file> |
+// settings" lines (a script in layout/, e.g. pfx/Wind.js). Never exported to Unity. By name:
+// { source, shapes, scripts: [{ name, url, settings }], errors }.
+const PREFABS = path.join(ROOT, 'prefabs');
+function layoutPrefabs() {
+  const out = {};
+  if (!fs.existsSync(PREFABS)) return out;
+  for (const file of fs.readdirSync(PREFABS).filter(f => f.endsWith('.md'))) {
+    const name = file.slice(0, -3), source = `layout/prefabs/${file}`;
+    const entry = out[name] = { source, shapes: [], scripts: [], errors: [] };
+    for (const line of fs.readFileSync(path.join(PREFABS, file), 'utf8').split('\n')) {
+      const shape = /^\s*-\s*Shape:\s*(.+?)\s*$/.exec(line), script = /^\s*-\s*Script:\s*([^|]+?)\s*(?:\|\s*(.*?))?\s*$/.exec(line);
+      try {
+        if (shape) entry.shapes.push(Shapes.parseShape(shape[1]));
+        if (script) {
+          const url = scriptUrl(script[1]);
+          if (!url) throw new Error(`no layout/${script[1]}`);
+          entry.scripts.push({ name: path.basename(script[1], '.js'), url, settings: script[2] || '' });
+        }
+      } catch (error) {
+        entry.errors.push(`${source}: ${error.message}`);
+      }
+    }
+  }
+  return out;
+}
+// "assemblage: true" in a scene's frontmatter: it becomes a prefab of its own (tools/assemblage.js).
+const isAssemblage = text => /^---\n[\s\S]*?^assemblage:\s*true\s*$[\s\S]*?^---$/m.test(String(text || '').replace(/\r\n/g, '\n'));
 function formatPieceLine(p) {
   const s = p.scale;
   const scale = Math.abs(s[0] - s[1]) < 1e-4 && Math.abs(s[0] - s[2]) < 1e-4 ? String(round(s[0], 3)) : s.map(v => round(v, 3)).join(' ');
@@ -207,31 +280,43 @@ function leafSplitOf(p, cfg) {
 const CANDIDATES = path.join(CACHE, 'candidates');
 // A candidate's own LOD cutoffs (cache/candidates/<prefab>.lod.json, from tree-build.js) go on its
 // GridRender groups as candidateCutoffs.
+// A candidate mesh file's id and whether it is empty, remembered while the server runs and read
+// again only when its size or time changes (reading ~700 of them each load took seconds).
+const candidateInfo = new Map();
+function candidateFile(file) {
+  const s = fs.statSync(file), seen = candidateInfo.get(file);
+  if (seen && seen.mtimeMs === s.mtimeMs && seen.size === s.size) return seen;
+  const data = fs.readFileSync(file);
+  const info = { mtimeMs: s.mtimeMs, size: s.size, blob: 'cand-' + crypto.createHash('sha1').update(data).digest('hex').slice(0, 20), empty: /indexCount: 0\b/.test(data.toString('latin1', 0, 2000)) };
+  candidateInfo.set(file, info);
+  return info;
+}
 function withCandidates(pieces) {
-  if (!fs.existsSync(CANDIDATES)) return 0;
+  return Timing.time('candidates', () => candidatesIn(pieces));
+}
+function candidatesIn(pieces) {
+  if (!listing(CANDIDATES).size) return 0;
   let count = 0;
   for (const piece of pieces) {
     for (const g of Object.values(piece.lodGroups || {})) {
-      const file = g.kind === 'grid' && g.prefab && path.join(CANDIDATES, g.prefab + '.lod.json');
-      if (file && fs.existsSync(file)) g.candidateCutoffs = JSON.parse(fs.readFileSync(file, 'utf8')).cutoffs;
+      const file = g.kind === 'grid' && g.prefab && cached(CANDIDATES, g.prefab + '.lod.json') && path.join(CANDIDATES, g.prefab + '.lod.json');
+      if (file) g.candidateCutoffs = JSON.parse(fs.readFileSync(file, 'utf8')).cutoffs;
     }
     if (!piece.parts) continue;
     const twins = [];
     for (const part of piece.parts) {
-      const file = part.mesh && part.mesh.kind === 'asset' && part.mesh.path && path.join(CANDIDATES, part.mesh.path);
-      if (!file || !fs.existsSync(file)) continue;
-      const data = fs.readFileSync(file);
-      const blob = 'cand-' + crypto.createHash('sha1').update(data).digest('hex').slice(0, 20);
+      const file = part.mesh && part.mesh.kind === 'asset' && part.mesh.path && cached(CANDIDATES, part.mesh.path) && path.join(CANDIDATES, part.mesh.path);
+      if (!file) continue;
+      const { blob, empty } = candidateFile(file);
       part.set = 'shipped';
       // An empty candidate (its triangles all went to neighbors) has no twin: nothing shows there.
-      if (!/indexCount: 0\b/.test(data.toString('latin1', 0, 2000))) twins.push({ ...part, set: 'candidate', mesh: { ...part.mesh, blob, file } });
+      if (!empty) twins.push({ ...part, set: 'candidate', mesh: { ...part.mesh, blob, file } });
       // Strips beside it (<chunk>.strips.asset, tree-build.js): drawn with the strip shader.
       for (const [suffix, extra] of [['.strips.asset', { strip: true }]]) {
         const side = file.replace(/\.asset$/, suffix);
-        if (!fs.existsSync(side)) continue;
-        const sdata = fs.readFileSync(side);
-        if (/indexCount: 0\b/.test(sdata.toString('latin1', 0, 2000))) continue;
-        const sblob = 'cand-' + crypto.createHash('sha1').update(sdata).digest('hex').slice(0, 20);
+        if (!cached(CANDIDATES, part.mesh.path.replace(/\.asset$/, suffix))) continue;
+        const { blob: sblob, empty: sempty } = candidateFile(side);
+        if (sempty) continue;
         twins.push({ ...part, set: 'candidate', ...extra, mesh: { ...part.mesh, name: part.mesh.name + suffix.replace(/\.asset$/, ''), blob: sblob, file: side } });
       }
       count++;
@@ -241,13 +326,27 @@ function withCandidates(pieces) {
   return count;
 }
 // The LOD groups these parts use.
-const groupsFor = (parts, groups) => {
+// The LODGroups a piece's parts (and its stand-ins: a particle system at one level) use.
+const groupsFor = (parts, groups, scripts = []) => {
   const used = {};
-  for (const part of parts) if (part.lod && groups && groups[part.lod.key]) used[part.lod.key] = groups[part.lod.key];
+  for (const x of [...parts, ...scripts]) if (x.lod && groups && groups[x.lod.key]) used[x.lod.key] = groups[x.lod.key];
   return used;
 };
 
-function extractArea(scene, center, half) {
+// A piece's game fields as served: { never } or { when }, and moved as a placement in Unity's terms.
+function gamePlacement(game) {
+  if (!game) return {};
+  const { moved, ...gate } = game;
+  if (!moved) return gate;
+  const e = U.quatToEuler(moved.rot);
+  return { ...gate, moved: { when: moved.when, position: [moved.pos.x, moved.pos.y, moved.pos.z].map(v => round(v, 3)), rotation: [e.x, e.y, e.z].map(v => round(v, 2) % 360), scale: [moved.scl.x, moved.scl.y, moved.scl.z].map(v => round(v, 3)) } };
+}
+// A tree's parts are drawn as GridRender draws them, whatever their objects' conditions.
+const plainParts = parts => parts.map(({ when, never, offSaved, ...rest }) => rest);
+
+// terrainOnly: only the trees (their chunks, as grid trees bring them), e.g. the Tangle's
+// GridTangle without the scene's gameplay pieces.
+function extractArea(scene, center, half, terrainOnly = false) {
   const file = path.join(U.REPO, 'Assets', 'Scenes', scene + '.unity');
   if (!fs.existsSync(file)) throw new Error(`no scene ${scene}`);
   const inside = p => Math.abs(p.pos.x - center[0]) <= half && Math.abs(p.pos.y - center[1]) <= half && Math.abs(p.pos.z - center[2]) <= half;
@@ -271,22 +370,28 @@ function extractArea(scene, center, half) {
       position: [p.pos.x, p.pos.y, p.pos.z].map(v => round(v, 3)),
       rotation: [e.x, e.y, e.z].map(v => round(v, 2) % 360),
       scale: [p.scl.x, p.scl.y, p.scl.z].map(v => round(v, 3)),
-      extra: [p.textId ? `textId ${p.textId}` : '', p.active ? '' : 'inactive', extra || ''].filter(Boolean).join(', ')
+      extra: [p.textId ? `textId ${p.textId}` : '', p.active ? '' : 'inactive', p.guards ? `guards ${p.guards}` : '', extra || ''].filter(Boolean).join(', '),
+      // in the game (web/conditions.js): never on, or on while its when holds; moved, where its triggers put it
+      ...gamePlacement(p.game),
+      // its C# scripts that have stand-ins (their URLs are added when a scene loads), and the objects they move
+      ...(p.prefab && (p.prefab.scripts || []).some(s => s.fields) ? { scripts: p.prefab.scripts.filter(s => s.fields), ...(p.prefab.objects ? { objects: p.prefab.objects } : {}) } : {})
     };
   };
   // Every imported piece carries its own parts, filtered by the scene's show and hide rules
   // (unity.json). A piece whose parts are all switched off or hidden is left out; one with no
   // meshes at all stays, as a labeled box. A tree brings only its overlapping chunks.
   const pieces = [];
-  for (const p of found) {
-    if (trees.some(t => t.piece === p)) continue;
+  for (const imported of terrainOnly ? [] : found) {
+    if (trees.some(t => t.piece === imported)) continue;
+    // a gem locus brings the gem the game makes on it (tools/gems.js)
+    const p = imported.prefab ? { ...imported, prefab: Gems.withGem(imported.prefab, imported.scl) } : imported;
     const parts = p.prefab ? p.prefab.parts : [meshPart(p)];
     const shown = Config.visibleParts(cfg, p.piece, parts, materialName);
     if (parts.length && !shown.length) continue;
-    pieces.push(place(p, shown, '', groupsFor(shown, p.prefab && p.prefab.lodGroups)));
+    pieces.push(place(p, p.prefab ? servedParts(p.prefab, shown) : shown, '', groupsFor(shown, p.prefab && p.prefab.lodGroups, ((p.prefab && p.prefab.scripts) || []).filter(s => s.fields))));
   }
-  for (const t of trees) pieces.push(place(t.piece, t.parts, `tree chunk meshes: ${t.parts.length - t.leaves}${t.leaves ? (t.leafSplit ? `, LeafSplit leaves (thinning from ${t.leafSplit.thin.from})` : ', leaves') : ''}${t.grid && t.grid.manual ? ', GridRender LODs' : ''}`, t.lodGroups));
-  return { source: { scene, center, half, config: Config.mtime() }, pieces };
+  for (const t of trees) pieces.push(place({ ...t.piece, game: null }, plainParts(t.parts), `tree chunk meshes: ${t.parts.length - t.leaves}${t.leaves ? (t.leafSplit ? `, LeafSplit leaves (thinning from ${t.leafSplit.thin.from})` : ', leaves') : ''}${t.grid && t.grid.manual ? ', GridRender LODs' : ''}`, t.lodGroups));
+  return { source: { scene, center, half, terrainOnly, config: Config.extractKey(scene) }, pieces };
 }
 function saveArea(name, area) {
   fs.mkdirSync(AREAS, { recursive: true });
@@ -353,18 +458,36 @@ function prepare(names, extraParts = []) {
   const out = {}, problems = [];
   Timing.count('prepares');
   for (const name of new Set(names)) {
+    // An inspection model a tool wrote (cache/inspect/<Name>.obj and .json, e.g. by
+    // tools/mesh-clean.js): drawn lit in its color (in its material, if it names one, when Textures
+    // is on), its own folder so ☰ Folders toggles it. side "front" or "back" draws only that side
+    // (default both): a back-only copy of a front-only surface lines its inside.
+    const inspect = /^inspect:([\w .-]+)$/.exec(name);
+    if (inspect) {
+      const file = path.join(CACHE, 'inspect', inspect[1] + '.obj');
+      if (!fs.existsSync(file)) {
+        problems.push(`${name}: no cache/inspect/${inspect[1]}.obj (made by a tool such as tools/mesh-clean.js --inspect)`);
+        continue;
+      }
+      let look = {};
+      try { look = JSON.parse(fs.readFileSync(file.replace(/\.obj$/, '.json'), 'utf8')); } catch { /* default look */ }
+      const obj = `inspect/${encodeURIComponent(inspect[1])}.obj?v=${Math.round(fs.statSync(file).mtimeMs)}`;
+      out[name] = { kind: 'inspect', source: `Inspect/${inspect[1]}/model`, parts: [{ mesh: { kind: 'inspect', name: inspect[1] }, m: U.I(), material: look.material || null, object: inspect[1], prefab: '', off: false, inspect: { color: look.color || '#ffffff', opacity: look.opacity ?? 1, side: look.side || 'both' }, obj }], lodGroups: {} };
+      continue;
+    }
     if (!(lib[name] && lib[name].kind === 'mesh')) {
-      // A model file by name ("LeafSingle.fbx"), placed whole, or a prefab.
+      // A model file by name ("LeafSingle.fbx"), placed whole, or a prefab ("Sea.prefab" names the
+      // Unity prefab even where a layout prefab shares its name).
       const model = /\.(fbx|obj)$/i.test(name) && Object.entries(index()).find(([, e]) => e.path.endsWith('/' + name));
-      const p = Timing.time('prefabs', () => (model ? U.modelInstance(model[0], []) : U.prefabByName(name)));
-      if (p) lib[name] = { kind: model ? 'model' : 'prefab', source: p.path, parts: p.parts, takesText: Boolean(p.takesText), lodGroups: p.lodGroups || {} };
+      const p = Timing.time('prefabs', () => (model ? U.modelInstance(model[0], []) : U.prefabByName(name.replace(/\.prefab$/i, ''))));
+      if (p) lib[name] = { kind: model ? 'model' : 'prefab', source: p.path, parts: servedParts(p, p.parts), takesText: Boolean(p.takesText), lodGroups: p.lodGroups || {}, ...scriptsOf(p) };
     }
     if (lib[name]) out[name] = { ...lib[name], parts: Config.visibleParts(cfg, name, lib[name].parts, materialName) };
   }
   const allParts = [...Object.values(out).flatMap(e => e.parts), ...extraParts];
   const wanted = new Map();
   for (const part of allParts) {
-    if (part.mesh.kind === 'asset' && part.mesh.blob && !fs.existsSync(path.join(MESHES, part.mesh.blob + '.obj'))) wanted.set(part.mesh.blob, part.mesh.name);
+    if (part.mesh.kind === 'asset' && part.mesh.blob && !cached(MESHES, part.mesh.blob + '.obj')) wanted.set(part.mesh.blob, part.mesh.name);
   }
   fs.mkdirSync(MESHES, { recursive: true });
   const candidateFiles = new Map(allParts.filter(p => p.mesh.file).map(p => [p.mesh.blob, p.mesh.file]));
@@ -373,6 +496,7 @@ function prepare(names, extraParts = []) {
   for (const [blob, data] of fromCanopy) {
     try {
       fs.writeFileSync(path.join(MESHES, blob + '.obj'), Timing.time('meshes converted', () => assetToObj(data.toString(), wanted.get(blob))));
+      written(MESHES, blob + '.obj');
       Timing.count('meshes converted');
     } catch (error) {
       problems.push(`${wanted.get(blob)}: ${error.message}`);
@@ -381,7 +505,7 @@ function prepare(names, extraParts = []) {
   // FBX models: one OBJ per model used, named by the file's blob and the model.
   const fbxParts = allParts.filter(p => p.mesh.kind === 'model' && !p.mesh.whole && p.mesh.blob && /\.fbx$/i.test(p.mesh.path));
   const fbxKey = p => `${p.mesh.blob}-${crypto.createHash('sha1').update(`${p.mesh.listed ? p.mesh.name : ''}|${p.object || ''}|${p.mesh.fileID || ''}${/^43\d{5}$/.test(p.mesh.fileID || '') ? '' : '|hashed'}`).digest('hex').slice(0, 8)}`;
-  const fbxWanted = fbxParts.filter(p => !fs.existsSync(path.join(MESHES, fbxKey(p) + '.obj')));
+  const fbxWanted = fbxParts.filter(p => !cached(MESHES, fbxKey(p) + '.obj'));
   const fbxFiles = blobs([...new Set(fbxWanted.map(p => p.mesh.blob))]);
   const idx = index();
   const scenes = new Map();
@@ -393,6 +517,7 @@ function prepare(names, extraParts = []) {
       if (!model) throw new Error(`no single mesh matches ${p.object || p.mesh.name}`);
       const settings = (idx[p.mesh.guid] || {}).import;
       fs.writeFileSync(path.join(MESHES, fbxKey(p) + '.obj'), FBX.modelToObj(scene, model, FBX.importScale(scene, settings), `${p.mesh.path} ${model.name}`));
+      written(MESHES, fbxKey(p) + '.obj');
     } catch (error) {
       problems.push(`${p.mesh.path}: ${error.message}`);
     }
@@ -400,7 +525,7 @@ function prepare(names, extraParts = []) {
   // Model files placed whole (FBX or OBJ): one OBJ per file and root-scale choice.
   const wholeParts = allParts.filter(p => p.mesh.kind === 'model' && p.mesh.whole && p.mesh.blob);
   const wholeKey = p => `${p.mesh.blob}-${crypto.createHash('sha1').update(`whole|${p.mesh.keepRootScale ? 1 : 0}`).digest('hex').slice(0, 8)}`;
-  const wholeWanted = wholeParts.filter(p => !fs.existsSync(path.join(MESHES, wholeKey(p) + '.obj')));
+  const wholeWanted = wholeParts.filter(p => !cached(MESHES, wholeKey(p) + '.obj'));
   const wholeFiles = blobs([...new Set(wholeWanted.map(p => p.mesh.blob))]);
   for (const p of wholeWanted) {
     try {
@@ -414,20 +539,22 @@ function prepare(names, extraParts = []) {
         obj = FBX.wholeModelToObj(scene, FBX.importScale(scene, settings), p.mesh.keepRootScale, p.mesh.path);
       } else throw new Error('only FBX and OBJ models are read');
       fs.writeFileSync(path.join(MESHES, wholeKey(p) + '.obj'), obj);
+      written(MESHES, wholeKey(p) + '.obj');
     } catch (error) {
       problems.push(`${p.mesh.path}: ${error.message}`);
     }
   }
   for (const part of allParts) {
+    if (part.mesh.kind === 'inspect') continue; // its own URL already
     if (wholeParts.includes(part)) {
-      part.obj = fs.existsSync(path.join(MESHES, wholeKey(part) + '.obj')) ? `meshes/${wholeKey(part)}.obj` : null;
+      part.obj = cached(MESHES, wholeKey(part) + '.obj') ? `meshes/${wholeKey(part)}.obj` : null;
       continue;
     }
     if (fbxParts.includes(part)) {
-      part.obj = fs.existsSync(path.join(MESHES, fbxKey(part) + '.obj')) ? `meshes/${fbxKey(part)}.obj` : null;
+      part.obj = cached(MESHES, fbxKey(part) + '.obj') ? `meshes/${fbxKey(part)}.obj` : null;
       continue;
     }
-    part.obj = part.mesh.kind === 'asset' && fs.existsSync(path.join(MESHES, part.mesh.blob + '.obj')) ? `meshes/${part.mesh.blob}.obj` : null;
+    part.obj = part.mesh.kind === 'asset' && cached(MESHES, part.mesh.blob + '.obj') ? `meshes/${part.mesh.blob}.obj` : null;
   }
   // Parts cut to an area's cube (a tree's leaves): keep the triangles whose center is inside.
   for (const part of allParts) {
@@ -450,24 +577,38 @@ const SHADERS = path.join(CACHE, 'shaders.json');
 function shaderFlags(shaders, idx) {
   const cache = fs.existsSync(SHADERS) ? JSON.parse(fs.readFileSync(SHADERS, 'utf8')) : {};
   const guids = [...new Set(shaders.map(s => s.guid))].filter(g => idx[g] && idx[g].blob && /\.shader$/.test(idx[g].path));
-  const want = guids.filter(g => !cache[idx[g].blob] || !('cull' in cache[idx[g].blob]));
+  const want = guids.filter(g => !cache[idx[g].blob] || !('queue' in cache[idx[g].blob]));
   const texts = blobs(want.map(g => idx[g].blob));
   for (const g of want) {
     const src = (texts.get(idx[g].blob) || '').toString();
+    if (!src) continue; // not fetched: no flags, read again next time
     cache[idx[g].blob] = {
       cutout: /\bclip\s*\(|"Queue"\s*=\s*"AlphaTest/.test(src),
       transparent: /"Queue"\s*=\s*"Transparent|\bBlend\s+SrcAlpha\s+OneMinusSrcAlpha/.test(src),
       surface: surfaceOf(src),
-      cull: cullOf(src)
+      cull: cullOf(src),
+      colors: ['_Tint', '_BaseColor', '_Color'].filter(name => new RegExp(`\\b${name}\\b`).test(codeOf(src))), // the base colors it reads
+      name: (/^\s*Shader\s+"([^"]+)"/m.exec(src) || [])[1] || '',
+      queue: queueOf(src)
     };
   }
   if (want.length) fs.writeFileSync(SHADERS, JSON.stringify(cache));
   return Object.fromEntries(guids.map(g => [g, cache[idx[g].blob]]));
 }
+// A shader's render queue, from its first Queue tag ("Transparent", "Geometry+1"), or null (Unity's
+// default, Geometry). Unity draws by queue first: below 2500 opaque, from 2500 transparent.
+const QUEUES = { background: 1000, geometry: 2000, alphatest: 2450, geometrylast: 2500, transparent: 3000, overlay: 4000 };
+function queueOf(src) {
+  const m = /"Queue"\s*=\s*"\s*(\w+)\s*(?:([+-])\s*(\d+))?\s*"/.exec(codeOf(src));
+  if (!m || !(m[1].toLowerCase() in QUEUES)) return null;
+  return QUEUES[m[1].toLowerCase()] + (m[2] ? (m[2] === '-' ? -1 : 1) * +m[3] : 0);
+}
+// A shader's source without its comments.
+const codeOf = src => src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map(l => l.replace(/\/\/.*/, '')).join('\n');
 // Which faces a shader draws: its first Cull (Back, Front, Off; Unity's default is Back), or the
 // material property that sets it ("Cull [_CullMode]": { property }).
 function cullOf(src) {
-  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map(l => l.replace(/\/\/.*/, '')).join('\n');
+  const code = codeOf(src);
   const m = /^\s*Cull\s+(\[\s*(\w+)\s*\]|Back|Front|Off)/mi.exec(code);
   if (!m) return 'Back';
   return m[2] ? { property: m[2] } : m[1][0].toUpperCase() + m[1].slice(1).toLowerCase();
@@ -490,12 +631,35 @@ function surfaceOf(src) {
 // guid index and the working tree's textures, each read at most once. A request for the New
 // Assets scene prepares each asset's prefab in turn; reading these per call took most of a minute.
 let shared = {};
-const beginRequest = () => { shared = {}; };
+const beginRequest = () => {
+  shared = {};
+  U.refreshIndex();
+  guidIndex = null; // materialName's
+};
 const index = () => shared.index || (shared.index = JSON.parse(fs.readFileSync(path.join(CACHE, 'guid-index.json'), 'utf8')).entries);
+// What a cache folder holds (paths relative to it, recursively), read once a request: on shared
+// storage each existsSync costs about as much as listing a folder, and a load checked thousands
+// (2026-10-29). Files a request writes are noted in it (written).
+function listing(dir) {
+  const key = 'list:' + dir;
+  if (!shared[key]) {
+    const out = new Set();
+    const walk = (d, rel) => {
+      let entries;
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) if (e.isDirectory()) walk(path.join(d, e.name), rel + e.name + '/'); else out.add(rel + e.name);
+    };
+    Timing.time('cache listings', () => walk(dir, ''));
+    shared[key] = out;
+  }
+  return shared[key];
+}
+const cached = (dir, name) => listing(dir).has(name);
+const written = (dir, name) => listing(dir).add(name);
 // Reads what the viewer needs from a .mat: base color, color texture, normal map, and (for
 // Canopy/General) the detail texture, each texture with its tiling and offset. Bump
 // MATERIAL_PARSER when what it reads changes, so cached materials are read again.
-const MATERIAL_PARSER = 2;
+const MATERIAL_PARSER = 6;
 function parseMaterial(text) {
   text = text.replace(/\r\n/g, '\n');
   const tex = name => {
@@ -517,6 +681,8 @@ function parseMaterial(text) {
   const transparent = [2, 3].includes(float('_Mode')) || float('_Surface') === 1 || queue >= 3000
     || /_ALPHABLEND_ON|_ALPHAPREMULTIPLY_ON|_SURFACE_TYPE_TRANSPARENT/.test(text);
   const shader = (/m_Shader: \{fileID: (-?\d+), guid: ([0-9a-f]+)/.exec(text) || []).slice(1);
+  // The property the base color comes from: a custom shader that never reads it isn't tinted (see prepareMaterials).
+  const colorProperty = (general && color('_Tint') && '_Tint') || (color('_BaseColor') && '_BaseColor') || (color('_Color') && '_Color') || null;
   return {
     parser: MATERIAL_PARSER,
     shader: shader.length ? { fileID: shader[0], guid: shader[1] } : null,
@@ -525,12 +691,16 @@ function parseMaterial(text) {
     cutout: float('_Mode') === 1 || float('_AlphaClip') === 1 || /_ALPHATEST_ON/.test(text),
     cutoff: float('_Cutoff') ?? 0.5,
     transparent,
+    customQueue: queue, // its own render queue, or -1 for its shader's (see prepareMaterials)
     name: (/m_Name: (.*)/.exec(text) || [])[1] || '',
-    color: (general ? color('_Tint') : null) || color('_BaseColor') || color('_Color') || [1, 1, 1, 1],
+    color: (colorProperty && color(colorProperty)) || [1, 1, 1, 1],
+    colorProperty,
     brightness: general ? (float('_Brightness') ?? 1) : 1,
     general,
     map: tex('_MainTex') || tex('_BaseMap') || tex('_BaseColorMap') || tex('_Tex'), // _Tex: a skybox's
     normal: tex('_NormalMap') || tex('_BumpMap'),
+    normal1: tex('_Normal1'), normal2: tex('_Normal2'), // the sea's two (SeaSurface, WaterBelow)
+    noise: tex('_NoiseTex'), // clouds' and goop's mottling (CloudTextured, Goop)
     detail: general ? tex('_DetailTex') : null,
     // Every float and color (or vector) property, for surface shaders (web/surface.js).
     values: Object.fromEntries([
@@ -540,10 +710,17 @@ function parseMaterial(text) {
   };
 }
 // Stores a texture at most MAX_TEXTURE px (unity.json maxTexture) on a side, as PNG (JPG stays JPG), using ImageMagick.
-// TIF and PSD extra channels become alpha, as Unity reads them. Returns false if it can't.
-function storeTexture(data, ext, dest, MAX_TEXTURE) {
+// TIF and PSD extra channels become alpha, as Unity reads them. alpha: its .meta's Alpha Source
+// (tools/guid-index.js): 0 none (opaque), 2 from gray scale (the average of R, G and B, as Unity
+// makes it), else its own. Returns false if it can't.
+const ALPHA_FROM = {
+  0: ['-alpha', 'off'],
+  2: ['-alpha', 'off', '(', '+clone', '-channel', 'RGB', '-separate', '+channel', '-evaluate-sequence', 'mean', ')', '-compose', 'CopyOpacity', '-composite']
+};
+function storeTexture(data, ext, dest, MAX_TEXTURE, alpha) {
   const fmt = { jpg: 'jpg', jpeg: 'jpg', tif: 'tiff', tiff: 'tiff', psd: 'psd', tga: 'tga', png: 'png' }[ext];
   const run = extra => execFileSync('magick', [`${fmt}:-[0]`, ...extra, '-resize', `${MAX_TEXTURE}x${MAX_TEXTURE}>`, '-depth', '8', dest], { input: data, stdio: ['pipe', 'ignore', 'pipe'] });
+  if (ALPHA_FROM[alpha]) return run(ALPHA_FROM[alpha]);
   try {
     run(fmt === 'tiff' || fmt === 'psd' ? ['-channel-fx', 'meta0=>alpha'] : []);
   } catch {
@@ -554,18 +731,11 @@ function storeTexture(data, ext, dest, MAX_TEXTURE) {
 // PNG): guid -> absolute path, from the checked-out .meta files.
 function workingTreeTextures() {
   if (shared.local) return shared.local;
+  // Uncommitted textures, from the guid index (tools/guid-index.js marks them local), not a walk of
+  // Canopy's Assets: on shared storage that walk took seconds a load (2026-10-29). A texture
+  // checked out but unchanged is read from git, the same bytes.
   const out = shared.local = {};
-  const walk = dir => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (/\.(png|jpe?g|tga|tiff?|psd)\.meta$/i.test(e.name)) {
-        const g = /^guid: (\w+)/m.exec(fs.readFileSync(p, 'utf8'));
-        if (g && fs.existsSync(p.slice(0, -5))) out[g[1]] = p.slice(0, -5);
-      }
-    }
-  };
-  Timing.time('working tree textures', () => walk(path.join(U.REPO, 'Assets')));
+  for (const [g, e] of Object.entries(index())) if (e.local && /\.(png|jpe?g|tga|tiff?|psd)$/i.test(e.path)) out[g] = path.join(U.REPO, e.path);
   return out;
 }
 // A Unity material's guid by its file name (no .mat), as a Shape's "material" names it.
@@ -577,13 +747,35 @@ function materialGuid(name) {
 }
 // Descriptions of materials named by Shapes, by guid.
 const shapeMaterials = (guids, problems) => prepareMaterials(guids, problems, Config.load(null).maxTexture);
+// A Piece line's "material <Name>" setting: the piece drawn all in that material (Ken, 2026-10-28:
+// the Tangle in bone). Layout's own materials (materials/<Name>.json: map and normal, files beside
+// it, optional color [r g b a] and scale [x y]), for previews that are not in Canopy, come first;
+// else a Unity material by name. Returns { key, description } for the scene's materials.
+const LOCAL_MATERIALS = path.join(ROOT, 'materials');
+const materialSetting = extra => ((/(?:^|, )material ([^,]+)/.exec(extra || '') || [])[1] || '').trim() || null;
+function pieceMaterial(name, problems) {
+  const file = path.join(LOCAL_MATERIALS, path.basename(name) + '.json');
+  if (!fs.existsSync(file)) {
+    const guid = materialGuid(name);
+    return { key: guid, description: shapeMaterials([guid], problems)[guid] };
+  }
+  const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const tex = f => {
+    if (!f) return null;
+    const p = path.join(LOCAL_MATERIALS, path.basename(f));
+    if (!fs.existsSync(p)) throw new Error(`materials/${name}.json: no materials/${f}`);
+    return { guid: null, url: `materials/${encodeURIComponent(path.basename(f))}?v=${Math.round(fs.statSync(p).mtimeMs)}`, scale: j.scale || [1, 1], offset: [0, 0] };
+  };
+  return { key: 'layout:' + name, description: { parser: MATERIAL_PARSER, name: `layout/materials/${name}.json`, color: j.color || [1, 1, 1, 1], brightness: 1, map: tex(j.map), normal: tex(j.normal), detail: null, cull: 'Back' } };
+}
 // Material descriptions by guid, with texture URLs (textures/<key>.png or .jpg). Textures are
 // fetched, capped at unity.json maxTexture px, and stored once per source and cap.
+const TEXTURE_SLOTS = ['map', 'normal', 'detail', 'normal1', 'normal2', 'noise'];
 function prepareMaterials(guids, problems, maxTexture) {
   const cache = fs.existsSync(MATERIALS) ? JSON.parse(fs.readFileSync(MATERIALS, 'utf8')) : {};
   const idx = index();
   // A material checked out in the Canopy working tree may have uncommitted edits: read it fresh.
-  const checkedOut = g => idx[g] && idx[g].path.endsWith('.mat') && fs.existsSync(path.join(U.REPO, idx[g].path));
+  const checkedOut = g => idx[g] && idx[g].path.endsWith('.mat') && idx[g].local; // uncommitted (the index marks them); an unchanged one reads the same from git
   for (const g of new Set(guids)) if (checkedOut(g)) cache[g] = parseMaterial(fs.readFileSync(path.join(U.REPO, idx[g].path), 'utf8'));
   const want = [...new Set(guids)].filter(g => !cache[g] || cache[g].parser !== MATERIAL_PARSER);
   const matBlobs = want.map(g => idx[g] && idx[g].path.endsWith('.mat') ? idx[g].blob : null);
@@ -599,8 +791,12 @@ function prepareMaterials(guids, problems, maxTexture) {
   const flags = shaderFlags([...new Set(guids)].map(g => cache[g] && cache[g].shader).filter(s => s && s.guid !== BUILTIN_SHADERS), idx);
   for (const g of new Set(guids)) {
     const d = cache[g], f = d && d.shader && flags[d.shader.guid];
+    // A color the shader never reads (Canopy/BarkSimple has no _Color, though BarkBeech.mat keeps
+    // one from an old shader) tints nothing in the game, so it tints nothing here.
+    if (d) d.untinted = Boolean(f && d.colorProperty && f.colors && !f.colors.includes(d.colorProperty));
     if (!f) continue;
     d.surface = f.surface || null;
+    d.shaderName = f.name || null; // the page draws some of Canopy's by name (the sea's)
     if (f.cutout) d.cutout = true;
     if (f.transparent) d.transparent = true;
     // a property's value is UnityEngine.Rendering.CullMode: 0 Off, 1 Front, 2 Back
@@ -609,10 +805,18 @@ function prepareMaterials(guids, problems, maxTexture) {
   }
   // Unity's built-in shaders (Standard and the like) cull back faces.
   for (const g of new Set(guids)) if (cache[g] && !cache[g].cull) cache[g].cull = 'Back';
+  // The render queue Unity draws it in (Ken, 2026-10-30: the sea, at 2950, drew over particles at
+  // 3000): the material's own, else its shader's, else by how it draws (Standard's are saved in
+  // the material).
+  for (const g of new Set(guids)) {
+    const d = cache[g], f = d && d.shader && flags[d.shader.guid];
+    if (!d) continue;
+    d.queue = d.customQueue >= 0 ? d.customQueue : f && f.queue !== null && f.queue !== undefined ? f.queue : d.cutout ? 2450 : d.transparent ? 3000 : 2000;
+  }
   // Textures for every material asked for: from the working tree if changed there, else git.
   const fromGit = new Map(); // blob -> { ext, file, path }
   fs.mkdirSync(TEXTURES, { recursive: true });
-  for (const g of new Set(guids)) for (const slot of ['map', 'normal', 'detail']) {
+  for (const g of new Set(guids)) for (const slot of TEXTURE_SLOTS) {
     const t = cache[g] && cache[g][slot];
     if (!t) continue;
     t.url = null;
@@ -621,18 +825,20 @@ function prepareMaterials(guids, problems, maxTexture) {
     const ext = source && ((/\.(png|jpe?g|tga|tiff?|psd)$/i.exec(source) || [])[1] || '').toLowerCase();
     if (!ext) continue;
     const key = file ? 'wt' + crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex').slice(0, 38) : idx[t.guid].blob;
-    const name = `${key}-${maxTexture}.${/^jpe?g$/.test(ext) ? 'jpg' : 'png'}`;
-    if (!fs.existsSync(path.join(TEXTURES, name))) {
+    const alpha = idx[t.guid] && idx[t.guid].alpha; // Unity's Alpha Source, when not the texture's own
+    const name = `${key}-${maxTexture}${alpha !== undefined ? '-a' + alpha : ''}.${/^jpe?g$/.test(ext) && alpha !== 2 ? 'jpg' : 'png'}`;
+    if (!cached(TEXTURES, name)) {
       if (file) {
         try {
-          Timing.time('textures converted', () => storeTexture(fs.readFileSync(file), ext, path.join(TEXTURES, name), maxTexture));
+          Timing.time('textures converted', () => storeTexture(fs.readFileSync(file), ext, path.join(TEXTURES, name), maxTexture, alpha));
+          written(TEXTURES, name);
           Timing.count('textures converted');
         } catch (error) {
           problems.push(`${file}: ${error.message.split('\n')[0]}`);
           continue;
         }
       } else {
-        fromGit.set(key, { ext, name, path: source });
+        fromGit.set(key, { ext, name, path: source, alpha });
       }
     }
     t.url = `textures/${name}`;
@@ -640,15 +846,16 @@ function prepareMaterials(guids, problems, maxTexture) {
   for (const [blob, data] of blobs([...fromGit.keys()])) {
     const t = fromGit.get(blob);
     try {
-      Timing.time('textures converted', () => storeTexture(data, t.ext, path.join(TEXTURES, t.name), maxTexture));
+      Timing.time('textures converted', () => storeTexture(data, t.ext, path.join(TEXTURES, t.name), maxTexture, t.alpha));
+      written(TEXTURES, t.name);
       Timing.count('textures converted');
     } catch (error) {
       problems.push(`${t.path}: ${error.message.split('\n')[0]}`);
     }
   }
-  for (const g of new Set(guids)) for (const slot of ['map', 'normal', 'detail']) {
+  for (const g of new Set(guids)) for (const slot of TEXTURE_SLOTS) {
     const t = cache[g] && cache[g][slot];
-    if (t && t.url && !fs.existsSync(path.join(ROOT, 'cache', t.url))) t.url = null;
+    if (t && t.url && !cached(TEXTURES, t.url.replace(/^textures\//, ''))) t.url = null;
   }
   fs.writeFileSync(MATERIALS, JSON.stringify(cache));
   const out = {};
@@ -688,7 +895,7 @@ function clipObj(text, M, center, half, leaves) {
   return [`# leaves ${leaves} ${per} ${list}`, ...lines.filter(l => !l.startsWith('f ') || keep.has(l))].join('\n');
 }
 
-module.exports = { REPO: U.REPO, ROOT, AREAS, MESHES, TEXTURES, beginRequest, blobs, withCandidates, parseMaterial, materialGuid, shapeMaterials, parsePieceLines, areaLine, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };
+module.exports = { REPO: U.REPO, ROOT, AREAS, MESHES, TEXTURES, LOCAL_MATERIALS, beginRequest, blobs, withCandidates, parseMaterial, materialGuid, shapeMaterials, materialSetting, pieceMaterial, parsePieceLines, areaLine, originLine, switchLine, includeLines, layoutPrefabs, withScriptUrls, fieldMaterials, isAssemblage, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };
 
 if (require.main === module) {
   const [command, ...args] = process.argv.slice(2);
