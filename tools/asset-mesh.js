@@ -40,16 +40,19 @@ const pos = read(0), nrm = read(1), uv = read(4);
 const wide = num('m_IndexFormat') === 1;
 const idx = []; for (let i = 0; i < ib.length; i += wide ? 4 : 2) idx.push(wide ? ib.readUInt32LE(i) : ib.readUInt16LE(i));
 
-// submeshes: only triangle topology (0)
-const tris = [];
+// submeshes: only triangle topology (0). Each is a range of the one index buffer, drawn in the
+// renderer's material of the same position; the page needs their sizes for that.
+const tris = [], submeshes = [];
 for (const m of t.matchAll(/firstByte: (\d+)\s+indexCount: (\d+)\s+topology: (\d+)\s+baseVertex: (\d+)/g)) {
-  if (+m[3] !== 0) continue;
+  if (+m[3] !== 0) { submeshes.push(0); continue; }
   const first = +m[1] / (wide ? 4 : 2), n = +m[2], bv = +m[4];
   for (let i = first; i < first + n; i += 3) tris.push([idx[i] + bv, idx[i + 1] + bv, idx[i + 2] + bv]);
+  submeshes.push(n / 3);
 }
 
 const f6 = x => +x.toFixed(6);
 const L = ['# from ' + label];
+if (submeshes.length > 1) L.push('# submeshes ' + submeshes.join(' '));
 pos.forEach(p => L.push('v ' + [-p[0], p[1], p[2]].map(f6).join(' ')));
 if (uv) uv.forEach(u => L.push('vt ' + [u[0], u[1]].map(f6).join(' ')));
 if (nrm) nrm.forEach(n => L.push('vn ' + [-n[0], n[1], n[2]].map(f6).join(' ')));

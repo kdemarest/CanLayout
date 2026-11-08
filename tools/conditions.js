@@ -23,6 +23,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const U = require('./unity.js');
+const Config = require('./config.js');
 
 const TRIGGERS = new Set(['OnCondition', 'OnConditionOnce', 'OnConditionDoEffect', 'EffectTrigger', 'EffectConditional']);
 const SELF_DEFAULT = new Set(['EffectTrigger', 'EffectConditional']); // no effectsToExecute: their own object
@@ -165,9 +166,22 @@ const dedupe = terms => [...new Map(terms.map(t => [JSON.stringify(t), t])).valu
 // RingsWorn) in both; a composed scene's "- Symbols: A=1 B=0" lines win (the page applies those).
 const SCRIPTS = ['EffectSetProgressFlag', 'EffectMath', 'FastForwardSymbols', 'Gate', 'GateOutpost', 'GateMini'];
 let scan = null, scanKey = null;
+// The scan is kept in cache/game-scan.json, by what it reads: the guid index (every Canopy
+// file's blob, uncommitted ones rehashed) and unity.json (scenes' stages). A restart used to
+// scan again, about 8 s (Ken, 2026-11-04: a reload took 12 s).
+const SCAN_CACHE = path.join(__dirname, '..', 'cache', 'game-scan.json');
 function scanGame() {
-  const key = fs.statSync(path.join(__dirname, '..', 'cache', 'guid-index.json')).mtimeMs;
+  const key = require('crypto').createHash('sha1').update(fs.readFileSync(path.join(__dirname, '..', 'cache', 'guid-index.json')))
+    .update(fs.readFileSync(path.join(__dirname, '..', 'unity.json'))).digest('hex');
   if (scan && scanKey === key) return scan;
+  try {
+    const saved = JSON.parse(fs.readFileSync(SCAN_CACHE, 'utf8'));
+    if (saved.key === key) {
+      scan = saved.scan;
+      scanKey = key;
+      return scan;
+    }
+  } catch { /* none kept yet */ }
   const guids = Object.fromEntries(SCRIPTS.map(n => [U.scriptGuid(n), n]).filter(([g]) => g));
   const pattern = `guid: (${Object.keys(guids).join('|')})|propertyPath: (flagId|depositsRequired)$`;
   let files = [];
@@ -192,7 +206,8 @@ function scanGame() {
   for (const file of files) {
     const text = fs.readFileSync(path.join(U.REPO, file), 'utf8').replace(/\r\n/g, '\n');
     const f = U.parse(text);
-    const stage = sceneStage(path.basename(file).replace(/\.\w+$/, ''), stages);
+    const sceneName = path.basename(file).replace(/\.\w+$/, ''), playsIn = Config.load(sceneName).stage;
+    const stage = sceneStage(playsIn ? playsIn + 'Scene' : sceneName, stages); // its Gates' deposits count for that stage
     for (const [, guid, body] of f.scripts) {
       const name = guids[guid];
       if (!name) continue;
@@ -219,6 +234,7 @@ function scanGame() {
   }
   scan = { ff, sets, adds, deposits, stages };
   scanKey = key;
+  fs.writeFileSync(SCAN_CACHE, JSON.stringify({ key, scan }));
   return scan;
 }
 // StageId.cs's enum: { name: number }.
@@ -231,9 +247,10 @@ function sceneStage(scene, stages) {
   const m = /^(\w+?)Scene$/.exec(scene || '');
   return m && m[1] in stages ? { name: m[1], id: stages[m[1]] } : null;
 }
-function symbols(scene, extra = {}) {
+// stageName: the stage the scene plays in, when its name is not one (unity.json stage).
+function symbols(scene, extra = {}, stageName = null) {
   const g = scanGame();
-  const stage = sceneStage(scene, g.stages);
+  const stage = sceneStage(stageName ? stageName + 'Scene' : scene, g.stages);
   const met = {}, start = {};
   for (const id of Object.keys(g.ff).map(Number).sort((a, b) => a - b)) {
     Object.assign(met, g.ff[id]);

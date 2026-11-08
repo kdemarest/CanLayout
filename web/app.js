@@ -2,6 +2,7 @@
 // Pieces are kept as Unity values ({ name, position, rotation, scale, extra }); Space converts.
 (function () {
     const $ = id => document.getElementById(id);
+    const Lights = window.CanopyLights.create(THREE); // Canopy's point lights (More Lights phase 4)
     const status = $("status");
 
     // ---------- state ----------
@@ -10,7 +11,11 @@
         pieces: [],           // Unity values
         objects: [],          // Three.js group per piece, same order
         area: null,           // the imported area a composed scene sits on ("- Area:" line), or null
-        base: [],             // that area's pieces: drawn, snapped onto, never picked up or saved
+        also: [],             // other areas drawn alongside (☰ Areas, and a composed scene's later Area lines)
+        areaLines: [],        // a composed scene's Area lines (the first is area)
+        areaNames: [],        // every imported area, for ☰ Areas
+        sceneSymbols: {},     // symbols of the Unity scenes of areas drawn alongside, by scene
+        base: [],             // those areas' pieces: drawn, snapped onto, never picked up or saved
         baseObjects: [],
         library: {},
         materials: {},        // Unity material guid -> description (colors, texture URLs)
@@ -24,14 +29,19 @@
         snap: false,
         labels: false,        // name every piece, not only the placeholders
         hiddenFolders: new Set(),
-        orbitDistance: 12
+        orbitDistance: 12,
+        // ☰ View's lighting checks (Ken, 2026-11-06), never remembered, so the page always opens
+        // lit as the game is: no ambient light at all, and every normal map 10 times as strong.
+        noAmbient: false,
+        normalsTimes2: false,
+        fullSunHighlight: false
     };
 
     // ---------- three.js ----------
     const canvas = $("view");
     let renderer;
     try {
-        renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+        renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true }); // smoothed in linearFrame (below)
     } catch (error) {
         throw new Error(`3D graphics (WebGL) could not start: ${error.message}. If the browser blocked it after a crash, close this tab and reopen it, or restart the browser.`, { cause: error });
     }
@@ -44,6 +54,25 @@
         const log = gl.getShaderInfoLog(fragment) || gl.getShaderInfoLog(vertex) || gl.getProgramInfoLog(program);
         window.layoutError(`A surface shader didn't compile: ${String(log).trim().split("\n").slice(0, 3).join(" | ")}`);
     };
+    // Canopy draws in linear color space: what blends (additive glows, the skybeams' strands, all
+    // that is see-through) adds up in linear, and only the sum is encoded for the screen. Drawn
+    // straight to the canvas, each layer was encoded before it was added, so the faint edges of a
+    // glow came out darker and overlaps turned white sooner; the orange skybeams looked white (Ken,
+    // 2026-11-03). So the scene is drawn into an sRGB buffer, smoothed (4 samples, as the canvas
+    // was), whose blending is in linear, then copied to the screen. WebGL 1 can't: straight to the
+    // canvas, unsmoothed.
+    const linearFrame = renderer.capabilities.isWebGL2 ? new THREE.WebGLRenderTarget(1, 1, { samples: 4, colorSpace: THREE.SRGBColorSpace }) : null;
+    const toScreen = new THREE.Scene(), toScreenCamera = new THREE.OrthographicCamera();
+    if (linearFrame) {
+        const copy = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+            uniforms: { frame: { value: linearFrame.texture } },
+            vertexShader: "varying vec2 vUv;\nvoid main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }",
+            fragmentShader: "uniform sampler2D frame;\nvarying vec2 vUv;\nvoid main() {\n    gl_FragColor = texture2D(frame, vUv);\n    #include <colorspace_fragment>\n}",
+            depthTest: false, depthWrite: false, blending: THREE.NoBlending
+        }));
+        copy.frustumCulled = false;
+        toScreen.add(copy);
+    }
     // Fog by distance from the camera, as Canopy's shaders have it, not by depth along the view.
     THREE.ShaderChunk.fog_vertex = THREE.ShaderChunk.fog_vertex.replace("- mvPosition.z", "length( mvPosition.xyz )");
     const scene = new THREE.Scene();
@@ -59,11 +88,7 @@
     function applyEnvironment() {
         const env = state.environment;
         if (!env) return;
-        const [x, y, z] = env.sunDirection;
-        sun.position.set(-x, y, z).normalize(); // Unity's world is Three.js's with X mirrored
-        sun.color.set(env.sunColor);
-        scene.fog = state.fog ? new THREE.FogExp2(env.fogColor, env.fogDensity * Math.sqrt(Math.LN2)) : null;
-        Surface.setEnvironment(env, state.fog);
+        applyLight(env);
         const w = env.leafWind;
         if (w) {
             leafWindUniforms.leafWind.value.set(w.sway, w.flutter, w.frequency, w.fadeDistance);
@@ -71,6 +96,34 @@
             leafWindUniforms.leafNear.value.set(w.near, w.nearDistance);
         }
         leafWindUniforms.leafWaveGusts.value = state.gustKind === "waves" ? 1 : 0;
+    }
+    // The sun, fog and Canopy's globals from the environment: on a load, and each frame while the
+    // game's light is worked out live (web/environment.js, stepped in frame()).
+    function applyLight(env) {
+        const [x, y, z] = env.sunDirection;
+        sun.position.set(-x, y, z).normalize(); // Unity's world is Three.js's with X mirrored
+        sun.color.set(env.sunColor);
+        if (!state.fog) scene.fog = null;
+        else if (scene.fog) {
+            scene.fog.color.set(env.fogColor);
+            scene.fog.density = env.fogDensity * Math.sqrt(Math.LN2);
+        } else scene.fog = new THREE.FogExp2(env.fogColor, env.fogDensity * Math.sqrt(Math.LN2));
+        Surface.setEnvironment(env, state.fog);
+        if (state.noAmbient) Surface.uniforms.canopyAmbient.value.setRGB(0, 0, 0);
+        // ☰ View › Full sun highlight: General's highlight as the committed shader had it, the sun's
+        // color as the inspector shows it (never made linear), without its intensity.
+        if (state.fullSunHighlight) Surface.uniforms.canopySunHighlight.value.set(env.sunColor).convertLinearToSRGB();
+        hemisphere.intensity = state.noAmbient ? 0 : 0.9; // Three.js's own materials' ambient
+    }
+    // The game's EnvironmentManager (web/environment.js), from where the camera is, each frame;
+    // unity.json's environment stands until its first step.
+    function stepEnvironment(dt) {
+        const env = state.environment;
+        if (!env || !env.live) return;
+        const sea = Surface.uniforms.canopySeaLevel.value;
+        if (!Environment.step(env, [-camera.position.x, camera.position.y, camera.position.z], dt, sea > -1e8 ? sea : null)) return;
+        applyLight(env);
+        if (state.fogClip) applyClip();
     }
     const world = new THREE.Group();
     scene.add(world);
@@ -112,6 +165,10 @@
         // The canvas size, not the window: on Android they differ while the address bar moves.
         const w = canvas.clientWidth || window.innerWidth, h = canvas.clientHeight || window.innerHeight;
         renderer.setSize(w, h, false);
+        if (linearFrame) {
+            const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+            linearFrame.setSize(size.x, size.y);
+        }
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
     }
@@ -141,9 +198,11 @@
     function parseObj(text) {
         const v = [], vt = [], vn = [], pos = [], nor = [], uv = [];
         let leaves = null; // a leaf mesh cut to an area: "# leaves <count> <faces each> <kept index ranges>"
+        let submeshes = null; // several: "# submeshes <faces in each>", the faces in that order
         for (const line of text.split("\n")) {
             const p = line.trim().split(/\s+/);
             if (p[0] === "#" && p[1] === "leaves") leaves = { per: +p[3], list: p.slice(4).flatMap(r => { const [a, b] = r.split("-").map(Number); return Array.from({ length: (b ?? a) - a + 1 }, (_, i) => a + i); }) };
+            if (p[0] === "#" && p[1] === "submeshes") submeshes = p.slice(2).map(Number);
             if (p[0] === "v") v.push([+p[1], +p[2], +p[3]]);
             else if (p[0] === "vt") vt.push([+p[1], +p[2]]);
             else if (p[0] === "vn") vn.push([+p[1], +p[2], +p[3]]);
@@ -167,7 +226,40 @@
         g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
         g.computeBoundingSphere();
         if (leaves) g.userData.leaves = leaves;
+        if (submeshes) g.userData.submeshes = submeshes;
         return g;
+    }
+    // A mesh and a renderer's material slots paired as Unity pairs them: slot i draws submesh i, a
+    // submesh with no slot isn't drawn, and a slot past the last submesh draws that one again. The
+    // same vertices, with three.js's groups for the ranges; each group needs a material (Mesh.raycast).
+    const slottedGeometries = new WeakMap();
+    function slotted(geometry, count) {
+        if (!slottedGeometries.has(geometry)) slottedGeometries.set(geometry, new Map());
+        const made = slottedGeometries.get(geometry);
+        if (made.has(count)) return made.get(count);
+        const g = new THREE.BufferGeometry();
+        made.set(count, g);
+        for (const [name, attribute] of Object.entries(geometry.attributes)) g.setAttribute(name, attribute);
+        g.boundingSphere = geometry.boundingSphere;
+        const sizes = geometry.userData.submeshes || [geometry.attributes.position.count / 3];
+        let at = 0, last = 0;
+        sizes.forEach((size, i) => {
+            if (i < count) g.addGroup(at * 3, size * 3, i);
+            if (size) last = i;
+            at += size;
+        });
+        const lastAt = sizes.slice(0, last).reduce((a, b) => a + b, 0);
+        for (let i = sizes.length; i < count; i++) g.addGroup(lastAt * 3, sizes[last] * 3, i);
+        return g;
+    }
+    // The guids of a part's slots, or null for a mesh drawn whole in the one material. Slot 0 is
+    // part.material, which gems change as the game does.
+    const slotsOf = (part, geometry) => (part.materials ? [part.material, ...part.materials.slice(1)] : geometry.userData.submeshes ? [part.material] : null);
+    // What a ray hit is drawn in: on a mesh with slots, its triangle's (three.js's face.materialIndex).
+    function hitMaterial(hit, piece) {
+        const part = hit.object.userData.part || {}, several = Array.isArray(hit.object.material);
+        const slot = several ? hit.face.materialIndex : null;
+        return { slot, guid: (piece && piece.material) || (slot ? part.materials[slot] : part.material), drawn: several ? hit.object.material[slot] : hit.object.material };
     }
     // A leaf's thinning rank, 0..1: the same integer hash as Canopy's LeafSplit.LeafRank.
     const leafRank = i => {
@@ -418,14 +510,52 @@
     }
     // ---------- materials ----------
     // Textures are shrunk to at most 1024 px as they load; Unity's are often 4096 px, which a
-    // phone can't hold many of.
+    // phone can't hold many of uncompressed. Where the GPU reads ASTC (astcTexture) they come at
+    // the size the game draws them instead, at a quarter to a ninth of the memory.
     const MAX_TEXTURE = 1024;
     const textures = new Map();
-    function texture(t, srgb) {
+    const textureMemory = { astc: 0, astcs: 0, png: 0, pngs: 0 }; // bytes on the GPU and how many, for layout.log
+    const dressed = (tex, t, srgb) => {
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(t.scale[0], t.scale[1]);
+        tex.offset.set(t.offset[0], t.offset[1]);
+        if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = 4;
+        tex.needsUpdate = true;
+        return tex;
+    };
+    // A texture's compressed copy (tools/texture-astc.js, which describes the file), with its
+    // mipmaps; null without one or where the GPU can't read ASTC, for the PNG instead.
+    async function astcTexture(t, srgb) {
+        if (!t.astc || !renderer.extensions.has("WEBGL_compressed_texture_astc")) return null;
+        const response = await queuedFetch(t.astc);
+        if (!response || !response.ok) return null;
+        const buffer = await response.arrayBuffer();
+        const head = new DataView(buffer);
+        if (head.getUint32(0, true) !== 0x3141544c) return null; // LTA1
+        const count = head.getUint32(4, true), block = head.getUint32(8, true);
+        const mipmaps = [];
+        for (let i = 0, at = 16 + count * 12; i < count; i++) {
+            const size = head.getUint32(24 + i * 12, true);
+            mipmaps.push({ data: new Uint8Array(buffer, at, size), width: head.getUint32(16 + i * 12, true), height: head.getUint32(20 + i * 12, true) });
+            at += size;
+        }
+        const format = block === 4 ? THREE.RGBA_ASTC_4x4_Format : THREE.RGBA_ASTC_6x6_Format;
+        textureMemory.astc += buffer.byteLength;
+        textureMemory.astcs++;
+        return dressed(new THREE.CompressedTexture(mipmaps, mipmaps[0].width, mipmaps[0].height, format), t, srgb);
+    }
+    // srgb: whether its slot takes colors; a texture's own import setting decides when known
+    // (t.srgb, tools/guid-index.js), as Unity decodes each by its own.
+    function texture(t, slotSrgb) {
         if (!t || !t.url) return Promise.resolve(null);
-        const key = `${t.url}|${t.scale}|${t.offset}|${srgb}`;
+        const srgb = typeof t.srgb === "boolean" ? t.srgb : slotSrgb;
+        const key = `${t.url}|${t.astc}|${t.scale}|${t.offset}|${srgb}`;
         if (!textures.has(key)) {
-            textures.set(key, queuedFetch(t.url).then(r => (r && r.ok ? r.blob() : null)).then(async blob => {
+            textures.set(key, astcTexture(t, srgb).catch(() => null).then(async compressed => {
+                if (compressed) return compressed;
+                const response = await queuedFetch(t.url);
+                const blob = response && response.ok ? await response.blob() : null;
                 if (!blob) return null;
                 // Colors as the file has them, not multiplied by alpha (the browser's default): Unity
                 // and Three.js keep them apart, and a texture whose alpha its shader ignores (the
@@ -436,13 +566,9 @@
                 full.close();
                 const tex = new THREE.Texture(bitmap);
                 tex.flipY = false; // flipped while decoding
-                tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-                tex.repeat.set(t.scale[0], t.scale[1]);
-                tex.offset.set(t.offset[0], t.offset[1]);
-                if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
-                tex.anisotropy = 4;
-                tex.needsUpdate = true;
-                return tex;
+                textureMemory.png += bitmap.width * bitmap.height * 16 / 3; // RGBA, and a third more for its mipmaps
+                textureMemory.pngs++;
+                return dressed(tex, t, srgb);
             }).catch(() => null));
         }
         return textures.get(key);
@@ -556,6 +682,113 @@
 \tdiffuseColor *= sampledDiffuseColor;
 #endif`);
     };
+    // Canopy/General's own lighting (Canopy's General.shader) in place of Three.js's: ambient
+    // times the color, plus the sun (its color times its intensity) times N·L times the color,
+    // plus its Blinn highlight, between the 8th and 64th power by gloss, _HighlightStrength (0.2
+    // by default: a fifth) of the sun times gloss. The sun (canopySunLight, already times its intensity) and ambient are
+    // web/surface.js's (Canopy's globals). gloss: the material's
+    // _Glossiness, live. GlowLit and TransparentLit light as General does; GeneralCutout's
+    // highlight is its own, the 8th power times gloss times the sun, when its _SpecularHighlights
+    // (cutoutHighlights, 0 or 1; null for General's) is on. A glowing pixel has none (glowLitPatch).
+    // Then up to four point or spot lights (More Lights phase 4, web/lights.js), each lit as the sun is,
+    // by its color, falloff (Unity's shape: 1 / (1 + 25 x), x the distance over the range squared, 0 at
+    // the range), a spot's cone and its weight, as CanopyLighting.cginc's CanopyLights; lights: the material's own four
+    // (canopyLights, set per mesh as it draws). WebGL 1 can't index the arrays, so it draws none.
+    const generalLight = (gloss, cutoutHighlights = null, strength = { value: 0.2 }, lights = { value: new THREE.Vector4() }) => shader => {
+        for (const name of ["canopySunDirection", "canopySunLight", "canopySunHighlight", "canopyAmbient"]) shader.uniforms[name] = Surface.uniforms[name];
+        Object.assign(shader.uniforms, Lights.uniforms);
+        shader.uniforms.canopyLights = lights;
+        shader.uniforms.canopyGloss = gloss;
+        shader.uniforms.canopyHighlightStrength = strength;
+        const highlight = cutoutHighlights === null ? "(canopyGloss == 0.0 ? 0.0 : mix(n8, n64, canopyGloss)) * canopyHighlightStrength * canopyGloss" : `n8 * canopyGloss * ${cutoutHighlights ? "1.0" : "0.0"}`;
+        const lightHighlight = highlight.replace(/\bn8\b/g, "m8").replace(/\bn64\b/g, "m64");
+        shader.fragmentShader = `uniform vec3 canopySunDirection;\nuniform vec3 canopySunLight;\nuniform vec3 canopySunHighlight;\nuniform vec3 canopyAmbient;\nuniform float canopyGloss;\nuniform float canopyHighlightStrength;\nuniform vec4 canopyLightPos[${Lights.MAX}];\nuniform vec4 canopyLightColor[${Lights.MAX}];\nuniform vec4 canopyLightSpot[${Lights.MAX}];\nuniform float canopyLightCount;\nuniform float canopyLightView;\nuniform vec4 canopyLights;\nfloat canopyGlowOff = 1.0;\n` + shader.fragmentShader
+            .replace("#include <lights_fragment_begin>", `{
+\t\tvec3 L = normalize((viewMatrix * vec4(canopySunDirection * vec3(-1.0, 1.0, 1.0), 0.0)).xyz); // Unity's world is Three.js's with X mirrored
+\t\tvec3 H = normalize(L + normalize(vViewPosition));
+\t\tfloat n2 = max(dot(normal, H), 0.0);
+\t\tn2 *= n2;
+\t\tfloat n8 = n2 * n2 * n2 * n2;
+\t\tfloat n64 = n8 * n8 * n8 * n8 * n8 * n8 * n8 * n8;
+\t\treflectedLight.indirectDiffuse = canopyAmbient * diffuseColor.rgb;
+\t\treflectedLight.directDiffuse = max(dot(normal, L), 0.0) * canopySunLight * diffuseColor.rgb;
+\t\treflectedLight.directSpecular = ${highlight} * canopySunHighlight * canopyGlowOff;
+#if __VERSION__ >= 300
+\t\tvec3 V = normalize(vViewPosition);
+\t\tfloat reached = 0.0;
+\t\tfor (int k = 0; k < 4; k++) {
+\t\t\tfloat slot = canopyLights[k];
+\t\t\treached += step(0.5, slot);
+\t\t\tif (float(k) >= canopyLightCount) continue;
+\t\t\tint index = int(slot);
+\t\t\tfloat weight = clamp(fract(slot) / 0.99, 0.0, 1.0);
+\t\t\tvec4 p = canopyLightPos[index];
+\t\t\tvec3 toLight = p.xyz + vViewPosition; // the point is -vViewPosition
+\t\t\tfloat d2 = max(dot(toLight, toLight), 1e-6);
+\t\t\tvec3 Lk = toLight * inversesqrt(d2);
+\t\t\tfloat x = d2 * p.w;
+\t\t\tvec4 spot = canopyLightSpot[index];\n\t\t\tfloat cone = clamp((dot(-Lk, spot.xyz) - spot.w) * canopyLightColor[index].a, 0.0, 1.0);\n\t\t\tvec3 light = canopyLightColor[index].rgb * (clamp((1.0 - x) * 5.0, 0.0, 1.0) / (1.0 + 25.0 * x) * cone * weight);
+\t\t\tfloat m2 = max(dot(normal, normalize(Lk + V)), 0.0);
+\t\t\tm2 *= m2;
+\t\t\tfloat m8 = m2 * m2 * m2 * m2;
+\t\t\tfloat m64 = m8 * m8 * m8 * m8 * m8 * m8 * m8 * m8;
+\t\t\treflectedLight.directDiffuse += max(dot(normal, Lk), 0.0) * light * diffuseColor.rgb;
+\t\t\treflectedLight.directSpecular += ${lightHighlight} * light * canopyGlowOff;
+\t\t}
+\t\tif (canopyLightView > 0.5) { // ☰ View › Light crowding: none gray, then blue, green, yellow, red
+\t\t\tvec3 heat = reached < 0.5 ? vec3(0.08) : reached < 1.5 ? vec3(0.0, 0.2, 1.0) : reached < 2.5 ? vec3(0.0, 0.8, 0.1) : reached < 3.5 ? vec3(1.0, 0.85, 0.0) : vec3(1.0, 0.05, 0.0);
+\t\t\treflectedLight.indirectDiffuse = heat * (0.4 + 0.6 * max(dot(normal, L), 0.0));
+\t\t\treflectedLight.directDiffuse = vec3(0.0);
+\t\t\treflectedLight.directSpecular = vec3(0.0);
+\t\t}
+#endif
+\t}`)
+            .replace("#include <lights_fragment_maps>", "")
+            .replace("#include <lights_fragment_end>", "");
+    };
+    // Canopy/GlowLit's glows (More Lights phase 3), over generalLight: where the glow texture, at
+    // its own tiling, is brighter than _GlowThreshold (its average; _GlowMode 1: its brightest
+    // channel), its color squared times _GlowTint, _GlowBrightness and 1 / _GlowFogLevel glows and
+    // the highlight goes (_GlowMode 1: the lit color too); plus the constant glow, _EmissionColor
+    // times _EmissionMap (white without one) at _MainTex's tiling. Colors made linear, as Unity
+    // does; the game's glow fade (_DetailGlowFadeLevel) is taken as 1, none.
+    function glowLitPatch(d) {
+        const v = (name, dflt) => (d.values && d.values[name]) || dflt;
+        const srgb = c => new THREE.Color().setRGB(c[0], c[1], c[2], THREE.SRGBColorSpace);
+        const st = t => new THREE.Vector4(...(t ? [...t.scale, ...t.offset] : [1, 1, 0, 0]));
+        const u = {
+            glowMap: { value: null }, glowST: { value: st(d.glow) }, glowOn: { value: 0 }, glowTint: { value: srgb(v("_GlowTint", [0.5, 0.5, 0.5])) },
+            glowThreshold: { value: v("_GlowThreshold", [0.5])[0] }, glowBrightness: { value: v("_GlowBrightness", [100])[0] },
+            glowFogLevel: { value: v("_GlowFogLevel", [1])[0] }, glowMode: { value: v("_GlowMode", [0])[0] },
+            emissionColor: { value: srgb(v("_EmissionColor", [0, 0, 0])) }, emissionMap: { value: null }, emissionMapOn: { value: 0 }, mainST: { value: st(d.map) }
+        };
+        texture(d.glow, true).then(t => {
+            if (t) {
+                u.glowMap.value = t;
+                u.glowOn.value = 1;
+            }
+        });
+        texture(d.emission, true).then(t => {
+            if (t) {
+                u.emissionMap.value = t;
+                u.emissionMapOn.value = 1;
+            }
+        });
+        return shader => {
+            Object.assign(shader.uniforms, u);
+            shader.fragmentShader = "uniform sampler2D glowMap;\nuniform vec4 glowST;\nuniform vec3 glowTint;\nuniform float glowOn, glowThreshold, glowBrightness, glowFogLevel, glowMode;\nuniform vec3 emissionColor;\nuniform sampler2D emissionMap;\nuniform float emissionMapOn;\nuniform vec4 mainST;\n" + shader.fragmentShader.replace("#include <emissivemap_fragment>", `#include <emissivemap_fragment>
+\t{
+\t\tvec3 glow = texture2D(glowMap, vUv * glowST.xy + glowST.zw).rgb;
+\t\tfloat level = mix((glow.r + glow.g + glow.b) / 3.0, max(glow.r, max(glow.g, glow.b)), glowMode);
+\t\tif (glowOn > 0.5 && level > glowThreshold) {
+\t\t\ttotalEmissiveRadiance += glow * glow * glowTint * glowBrightness / glowFogLevel;
+\t\t\tdiffuseColor.rgb *= 1.0 - glowMode;
+\t\t\tcanopyGlowOff = 0.0;
+\t\t}
+\t\tif (any(greaterThan(emissionColor, vec3(0.0)))) totalEmissiveRadiance += emissionColor * (emissionMapOn > 0.5 ? texture2D(emissionMap, vUv * mainST.xy + mainST.zw).rgb : vec3(1.0));
+\t}`);
+        };
+    }
     // Flat colors for diagnostic parts (tree-build.js candidates: caps cyan, strips inside tubes red).
     function debugMaterial(color, strip) {
         const key = `debug|${color}|${Boolean(strip)}`;
@@ -580,7 +813,11 @@
         return materials.get(key);
     }
     function materialFor(guid, faint, split, strip) {
-        const d = guid && state.materials[guid];
+        // ☰ View › Unity's shaders: a material More Lights moved onto a Canopy shader drawn as its
+        // copy on Unity's (tools/convert-materials.js; the server sends it as unity).
+        const own = guid && state.materials[guid];
+        const asUnity = Boolean(state.unityShaders && own && own.unity);
+        const d = asUnity ? own.unity : own;
         if (!state.textures || !d) {
             if (!strip) return faint ? faded : gray;
             // a plain gray strip still has to widen
@@ -592,22 +829,22 @@
             }
             return materials.get("strip|gray");
         }
-        const key = `${guid}|${faint}${split ? "|" + JSON.stringify([split.thin, split.maxDistance]) : ""}${strip ? "|strip" : ""}`;
+        const key = `${guid}|${faint}${split ? "|" + JSON.stringify([split.thin, split.maxDistance]) : ""}${strip ? "|strip" : ""}${asUnity ? "|unity" : ""}`;
         if (materials.has(key)) return materials.get(key);
         // Faces as the Unity shader culls them (tools/scene.js cullOf); strips and LeafSplit's
         // leaves draw both sides, as the game does (front and back instances).
         const side = strip || split || d.cull === 'Off' ? THREE.DoubleSide : d.cull === 'Front' ? THREE.BackSide : THREE.FrontSide;
         // Some of Canopy's own shaders, drawn by name (web/surface.js byShader: the sea's surfaces,
-        // Water, Force Field, CloudTextured, Goop), with their textures.
-        const own = !faint && d.shaderName && Surface.byShader(d, { side });
-        if (own) {
-            own.userData.drawnBy = d.shaderName; // the probe says which of layout's ports drew it
-            if (own.uniforms.seaNormal) texture(d.normal1 || d.normal, false).then(t => { if (t) own.uniforms.seaNormal.value = t; });
-            if (own.uniforms.fieldMap) texture(d.map, true).then(t => { if (t) own.uniforms.fieldMap.value = t; });
-            if (own.uniforms.noiseMap) texture(d.noise, true).then(t => { if (t) own.uniforms.noiseMap.value = t; });
-            if (own.uniforms.normalMap) texture(d.normal, false).then(t => { if (t) own.uniforms.normalMap.value = t; });
-            materials.set(key, own);
-            return own;
+        // Water, Force Field, CloudTextured, Goop, DiffuseGlow, RimLit), with their textures.
+        const ported = !faint && d.shaderName && Surface.byShader(d, { side });
+        if (ported) {
+            ported.userData.drawnBy = d.shaderName; // the probe says which of layout's ports drew it
+            if (ported.uniforms.seaNormal) texture(d.normal1 || d.normal, false).then(t => { if (t) ported.uniforms.seaNormal.value = t; });
+            if (ported.uniforms.fieldMap) texture(d.map, true).then(t => { if (t) ported.uniforms.fieldMap.value = t; });
+            if (ported.uniforms.noiseMap) texture(d.noise, true).then(t => { if (t) ported.uniforms.noiseMap.value = t; });
+            if (ported.uniforms.normalMap) texture(d.normal, false).then(t => { if (t) ported.uniforms.normalMap.value = t; });
+            materials.set(key, ported);
+            return ported;
         }
         // A surface shader's material (web/surface.js); faint ones stay plain.
         if (d.surface && !faint) {
@@ -616,13 +853,53 @@
         }
         // untinted: its shader never reads the color (tools/scene.js prepareMaterials). A see-through
         // one still takes its alpha as opacity, a stand-in for blending layout doesn't draw.
-        let c = (d.untinted ? [1, 1, 1] : d.color.slice(0, 3)).map(v => v * (d.brightness || 1));
-        const top = Math.max(...c);
-        if (top > 1) c = c.map(v => v / top);
+        // Made linear, as Unity hands a material's colors to its shaders in a Linear project (the
+        // .mat keeps them in sRGB, as the inspector shows them); Three.js lights in linear too.
+        const base = d.untinted ? [1, 1, 1] : new THREE.Color().setRGB(d.color[0], d.color[1], d.color[2], THREE.SRGBColorSpace).toArray();
+        // Canopy/General and the shaders lit as it is (generalLight: GeneralCutout with its own
+        // highlight, GlowLit with its glows, TransparentLit blended by its alpha; glass's
+        // premultiplied highlight isn't drawn) take their color as bright as the game's, over 1 if
+        // so; the rest, under Three.js's own lighting, are scaled down to fit under 1.
+        const general = ["Canopy/General", "Canopy/GeneralCutout", "Canopy/GlowLit", "Canopy/TransparentLit"].includes(d.shaderName);
+        const lit = brightness => {
+            const c = base.map(v => v * brightness);
+            const top = Math.max(...c);
+            return top > 1 && !general ? c.map(v => v / top) : c;
+        };
+        const c = lit(d.brightness || 1);
         const opacity = faint ? 0.35 : d.transparent ? Math.min(1, d.color[3]) : 1;
-        const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(...c), roughness: 0.85, metalness: 0, side, transparent: opacity < 1, opacity });
-        // Shader patches, applied in order: darkening under the sea, LeafSplit's thinning and wind, the detail texture.
+        // Canopy/General's _Glossiness (a Blinn highlight, 8th to 64th power) as a stand-in roughness:
+        // the Hut's silk shines a little (Ken, 2026-11-04).
+        const gloss = d.general && d.values && d.values._Glossiness ? d.values._Glossiness[0] : 0;
+        // Unity's Standard by its own smoothness and metallic: Three.js's roughness is Unity's
+        // perceptual roughness, 1 - smoothness, and both are GGX, so Unity's shaders compare fairly
+        // with Canopy's (More Lights phase 3, ☰ View › Unity's shaders).
+        const standard = d.shader && d.shader.guid === "0000000000000000f000000000000000" && (d.shader.fileID === "46" || d.shader.fileID === "45");
+        const value = (name, dflt) => (d.values && d.values[name] ? d.values[name][0] : dflt);
+        const roughness = standard ? Math.min(1, Math.max(0, 1 - value("_Glossiness", 0.5))) : 0.85 - 0.5 * gloss;
+        const metalness = standard && d.shader.fileID === "46" ? Math.min(1, Math.max(0, value("_Metallic", 0))) : 0;
+        const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(...c), roughness, metalness, side, transparent: opacity < 1, opacity });
+        // Canopy/General's _NormalStrength scales the normal map's tilt (Ken, 2026-11-04).
+        const tilt = d.general && d.values && d.values._NormalStrength ? d.values._NormalStrength[0] : 1;
+        m.userData.tilt = tilt; // _NormalStrength, live in Tweak; ☰ View › Normal maps × 2 scales it
+        m.normalScale.setScalar(tilt * (state.normalsTimes2 ? 2 : 1));
+        // Tweak's live vars set these as a drag goes (tweakLive): the detail texture's tiling, how
+        // far toward white it is eased (its strength against the baked one) and the color's gain.
+        m.userData.guid = guid;
+        m.userData.lit = lit; // its color at a brightness (Canopy/General's _Brightness), linear
+        m.userData.gloss = { value: gloss }; // generalLight's, live
+        m.userData.highlight = { value: value("_HighlightStrength", 0.2) }; // and its _HighlightStrength
+        if (general) m.userData.canopyLights = { value: new THREE.Vector4() }; // the drawing mesh's four lights (web/lights.js)
+        m.userData.detail = { repeat: new THREE.Vector2(1, 1), ratio: { value: 1 }, gain: { value: 1 } };
+        // Shader patches, applied in order: darkening under the sea, Canopy/General's lighting, LeafSplit's thinning and wind, the detail texture.
         const patches = [["sea", Surface.underSea]];
+        // GeneralCutout's highlight switch is in the program's code, so in its cache key too
+        const cutoutHighlights = d.shaderName === "Canopy/GeneralCutout" ? value("_SpecularHighlights", 1) > 0.5 : null;
+        if (general) patches.push([cutoutHighlights === null ? "general" : "general-cutout" + Number(cutoutHighlights), generalLight(m.userData.gloss, cutoutHighlights, m.userData.highlight, m.userData.canopyLights)]);
+        if (d.shaderName === "Canopy/GlowLit" && !faint) {
+            m.defines = { ...(m.defines || {}), USE_UV: "" };
+            patches.push(["glow", glowLitPatch(d)]);
+        }
         if (split) patches.push(["thin", thinPatch(split)], ["wind", windPatch]);
         if (strip) patches.push(["strip", stripPatch]);
         const usePatches = () => {
@@ -640,8 +917,11 @@
         });
         texture(d.normal, false).then(t => {
             if (t && !strip) { // strips have no tangents: their normal comes from the shader
-                m.normalMap = t;
-                m.needsUpdate = true;
+                m.userData.normalMap = t; // kept for ☰ View › Normal maps
+                if (state.normalMaps) {
+                    m.normalMap = t;
+                    m.needsUpdate = true;
+                }
             }
         });
         if (d.detail) {
@@ -649,13 +929,17 @@
                 if (!t) return;
                 // Multiply the detail texture in, tiled by its own scale, as the Unity shader does.
                 m.defines = { ...(m.defines || {}), USE_UV: "" };
+                const live = m.userData.detail;
+                if (!live.tiled) live.repeat.set(d.detail.scale[0], d.detail.scale[1]);
                 patches.push(["detail", shader => {
                     shader.uniforms.detailMap = { value: t };
-                    shader.uniforms.detailRepeat = { value: new THREE.Vector2(d.detail.scale[0], d.detail.scale[1]) };
+                    shader.uniforms.detailRepeat = { value: live.repeat };
                     shader.uniforms.detailOffset = { value: new THREE.Vector2(d.detail.offset[0], d.detail.offset[1]) };
-                    shader.fragmentShader = "uniform sampler2D detailMap;\nuniform vec2 detailRepeat;\nuniform vec2 detailOffset;\n" + shader.fragmentShader.replace(
+                    shader.uniforms.detailRatio = live.ratio;
+                    shader.uniforms.detailGain = live.gain;
+                    shader.fragmentShader = "uniform sampler2D detailMap;\nuniform vec2 detailRepeat;\nuniform vec2 detailOffset;\nuniform float detailRatio;\nuniform float detailGain;\n" + shader.fragmentShader.replace(
                         "#include <map_fragment>",
-                        "#include <map_fragment>\n\tdiffuseColor.rgb *= texture2D(detailMap, vUv * detailRepeat + detailOffset).rgb;"
+                        "#include <map_fragment>\n\tdiffuseColor.rgb *= (1.0 + detailRatio * (texture2D(detailMap, vUv * detailRepeat + detailOffset).rgb - 1.0)) * detailGain;"
                     );
                 }]);
                 usePatches();
@@ -690,30 +974,32 @@
     // as the scene was saved (saved). An imported piece or part carries its gate (never, or when:
     // terms over the scene's symbols, which the server sends) and moved (where its triggers put it).
     // An object off in the mode is hidden; with ☰ View Inactive it is drawn faint instead, scripts off.
-    const symbolsNow = () => ((state.symbols || {})[state.conditions] || {});
-    const gateOf = x => (x.never ? false : x.when ? Conditions.allHold(x.when, symbolsNow()) : null);
+    // A piece from an area drawn alongside (☰ Areas) carries its own Unity scene, and is tested
+    // against that scene's symbols (its stage), not the scene being viewed.
+    const symbolsNow = piece => (((piece && piece.unityScene && (state.sceneSymbols || {})[piece.unityScene]) || state.symbols || {})[state.conditions] || {});
+    const gateOf = (x, piece) => (x.never ? false : x.when ? Conditions.allHold(x.when, symbolsNow(piece)) : null);
     function pieceOn(piece) {
         const saved = !/\binactive\b/.test(piece.extra || "");
         if (state.conditions === "saved") return saved;
-        const gate = gateOf(piece);
+        const gate = gateOf(piece, piece);
         return gate === null ? saved : gate;
     }
-    function partOn(part) {
+    function partOn(part, piece) {
         if (state.conditions === "saved") return !part.offSaved;
-        const gate = gateOf(part);
+        const gate = gateOf(part, piece);
         return gate === null ? true : gate;
     }
     // The piece, placed where the mode has it.
     function placed(piece) {
         const mv = piece.moved;
-        if (!mv || state.conditions === "saved" || !Conditions.allHold(mv.when, symbolsNow())) return piece;
+        if (!mv || state.conditions === "saved" || !Conditions.allHold(mv.when, symbolsNow(piece))) return piece;
         return { ...piece, position: mv.position, rotation: mv.rotation, scale: mv.scale };
     }
     // A gate as text, for the probe: "when SkyIsle (holds)".
-    function gateText(x) {
+    function gateText(x, piece) {
         if (x.never) return "never on in the game";
         if (!x.when) return null;
-        return `when ${x.when.map(Conditions.describe).join(" and ")} (${Conditions.allHold(x.when, symbolsNow()) ? "holds" : "doesn't hold"} in ${state.conditions})`;
+        return `when ${x.when.map(Conditions.describe).join(" and ")} (${Conditions.allHold(x.when, symbolsNow(piece)) ? "holds" : "doesn't hold"} in ${state.conditions})`;
     }
 
     // A Three.js group for one piece; its parts load asynchronously. tint replaces its materials.
@@ -735,6 +1021,9 @@
         // (an imported piece carries its own).
         const scripted = piece.parts ? piece : entry;
         if (scripted && scripted.scripts && on) Tickable.attach(scripted, group, piece);
+        // its point Lights (More Lights phase 4, web/lights.js)
+        const lights = piece.lights || (!piece.parts && entry && entry.lights);
+        if (lights && on) group.userData.lights = lights;
         if (!piece.parts && entry && entry.shapes) {
             // Prefabs its "use" shapes nest, with LOD groups or sets: updateLods reaches them
             // through this piece (Ken, 2026-11-02: Cocoon Basket's basket and cocoons never showed).
@@ -749,17 +1038,21 @@
             return group;
         }
         if (!parts.length) {
-            group.add(placeholder(new THREE.Matrix4(), piece.name));
+            // a piece that is only a light: a small ball of its color, unlit, not a placeholder box
+            if (piece.lights) for (const l of piece.lights) group.add(lightMarker(l));
+            else group.add(placeholder(new THREE.Matrix4(), piece.name));
             return group;
         }
         for (const part of parts) {
-            const partFaint = faint || !partOn(part);
+            const partFaint = faint || !partOn(part, piece);
             if (partFaint && !faint && !state.inactive) continue; // off in this mode
             const local = Space.partMatrix(THREE, part.m);
             const material = piece.material || part.material; // "material <Name>" in the piece's settings wins
             geometryFor(part).then(geometry => {
                 if (geometry) {
-                    const mesh = new THREE.Mesh(geometry, tint || (part.inspect ? (material && state.textures ? materialFor(material, partFaint) : inspectMaterial(part.inspect)) : part.debug ? debugMaterial(part.debug, part.strip) : materialFor(material, partFaint, part.leafSplit, part.strip)));
+                    const slots = tint || piece.material || part.inspect || part.debug ? null : slotsOf(part, geometry);
+                    const mesh = slots ? new THREE.Mesh(slotted(geometry, slots.length), slots.map(guid => materialFor(guid, partFaint, part.leafSplit, part.strip)))
+                        : new THREE.Mesh(geometry, tint || (part.inspect ? (material && state.textures ? materialFor(material, partFaint) : inspectMaterial(part.inspect)) : part.debug ? debugMaterial(part.debug, part.strip) : materialFor(material, partFaint, part.leafSplit, part.strip)));
                     if (part.debug || part.inspect) mesh.userData.debug = true;
                     // Unity draws by render queue, then distance; three.js by renderOrder, then depth.
                     // Queues past 2500 keep their order around the particles' 3000, which is
@@ -768,7 +1061,7 @@
                     // nearer). Opaque meshes keep 0. The sky goes before all of them (renderOrder
                     // -1000: it tests no depth, so it covers anything drawn first; Ken, 2026-10-31:
                     // LeafOakMat, at 2902, is -98, and was covered when the sky was -2).
-                    const queue = material && state.materials[material] && state.materials[material].queue;
+                    const queue = Math.max(...(slots || [material]).map(guid => (guid && state.materials[guid] && state.materials[guid].queue) || 0));
                     if (queue > 2500) mesh.renderOrder = queue - 3000;
                     if (part.mesh && part.mesh.name) mesh.userData.model = part.mesh.name; // Tweak swaps meshes by model
                     mesh.userData.part = part; // what Probe reports
@@ -788,6 +1081,7 @@
                         mesh.visible = false;
                         group.userData.sets = true;
                     }
+                    if ([mesh.material].flat().some(mm => mm && mm.userData && mm.userData.canopyLights)) Lights.track(mesh, group); // its lights (web/lights.js); after its LOD is set
                     group.add(mesh);
                 } else {
                     const box = placeholder(local, part.mesh ? part.mesh.name : piece.name);
@@ -799,7 +1093,16 @@
         }
         return group;
     }
+    // A light-only piece's mark: a 10 cm ball in its light's color.
+    function lightMarker(l) {
+        const ball = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 6), new THREE.MeshBasicMaterial({ color: new THREE.Color().setRGB(l.color[0], l.color[1], l.color[2], THREE.SRGBColorSpace) }));
+        ball.position.set(-l.at[0], l.at[1], l.at[2]);
+        ball.userData.debug = true;
+        return ball;
+    }
     function rebuildBase() {
+        state.pickedObject = null;
+        highlight.visible = false;
         for (const o of state.baseObjects) world.remove(o);
         state.baseObjects = state.base.map(p => {
             const o = buildObject(p);
@@ -811,6 +1114,8 @@
     }
     const allObjects = () => [...state.baseObjects, ...state.objects];
     function rebuildWorld() {
+        state.pickedObject = null;
+        highlight.visible = false;
         for (const o of state.objects) world.remove(o);
         state.objects = state.pieces.map(p => {
             const o = buildObject(p);
@@ -876,6 +1181,7 @@
         };
         group("Composed scenes", list.composed, "composed");
         group("Imported areas (read-only)", list.areas, "area");
+        state.areaNames = list.areas;
         $("unityScene").innerHTML = list.unityScenes.map(n => `<option>${n}</option>`).join("");
         if (select) sel.value = select;
         return list;
@@ -883,7 +1189,7 @@
     // Textures, ☰ Snap, ☰ Labels, ☰ Fog, ☰ LOD tint, ☰ Tick and the rest are remembered per scene, in this
     // browser; a scene not seen before starts with these.
     const GUST_KINDS = ["cylinders", "waves"];
-    const TOGGLES = { textures: true, snap: false, labels: false, fog: true, lodTint: false, candidates: false, fogClip: false, culling: false, refCube: false, showOrigin: false, wireframe: false, ticking: true, inactive: false, conditions: "met", windLevel: 1, gustLevel: 2, gustKind: "cylinders" };
+    const TOGGLES = { textures: true, normalMaps: true, lights: true, lightView: false, unityShaders: false, snap: false, labels: false, fog: true, lodTint: false, candidates: false, fogClip: false, culling: false, refCube: false, showOrigin: false, wireframe: false, ticking: true, inactive: false, conditions: "met", windLevel: 1, gustLevel: 2, gustKind: "cylinders" };
     const togglesKey = () => `layout.toggles.${state.scene.kind}:${state.scene.name}`;
     function loadToggles() {
         let saved;
@@ -942,11 +1248,23 @@
         }
         const [kind, ...rest] = value.split(":");
         const name = rest.join(":");
-        say(`Loading ${name}… (first time fetches meshes)`);
         const started = performance.now(), before = { meshes: geometries.size, textures: textures.size };
-        const data = await call("GET", `/api/scene?kind=${kind}&name=${encodeURIComponent(name)}`);
+        // the seconds counting up until the load says it's done (Ken, 2026-11-04: to see its timing)
+        const loading = () => `Loading ${name}… ${Math.round((performance.now() - started) / 1000)} s`;
+        say(loading());
+        const ticking = setInterval(() => (status.textContent.startsWith(`Loading ${name}…`) ? say(loading()) : clearInterval(ticking)), 1000);
+        const also = loadAlso(`${kind}:${name}`).map(a => `&also=${encodeURIComponent(a)}`).join("");
+        let data;
+        try {
+            data = await call("GET", `/api/scene?kind=${kind}&name=${encodeURIComponent(name)}${also}`);
+        } catch (error) {
+            clearInterval(ticking);
+            say(`Loading ${name} failed after ${Math.round((performance.now() - started) / 1000)} s.`);
+            throw error;
+        }
         const fetched = performance.now();
         state.scene = { name, kind, editable: data.editable };
+        if (!state.tweak) clearSelection(); // its pieces went with the old scene
         loadHidden();
         loadToggles();
         state.pieces = data.pieces;
@@ -955,11 +1273,15 @@
         if (state.switch && switchAt() < 0) showSwitch(0); // none of its sets shown alone yet: the first
         else updateSwitch();
         state.area = data.area || null;
+        state.also = data.also || [];
+        state.areaLines = data.areaLines || [];
         state.base = data.base || [];
         Object.assign(state.library, data.library);
         Object.assign(state.materials, data.materials || {});
         state.environment = data.environment || null;
+        Environment.load(state.environment && state.environment.live); // eased from scratch: the first step snaps
         state.symbols = data.symbols || { met: {}, start: {} };
+        state.sceneSymbols = data.sceneSymbols || {};
         state.lodView = data.lod || { fov: 90, bias: 1 };
         state.clip = data.clip || { near: 0.03, far: 400 };
         state.cullSettings = data.culling || { perFrame: 0.05, margin: 6 };
@@ -980,8 +1302,9 @@
         }
         localStorage.setItem("layout.scene", value);
         updateUi();
-        const on = state.area ? `, on ${state.area} (${state.base.length}, read-only)` : "";
-        say(`${name}: ${data.pieces.length} pieces${on}${data.problems.length ? `; ${data.problems.length} meshes failed` : ""}${data.editable ? "" : " (read-only; Add starts a scene on it)"}`);
+        const on = (state.area ? `, on ${state.area}` : "") + (state.also.length ? `, with ${state.also.join(", ")}` : "") + (state.area || state.also.length ? ` (${state.base.length}, read-only)` : "");
+        clearInterval(ticking);
+        say(`${name}: ${data.pieces.length} pieces, loaded in ${((performance.now() - started) / 1000).toFixed(1)} s${on}${data.problems.length ? `; ${data.problems.length} meshes failed` : ""}${data.editable ? "" : " (read-only; Add starts a scene on it)"}`);
         logLoad(name, started, fetched, before).catch(() => {});
         findTweaks().catch(fail);
         showRefCube();
@@ -993,8 +1316,9 @@
         await Promise.all(geometries.values());
         await Promise.all(textures.values());
         const s = ms => `${(ms / 1000).toFixed(1)} s`;
+        const mb = bytes => `${Math.round(bytes / 1048576)} MB`;
         const done = performance.now();
-        const text = `${s(done - started)}: scene JSON ${s(fetched - started)}, meshes and textures ${s(done - fetched)}; downloaded ${geometries.size - before.meshes} meshes, ${textures.size - before.textures} textures`;
+        const text = `${s(done - started)}: scene JSON ${s(fetched - started)}, meshes and textures ${s(done - fetched)}; downloaded ${geometries.size - before.meshes} meshes, ${textures.size - before.textures} textures; on the GPU ${textureMemory.astcs} compressed ${mb(textureMemory.astc)}, ${textureMemory.pngs} PNG ${mb(textureMemory.png)}; ASTC ${renderer.extensions.has("WEBGL_compressed_texture_astc") ? "yes" : "no"}`;
         await call("POST", "/api/loaded", { name, text });
     }
     // Shown: not in a folder ☰ Folders hides, and not culled (☰ Culling).
@@ -1056,9 +1380,12 @@
     }
     // The scene's middle and size; its size sets how far the camera frames it from and how fast
     // the camera moves, so it is worked out on every load, the camera restored or not.
+    // The scene's own pieces, not the areas drawn alongside it (Ken, 2026-11-07: Hawthorn with four
+    // other areas framed them all, 1.4 km off, and that camera was then remembered); a scene with
+    // none of its own, its base.
     function sceneExtent() {
         const box = new THREE.Box3();
-        for (const p of [...state.base, ...state.pieces]) box.expandByPoint(new THREE.Vector3(-p.position[0], p.position[1], p.position[2]));
+        for (const p of state.pieces.length ? state.pieces : state.base) box.expandByPoint(new THREE.Vector3(-p.position[0], p.position[1], p.position[2]));
         if (box.isEmpty()) return null;
         const size = Math.max(4, box.getSize(new THREE.Vector3()).length());
         state.orbitDistance = size * 0.8;
@@ -1102,7 +1429,7 @@
         return box.isEmpty() ? 1 : Math.max(0.5, box.getSize(new THREE.Vector3()).length() / 2);
     }
     // Carry: the piece keeps its pose relative to the camera, so moving the camera moves it;
-    // orbiting and spinning (A, D) take that pose again (holdingCarried).
+    // orbiting and spinning (the spin buttons) take that pose again (holdingCarried).
     function startCarry(index, object) {
         camera.updateMatrixWorld();
         object.updateMatrixWorld(true);
@@ -1117,7 +1444,9 @@
             extra: index >= 0 ? state.pieces[index].extra || "" : "" // settings, e.g. a tablet's text id
         };
         showScale(state.carried.base);
+        showSelection();
         updateUi();
+        if (state.tweak) renderTweaks(); // only its vars
     }
     // The scale slider sets a piece's size as a multiple of its base size (scale 1), from x0.25
     // to x49 on a doubling (exponential) scale.
@@ -1138,8 +1467,13 @@
     }
     function endCarry() {
         state.carried = null;
-        highlight.visible = false;
+        showSelection();
         updateUi();
+        if (state.tweak) renderTweaks(); // every var again
+        if (state.reloadAfterCarry) {
+            state.reloadAfterCarry = false;
+            canopyReload();
+        }
     }
     async function addPiece(name) {
         closePanels();
@@ -1166,7 +1500,7 @@
             new THREE.Vector3(1, 1, 1)
         );
         startCarry(-1, object);
-        say(`Carrying ${name}. Move to carry it, drag to circle it, A and D to spin it, then Drop.${takesText(state.carried) ? " Add text picks its text." : ""}`);
+        say(`Carrying ${name}. Move to carry it, drag to circle it, the buttons above Q and E to spin it, then Drop.${takesText(state.carried) ? " Add text picks its text." : ""}`);
     }
     function carriedMatrix() {
         const c = state.carried;
@@ -1263,7 +1597,7 @@
         c.rel = camera.matrixWorld.clone().invert().multiply(changed);
     }
     // Carrying, a drag orbits the camera around the piece (about the vertical, level), which
-    // stays put; A and D spin it instead (spin). A drag the width of the screen goes a quarter
+    // stays put; the spin buttons spin it instead (spin). A drag the width of the screen goes a quarter
     // turn, whatever the screen (0.008 a pixel spun a phone's swipe half way round: too fast,
     // Ken 2026-10-25).
     function orbit(dx, dy) {
@@ -1307,9 +1641,13 @@
         const step = { forward, back: forward.clone().negate(), right, left: right.clone().negate(), up: new THREE.Vector3(0, 1, 0), down: new THREE.Vector3(0, -1, 0) }[direction];
         camera.position.addScaledVector(step, amount);
     }
+    // The move keys' base speed: the same in every scene (Ken, 2026-11-03; it was a share of the
+    // scene's size, so the same ground went at different speeds in different areas): what
+    // HawthornScene Whole gave; the keys go from a sixtieth of it to six times it (frame()'s
+    // RAMP). Carrying, it follows the piece's size, for placing small things.
+    const MOVE_SPEED = 44;
     function speed() {
-        const base = state.carried ? sizeOf(state.carried.object) * 1.5 : state.orbitDistance * 0.3;
-        return Math.max(0.5, base * 0.5); // halved for now (Ken, 2026-10-21)
+        return state.carried ? Math.max(0.5, sizeOf(state.carried.object) * 0.75) : MOVE_SPEED;
     }
 
     // Touch: one finger looks around (or, carrying, circles the piece); a pinch travels
@@ -1342,12 +1680,12 @@
             p.y = e.clientY;
             const after = Math.hypot(a.x - b.x, a.y - b.y);
             // The faster the fingers move, the farther each pixel goes (Ken, 2026-10-28): slow
-            // pinches stay fine, a quick one travels: 1 + (speed / 400 px/s)^1.5, at most 12, all
-            // four times over (Ken, 2026-10-28).
+            // pinches stay fine, a quick one travels: 0.2 + (speed / 400 px/s)^1.5, at most 12, all
+            // four times over (Ken, 2026-10-28; the start a fifth of what it was, Ken, 2026-11-04).
             const now = performance.now();
             const dt = Math.max(8, now - (pinchStart === null ? now - 16 : pinchStart)) / 1000;
             pinchStart = now;
-            const gain = Math.min(12, 1 + Math.pow(Math.abs(after - before) / dt / 400, 1.5));
+            const gain = Math.min(12, 0.2 + Math.pow(Math.abs(after - before) / dt / 400, 1.5));
             move("forward", 4 * (after - before) / 200 * speed() * gain);
             gesture = "two";
             return;
@@ -1370,6 +1708,7 @@
         if (pointers.size === 0) tweakReleased();
     });
     function tap(x, y) {
+        if (state.game) return hopToward(x, y);
         if (state.carried || state.tweak || !state.scene) return;
         const ray = new THREE.Raycaster();
         const r = canvas.getBoundingClientRect();
@@ -1378,6 +1717,7 @@
             startCarry(REF_CUBE, refCube);
             return say("Carrying the reference cube. Drop or Cancel.");
         }
+        pickMaterial(ray);
         if (!state.scene.editable) return;
         const hit = ray.intersectObjects(state.objects.filter(o => o.visible), true)[0];
         if (!hit) return;
@@ -1390,6 +1730,61 @@
             const text = textIdOf(state.pieces[index].extra);
             say(`Carrying ${state.pieces[index].name}${text ? ` (${text})` : ""}. Drop, Cancel, or Delete.`);
         }
+    }
+
+    // ---------- game mode ----------
+    // ☰ Game mode (Ken, 2026-11-02): only ☰ (holding Edit mode, which ends it) and ⛶ on screen;
+    // dragging looks around and a pinch travels, as ever; a tap casts a ray, reaching HOP_REACH m
+    // level or upward, and below level anything within HOP_REACH m across (in x and z, however
+    // far down: Ken, 2026-11-02), and the camera (the player) hops there along an arc, landing a meter off the tapped
+    // polygon along its normal (turned toward the side tapped), still looking the same way.
+    // Leaves are never landed on (Ken, 2026-11-03): a tap passes through them to what is behind,
+    // and a hop, which tests nothing on its way, goes through them.
+    const HOP_REACH = 20, HOP_STANDOFF = 1;
+    const isLeaf = part => Boolean(part && (part.leafSplit || /\/ForestTreeLeaves/.test((part.mesh && part.mesh.path) || "")));
+    function setGame(on) {
+        if (on) {
+            if (state.carried) cancel();
+            if (state.tweak) endTweak();
+            clearSelection();
+            held.clear();
+            closePanels();
+        }
+        state.game = on;
+        state.hop = null;
+        document.body.classList.toggle("game", on);
+        $("gameBtn").textContent = on ? "Edit mode" : "Game mode";
+        say(on ? "Game mode: drag to look, tap to hop there." : "Edit mode.");
+    }
+    $("gameBtn").onclick = () => setGame(!state.game);
+    function hopToward(x, y) {
+        if (state.hop) return;
+        const ray = new THREE.Raycaster();
+        const r = canvas.getBoundingClientRect();
+        ray.setFromCamera(new THREE.Vector2((x - r.left) / r.width * 2 - 1, -((y - r.top) / r.height) * 2 + 1), camera);
+        const down = ray.ray.direction.y < 0;
+        ray.far = down ? Infinity : HOP_REACH;
+        const across = p => Math.hypot(p.x - camera.position.x, p.z - camera.position.z);
+        // what is drawn: a mesh with a face, it and everything above it visible (hidden LOD levels,
+        // culled and switched-off pieces aren't)
+        const seen = o => { for (let p = o; p; p = p.parent) if (!p.visible) return false; return true; };
+        const hit = ray.intersectObject(world, true).find(h => h.face && h.object.isMesh && seen(h.object) && !isLeaf(h.object.userData.part));
+        if (hit && down && across(hit.point) > HOP_REACH) return;
+        if (!hit) return;
+        const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+        if (normal.dot(ray.ray.direction) > 0) normal.negate(); // the side it was tapped from
+        const to = hit.point.clone().addScaledVector(normal, HOP_STANDOFF);
+        const from = camera.position.clone();
+        const distance = from.distanceTo(to);
+        state.hop = { from, to, t: 0, seconds: 0.3 + distance / 15, lift: Math.min(3, 0.3 * distance) };
+    }
+    function stepHop(dt) {
+        const h = state.hop;
+        h.t = Math.min(1, h.t + dt / h.seconds);
+        const s = h.t * h.t * (3 - 2 * h.t); // eases off and in
+        camera.position.lerpVectors(h.from, h.to, s);
+        camera.position.y += h.lift * 4 * s * (1 - s); // the arc
+        if (h.t >= 1) state.hop = null;
     }
 
     // Movement pad and keys: held buttons move continuously. Only a finger that lands on a pad
@@ -1527,19 +1922,25 @@
     function frame(now) {
         const dt = Math.min(0.1, (now - last) / 1000);
         last = now;
-        // A and D sidestep at half speed (Ken, 2026-10-22); carrying, they spin the piece a quarter
-        // turn a second (Ken, 2026-10-25).
-        // Over 2 s of holding, every move key (W S A D Q E) speeds up from a third of the speed to
-        // twenty times it, A and D at half that as sidesteps (Ken, 2026-10-28).
-        const RAMP = [1 / 3, 20], RAMP_SECONDS = 2;
+        // A and D sidestep at half speed (Ken, 2026-10-22); carrying, at Q and E's (Ken, 2026-11-04:
+        // traverse, nice and slow), and the spin buttons above Q and E turn the piece a quarter
+        // turn a second, as A and D did (Ken, 2026-10-25).
+        // Over 2 s of holding, every move key (W S A D Q E) speeds up from a sixtieth of the speed to
+        // six times it, A and D at half that as sidesteps (Ken, 2026-10-28; the start a third of what
+        // it was, the top the same, Ken, 2026-11-03; then both 30% of that, Ken, 2026-11-03; then the
+        // start half that, Ken, 2026-11-04).
+        const RAMP = [1 / 60, 6], RAMP_SECONDS = 2;
         for (const d of [...heldFor.keys()]) if (!held.has(d)) heldFor.delete(d);
         for (const direction of held) {
             heldFor.set(direction, (heldFor.get(direction) || 0) + dt);
             const sideways = direction === "left" || direction === "right";
             const ramp = RAMP[0] + (RAMP[1] - RAMP[0]) * Math.min(1, heldFor.get(direction) / RAMP_SECONDS);
-            if (state.carried && sideways) spin((direction === "left" ? -1 : 1) * Math.PI / 2 * dt); // A clockwise from above (Ken, 2026-10-25)
-            else move(direction, speed() * dt * (sideways ? 0.5 : 1) * ramp);
+            if (direction === "spinLeft" || direction === "spinRight") {
+                if (state.carried) spin((direction === "spinLeft" ? -1 : 1) * Math.PI / 2 * dt); // left clockwise from above, as A was (Ken, 2026-10-25)
+            } else move(direction, speed() * dt * (sideways && !state.carried ? 0.5 : 1) * ramp);
         }
+        if (state.hop) stepHop(dt);
+        stepEnvironment(dt);
         if (state.carried) {
             state.carried.object.matrix.copy(carriedMatrix());
             for (const s of labels.children) if (s.userData.object === state.carried.object) placeLabel(s, s.userData.object);
@@ -1553,13 +1954,20 @@
         Surface.uniforms.canopyHeadUnder.value = camera.position.y < Surface.uniforms.canopySeaLevel.value ? 1 : 0;
         updateCulling();
         updateLods();
+        Lights.update(now, camera, allObjects());
         saveCamera(now);
+        renderer.setRenderTarget(linearFrame);
         renderer.render(scene, camera);
+        const triangles = renderer.info.render.triangles; // the scene's (each render starts the count over)
         if (state.wireframe) drawWireframe();
+        if (linearFrame) {
+            renderer.setRenderTarget(null);
+            renderer.render(toScreen, toScreenCamera);
+        }
         if (state.lodTint && now - lodShown > 500) {
             lodShown = now;
             const culled = state.culling ? allObjects().filter(o => o.userData.culled).length : 0;
-            $("lodTris").textContent = `${renderer.info.render.triangles.toLocaleString()} triangles${state.culling ? `, ${culled} pieces culled` : ""}`;
+            $("lodTris").textContent = `${triangles.toLocaleString()} triangles${state.culling ? `, ${culled} pieces culled` : ""}`;
         }
         requestAnimationFrame(frame);
     }
@@ -1706,7 +2114,7 @@
             const part = hit.object.userData.part || {};
             const local = hit.point.clone().applyMatrix4(top.matrixWorld.clone().invert());
             const normal = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : null;
-            const materialKey = (piece && piece.material) || part.material, material = materialKey && state.materials[materialKey];
+            const shown = hitMaterial(hit, piece), material = shown.guid && state.materials[shown.guid];
             const scripts = piece ? scriptsIn(piece.name) : [];
             report.hit = {
                 piece: piece ? piece.name : top.userData.pieceName || null,
@@ -1715,11 +2123,13 @@
                 folder: top.userData.folder || null,
                 model: (part.mesh && (part.mesh.path || part.mesh.name)) || hit.object.userData.model || null,
                 object: part.object || null, material: material ? material.name : part.inspect ? `inspect ${part.inspect.color}` : null,
-                drawnBy: (hit.object.material && hit.object.material.userData && hit.object.material.userData.drawnBy) || (hit.object.material && hit.object.material.type) || null,
+                ...(shown.slot !== null ? { submesh: shown.slot } : {}),
+                drawnBy: (shown.drawn && shown.drawn.userData && shown.drawn.userData.drawnBy) || (shown.drawn && shown.drawn.type) || null,
                 lod: hit.object.userData.lod ? hit.object.userData.lod.levels : null,
                 ...(scripts.length ? { scripts } : {}),
-                ...(piece && (piece.when || piece.never) ? { gate: gateText(piece) } : {}),
-                ...(part.when || part.never ? { partGate: gateText(part) } : {}),
+                ...(piece && (piece.when || piece.never) ? { gate: gateText(piece, piece) } : {}),
+                ...(part.when || part.never ? { partGate: gateText(part, piece) } : {}),
+                ...(piece && piece.unityScene ? { unityScene: piece.unityScene } : {}),
                 ...(piece && piece.moved ? { moved: { when: piece.moved.when.map(Conditions.describe), position: piece.moved.position } } : {}),
                 point: unityOf(hit.point), local: unityOf(local), normal: normal ? unityOf(normal) : null,
                 distance: +hit.distance.toFixed(2), triangle: hit.faceIndex, ...probeVertices(hit, top)
@@ -1827,9 +2237,67 @@
     // values into the doc and the full build into Canopy, and the scene reloads.
     state.tweakFamilies = [];
     state.tweak = null;
+    state.tweakPicked = null; // the family of the material last tapped (pickMaterial)
+    state.pickedObject = null; // the piece last tapped
+    // Any piece can be selected by a tap, even one that can't be moved or deleted (another area's,
+    // the scene beneath), for its material's shader properties in Tweak (Ken, 2026-11-07). They
+    // are a family of their own, folder material:<guid>, all live; leaving Tweak writes them into
+    // the .mat. Canopy's General and what lights as it does; other shaders have none yet.
+    function materialFamily(guid, d, pieceName) {
+        const value = (name, dflt) => (d.values && d.values[name] ? d.values[name][0] : dflt);
+        const live = (name, label, dflt, min, max, step) => ({ name, label, value: value(name, dflt), min, max, step, live: [{ material: guid, property: name }] });
+        const tile = (slot, label, t) => (t && t.scale[0] === t.scale[1] ? [{ name: `${slot}.scale`, label, value: t.scale[0], min: 0.05, max: 64, step: 0.05, live: [{ material: guid, property: `${slot}.scale` }] }] : []);
+        return {
+            folder: `material:${guid}`, family: d.name, assets: [pieceName], shaders: [],
+            vars: [
+                live("_Brightness", "Brightness", 1, 0, 10, 0.01), live("_Glossiness", "Gloss", 0, 0, 1, 0.01), live("_HighlightStrength", "Highlight strength", 0.2, 0, 2, 0.01),
+                ...(d.normal ? [live("_NormalStrength", "Normal strength", 1, 0, 4, 0.01)] : []), ...tile("_NormalMap", "Normal tiling", d.normal), ...tile("_DetailTex", "Detail tiling", d.detail)
+            ]
+        };
+    }
+    // The selection box, by what can be done with the piece (Ken, 2026-11-07): green, moved and
+    // tweaked; blue, moved; amber, tweaked; gray, neither.
+    function showSelection() {
+        const o = state.carried ? state.carried.object : state.pickedObject;
+        highlight.visible = Boolean(o);
+        if (!o) return;
+        const move = Boolean(state.carried) || Boolean(state.scene && state.scene.editable && state.objects.includes(o));
+        const asset = assetOf(o.userData.pieceName);
+        const tweak = state.tweakFamilies.some(f => f.assets.includes(asset));
+        highlight.material.color.setHex(move ? (tweak ? 0x4fe07a : 0x4fb3ff) : tweak ? 0xffb13d : 0x9aa3ad);
+        highlight.setFromObject(o);
+    }
+    function clearSelection() {
+        state.pickedObject = null;
+        state.tweakFamilies = state.tweakFamilies.filter(f => f !== state.tweakPicked);
+        state.tweakPicked = null;
+        showSelection();
+    }
+    function pickMaterial(ray) {
+        clearSelection();
+        const hit = ray.intersectObjects([...state.baseObjects, ...state.objects].filter(o => o.visible), true).find(h => h.object.isMesh && h.object !== probeMark && visibleUp(h.object));
+        if (hit) {
+            let top = hit.object;
+            while (top.parent && top.parent !== world) top = top.parent;
+            const index = state.objects.indexOf(top), baseIndex = state.baseObjects.indexOf(top);
+            const piece = index >= 0 ? state.pieces[index] : baseIndex >= 0 ? state.base[baseIndex] : null;
+            const shown = hitMaterial(hit, piece), guid = shown.guid, d = guid && state.materials[guid];
+            const name = piece ? piece.name : top.userData.pieceName || "that";
+            state.pickedObject = top;
+            const tweakable = d && d.general && shown.drawn.userData && shown.drawn.userData.highlight;
+            if (tweakable) {
+                state.tweakPicked = materialFamily(guid, d, assetOf(top.userData.pieceName));
+                state.tweakFamilies.push(state.tweakPicked);
+            }
+            say(tweakable ? `${name}: ${d.name}. Tweak changes its material.` : `${name}${d ? `: ${d.name}` : ""}: no shader tweaks for it yet.`);
+        }
+        showSelection();
+        updateUi();
+    }
     async function findTweaks() {
         const sources = [...new Set([...state.base, ...state.pieces].map(p => (state.library[p.name] || {}).source).filter(Boolean))];
         state.tweakFamilies = sources.length ? (await call("POST", "/api/tweak/vars", { sources })).families : [];
+        if (state.tweakPicked) state.tweakFamilies.push(state.tweakPicked);
         if (state.tweak) {
             // Reloaded mid-tweak (a rebuild, or the doc or script edited): the tweaks not yet
             // written stay, over the doc's values, and are put back on the rebuilt pieces.
@@ -1842,20 +2310,33 @@
                     tweakTextures(folder);
                 }
             }
+            tweakLiveAll();
             renderTweaks();
         }
         updateUi();
     }
+    // A piece's asset as a worker names it: its prefab's file ("Roof Leaf" is RoofLeaf.prefab).
+    const assetOf = name => {
+        const source = (state.library[name] || {}).source;
+        return source ? source.split("/").pop().replace(/\.prefab$/, "") : name;
+    };
     const tweakDocValues = () => Object.fromEntries(state.tweakFamilies.map(f => [f.folder, Object.fromEntries(f.vars.map(v => [v.name, v.value]))]));
-    const tweakVars = () => state.tweakFamilies.flatMap(f => f.vars.map(v => ({ ...v, folder: f.folder, key: `${f.folder}|${v.name}`, label: state.tweakFamilies.length > 1 ? `${f.family}.${v.name}` : v.name })))
-        .sort((a, b) => a.label.localeCompare(b.label));
+    // Carrying or having tapped a piece, only its vars: its family's, those its models and textures use (the
+    // worker's uses) and its material's live ones (Ken, 2026-11-04). all: every family's.
+    const tweakVars = (all = false) => {
+        const selected = !all && (state.carried ? state.carried.object : state.pickedObject);
+        const name = selected && assetOf(selected.userData.pieceName);
+        const keep = (f, v) => !name || (f.assets.includes(name) && (!f.uses || !f.uses[name] || f.uses[name].includes(v.name)));
+        return state.tweakFamilies.flatMap(f => f.vars.filter(v => keep(f, v)).map(v => ({ ...v, folder: f.folder, key: `${f.folder}|${v.name}`, label: state.tweakFamilies.length > 1 ? `${f.family}.${v.name}` : v.name })))
+            .sort((a, b) => a.label.localeCompare(b.label));
+    };
     const tweakSelected = () => state.tweak && tweakVars().find(v => v.key === state.tweak.selected);
     const tweakText = v => `${v.label} ${+state.tweak.values[v.folder][v.name].toFixed(4)}${v.unit ? " " + v.unit : ""}`;
     $("tweakBtn").onclick = () => (state.tweak ? endTweak() : startTweak());
     function startTweak() {
         let selected = null;
         try { selected = localStorage.getItem("layout.tweakSelected"); } catch { /* none */ }
-        state.tweak = { values: tweakDocValues(), undo: [], redo: [], selected, drag: null, busy: false, again: null };
+        state.tweak = { values: tweakDocValues(), undo: [], redo: [], selected, shader: null, drag: null, busy: false, again: null };
         state.tweak.start = JSON.stringify(state.tweak.values);
         showTweakList();
         updateUi();
@@ -1871,8 +2352,11 @@
         if (t.moved && state.scene && state.scene.editable) await call("POST", "/api/save", { name: state.scene.name, pieces: state.pieces }).catch(fail);
         say("Tweak: writing the values and rebuilding…");
         for (const f of state.tweakFamilies) {
+            const values = tweakChanged(t, f.folder);
+            if (!Object.keys(values).length) continue;
             try {
-                await call("POST", "/api/tweak/write", { folder: f.folder, values: t.values[f.folder] });
+                if (f.folder.startsWith("material:")) await call("POST", "/api/material/write", { guid: f.folder.slice("material:".length), values });
+                else await call("POST", "/api/tweak/write", { folder: f.folder, values });
             } catch (error) {
                 fail(error);
             }
@@ -1892,20 +2376,57 @@
     });
     $("tweakClose").onclick = () => closePanels();
     $("tweakHud").onclick = () => showTweakList();
+    // A material's live vars (all they set is on it: its shader's properties) are grouped under
+    // one row, <name>Shaders (the worker's shaders), which opens them (Ken, 2026-11-04).
+    function tweakShader(v) {
+        const f = state.tweakFamilies.find(x => x.folder === v.folder);
+        const on = new Set((v.live || []).map(set => set.material));
+        const shader = on.size === 1 && (f.shaders || []).find(x => on.has(x.material));
+        return shader ? { key: `${v.folder}|${shader.material}`, label: state.tweakFamilies.length > 1 ? `${f.family}.${shader.name}Shaders` : `${shader.name}Shaders` } : null;
+    }
     function renderTweaks() {
         if (!state.tweak) return;
         const list = $("tweakList");
         const top = list.scrollTop;
         list.innerHTML = "";
-        for (const v of tweakVars()) {
-            const row = document.createElement("div");
-            row.className = v.key === state.tweak.selected ? "on" : "";
-            row.textContent = tweakText(v);
-            const note = document.createElement("small");
-            note.textContent = v.rebuild ? "  · rebuild: enter a number" : v.geometry ? "" : "  · textures: shown when you lift your finger";
-            row.appendChild(note);
-            row.onclick = () => pickTweak(v);
-            list.appendChild(row);
+        const row = (text, note, on, click) => {
+            const div = document.createElement("div");
+            div.className = on ? "on" : "";
+            div.textContent = text;
+            const small = document.createElement("small");
+            small.textContent = note;
+            div.appendChild(small);
+            div.onclick = click;
+            list.appendChild(div);
+        };
+        const vars = tweakVars();
+        const groups = new Map();
+        for (const v of vars) {
+            const shader = tweakShader(v);
+            if (shader) groups.set(shader.key, { ...shader, vars: [...(groups.get(shader.key) || { vars: [] }).vars, v] });
+        }
+        const open = groups.get(state.tweak.shader);
+        if (!open) state.tweak.shader = null; // its vars went (a carried piece's list)
+        const shown = open ? open.vars : [...vars.filter(v => !tweakShader(v)), ...groups.values()].sort((a, b) => a.label.localeCompare(b.label));
+        if (open) {
+            row(`‹ ${open.label}`, "  · back to every tweakvar", false, () => {
+                state.tweak.shader = null;
+                renderTweaks();
+                list.scrollTop = 0;
+            });
+        }
+        for (const v of shown) {
+            if (v.vars) {
+                const on = v.vars.some(x => x.key === state.tweak.selected);
+                row(`${v.label} ›`, `  · ${v.vars.length} shader properties`, on, () => {
+                    state.tweak.shader = v.key;
+                    renderTweaks();
+                    list.scrollTop = 0;
+                });
+                continue;
+            }
+            const note = v.rebuild ? "  · rebuild: enter a number" : v.geometry || v.live ? "" : "  · textures: shown when you lift your finger";
+            row(tweakText(v), note, v.key === state.tweak.selected, () => pickTweak(v));
         }
         list.scrollTop = top;
         const v = tweakSelected();
@@ -1926,7 +2447,64 @@
         renderTweaks();
         say(`Tweak: rebuilding with ${tweakText(v)}…`);
         // the full build is written at once; the scene reloads from it
-        await call("POST", "/api/tweak/write", { folder: v.folder, values: state.tweak.values[v.folder] }).catch(fail);
+        await call("POST", "/api/tweak/write", { folder: v.folder, values: tweakChanged(state.tweak, v.folder) }).catch(fail);
+    }
+    // A live var (modl's serve.py, vars): its materials' properties set at once, asking the server
+    // nothing; leaving Tweak writes it and builds it (Ken, 2026-11-04: shader properties should
+    // move in real time).
+    function tweakLive(v) {
+        const value = state.tweak.values[v.folder][v.name];
+        for (const set of v.live || []) {
+            for (const [key, m] of materials) {
+                if (!key.startsWith(set.material + "|") || !m.userData.detail) continue;
+                const detail = m.userData.detail;
+                if (set.property === "_NormalStrength") {
+                    m.userData.tilt = value;
+                    m.normalScale.setScalar(value * (state.normalsTimes2 ? 2 : 1));
+                }
+                else if (set.property === "_Brightness") m.color.setRGB(...m.userData.lit(value * (set.scale || 1)));
+                else if (set.property === "_Glossiness") {
+                    m.roughness = 0.85 - 0.5 * value;
+                    m.userData.gloss.value = value;
+                }
+                else if (set.property === "_HighlightStrength") m.userData.highlight.value = value;
+                else if (set.property === "_DetailTex.scale") {
+                    detail.repeat.set(value, value);
+                    detail.tiled = true;
+                }
+                else if (set.property === "_NormalMap.scale") {
+                    if (!m.userData.normalMap) continue;
+                    // its own copy (the same pixels): others may share the texture at this tiling
+                    if (!m.userData.normalOwn) {
+                        const own = m.userData.normalMap.clone();
+                        own.needsUpdate = true;
+                        if (m.normalMap) m.normalMap = own;
+                        m.userData.normalMap = own;
+                        m.userData.normalOwn = true;
+                    }
+                    m.userData.normalMap.repeat.set(value, value);
+                }
+                else if (set.tiling) {
+                    detail.repeat.set(set.tiling / value, set.tiling / value);
+                    detail.tiled = true;
+                } else if ("strength" in set) {
+                    // baked at set.strength: d at value is 1 + value / strength (d - 1), its mean
+                    // likewise, and the atlas was lightened for the baked mean
+                    if (!set.strength) return say(`Tweak: ${v.name} was 0, so its detail can't be shown until Tweak is left.`);
+                    const ratio = value / set.strength;
+                    detail.ratio.value = ratio;
+                    detail.gain.value = set.mean / (1 - ratio * (1 - set.mean));
+                }
+            }
+        }
+    }
+    const tweakLiveAll = () => tweakVars(true).filter(v => v.live).forEach(tweakLive);
+    // Only the vars tweaked since Tweak began are written: the others stay as the doc has them,
+    // even where it changed after the page read it (Ken, 2026-11-04: writing them all put back
+    // stale values over newer ones).
+    function tweakChanged(t, folder) {
+        const start = JSON.parse(t.start)[folder] || {};
+        return Object.fromEntries(Object.entries(t.values[folder] || {}).filter(([name, value]) => start[name] !== value));
     }
     const tweakClamp = (v, x) => Math.min(v.max ?? Infinity, Math.max(v.min ?? -Infinity, Math.round(x / v.step) * v.step));
     function tweakRecord() {
@@ -1940,6 +2518,7 @@
         state.tweak.values = JSON.parse(from.pop());
         renderTweaks();
         updateUi();
+        tweakLiveAll();
         for (const f of state.tweakFamilies) {
             tweakMeshes(f.folder);
             tweakTextures(f.folder);
@@ -1967,7 +2546,8 @@
             }
             t.values[v.folder][v.name] = value;
             $("tweakHud").textContent = `${tweakText(v)} ⇆`;
-            if (v.geometry) tweakMeshes(v.folder);
+            if (v.live) tweakLive(v);
+            else if (v.geometry) tweakMeshes(v.folder);
         }
         return true;
     }
@@ -1986,7 +2566,7 @@
     // New meshes for a family's pieces; one request at a time, the latest values winning.
     async function tweakMeshes(folder) {
         const t = state.tweak;
-        if (!t) return;
+        if (!t || folder.startsWith("material:")) return;
         if (t.busy) {
             t.again = folder;
             return;
@@ -2013,7 +2593,8 @@
             };
             const family = state.tweakFamilies.find(f => f.folder === folder);
             for (const o of allObjects()) {
-                if (!family || !family.assets.includes(o.userData.pieceName)) continue;
+                const asset = assetOf(o.userData.pieceName);
+                if (!family || !family.assets.includes(asset)) continue;
                 for (const mesh of o.children) {
                     const g = mesh.isMesh && geometryOf(mesh.userData.model);
                     if (!g) continue;
@@ -2021,11 +2602,11 @@
                     mesh.geometry = g;
                 }
                 // the asset's LODGroup: its size and each level's lowest screen height
-                const lod = (reply.lods || {})[o.userData.pieceName];
+                const lod = (reply.lods || {})[asset];
                 // Anchored on a ring (a curved bench at its row's radius): in a scene with an
                 // Origin, the piece keeps its angle (its Y turn) around the Origin and moves to
                 // the ring's new radius, so tweaked rows widen or narrow in place.
-                const anchor = (reply.anchors || {})[o.userData.pieceName];
+                const anchor = (reply.anchors || {})[asset];
                 const index = state.objects.indexOf(o);
                 if (anchor && state.origin && index >= 0) {
                     const piece = state.pieces[index], turn = piece.rotation[1] * Math.PI / 180;
@@ -2058,18 +2639,28 @@
     async function tweakTextures(folder) {
         const t = state.tweak;
         const family = state.tweakFamilies.find(f => f.folder === folder);
-        if (!t || !family) return;
+        if (!t || !family || folder.startsWith("material:")) return;
         say("Tweak: redoing the textures…");
         try {
             const urls = await call("POST", "/api/tweak/textures", { folder, values: t.values[folder] });
-            const [map, normal] = await Promise.all([texture({ url: urls.map, scale: [1, 1], offset: [0, 0] }, true), texture({ url: urls.normal, scale: [1, 1], offset: [0, 0] }, false)]);
+            const load = pair => Promise.all([texture({ url: pair.map, scale: [1, 1], offset: [0, 0] }, true), texture({ url: pair.normal, scale: [1, 1], offset: [0, 0] }, false)]);
+            // the family's atlases, and those of assets with their own (the Hut's silk)
+            const own = new Map();
+            for (const more of urls.more || []) {
+                const pair = await load(more);
+                for (const name of more.assets) own.set(name, pair);
+            }
+            const shared = await load(urls);
             for (const o of allObjects()) {
-                if (!family.assets.includes(o.userData.pieceName)) continue;
+                if (!family.assets.includes(assetOf(o.userData.pieceName))) continue;
+                const [map, normal] = own.get(assetOf(o.userData.pieceName)) || shared;
                 for (const mesh of o.children) {
                     if (!mesh.isMesh || !mesh.material || mesh.userData.untinted) continue;
-                    if (map) mesh.material.map = map;
-                    if (normal) mesh.material.normalMap = normal;
-                    mesh.material.needsUpdate = true;
+                    for (const m of [mesh.material].flat()) {
+                        if (map) m.map = map;
+                        if (normal) m.normalMap = normal;
+                        m.needsUpdate = true;
+                    }
                 }
             }
             say("Tweak: textures updated.");
@@ -2082,6 +2673,7 @@
     function updateUi() {
         const editable = state.scene && state.scene.editable;
         const carrying = Boolean(state.carried);
+        document.body.classList.toggle("carrying", carrying);
         // Add places a piece; while carrying a tablet it picks the tablet's text instead.
         $("addBtn").disabled = carrying ? !takesText(state.carried) : !(editable || (state.scene && state.scene.kind === "area"));
         $("addBtn").textContent = carrying && takesText(state.carried) ? "Add text" : "Add";
@@ -2098,7 +2690,6 @@
             $("redoBtn").disabled = !state.tweak.redo.length;
         } else $("addBtn").hidden = false;
         $("tweakBtn").hidden = !state.tweakFamilies.length;
-        $("tweakBtn").disabled = carrying;
         $("tweakBtn").classList.toggle("on", Boolean(state.tweak));
         $("saveBtn").disabled = !editable || !state.dirty;
         $("saveBtn").textContent = state.dirty ? "Save ●" : "Save";
@@ -2106,6 +2697,16 @@
         $("snapBtn").classList.toggle("on", state.snap);
         $("labelsBtn").classList.toggle("on", state.labels);
         $("texturesBtn").classList.toggle("on", state.textures);
+        $("normalMapsBtn").classList.toggle("on", state.normalMaps);
+        $("noAmbientBtn").classList.toggle("on", state.noAmbient);
+        $("normals2Btn").classList.toggle("on", state.normalsTimes2);
+        $("fullSunHighlightBtn").classList.toggle("on", state.fullSunHighlight);
+        $("lightsBtn").classList.toggle("on", state.lights);
+        $("lightViewBtn").classList.toggle("on", state.lightView);
+        Lights.uniforms.canopyLightCount.value = state.lights ? Lights.SLOTS : 0;
+        Lights.uniforms.canopyLightView.value = state.lightView ? 1 : 0;
+        $("unityShadersBtn").classList.toggle("on", state.unityShaders);
+        $("unityShadersBtn").hidden = !Object.values(state.materials || {}).some(d => d && d.unity);
         $("fogBtn").classList.toggle("on", state.fog);
         $("tickBtn").classList.toggle("on", state.ticking);
         $("lodTintBtn").classList.toggle("on", state.lodTint);
@@ -2129,7 +2730,8 @@
     function closePanels() {
         for (const id of ["palette", "importPanel", "folders", "menu", "viewMenu", "tweakPanel"]) $(id).style.display = "none";
     }
-    // The ☰ menu holds New, Save, Import area, Folders, Inspect layers, Snap, Reference cube and View;
+    // The ☰ menu holds New, Save, Import area, Areas, Folders, Inspect layers, Snap, Reference cube, View
+    // and Game mode (in game mode only Edit mode);
     // choosing one closes it. ☰ View (Ken, 2026-10-29) holds the view toggles (Textures, Labels,
     // Wireframe, LOD tint, Fog, Fog far clip, Culling, Origin, Candidate trees, Tick, Conditions,
     // Inactive), in its place,
@@ -2347,6 +2949,13 @@
         saveToggles();
         updateUi();
     };
+    // ☰ Reframe scene (Ken, 2026-11-06): back to seeing the whole scene, as a first load frames
+    // it, when the camera has been steered too far away to find it.
+    $("reframeBtn").onclick = () => {
+        if (!sceneExtent()) return say("Nothing in the scene to frame.");
+        frameAll();
+        say(`Reframed ${state.scene.name}.`);
+    };
     $("refCubeBtn").onclick = () => {
         state.refCube = !state.refCube;
         saveToggles();
@@ -2387,10 +2996,11 @@
     };
     // Makes a composed scene (on an area, if given) and opens it. Returns false if cancelled.
     async function newScene(area) {
+        const also = area ? state.also : []; // the areas drawn alongside come too, as Area lines
         const on = area ? ` on ${area}` : "";
         const name = prompt(`New scene${on}, "<Type> <Name>" (e.g. Landmark Ring Forge):`);
         if (!name) return false;
-        await call("POST", "/api/new", { name, area });
+        await call("POST", "/api/new", { name, area, also });
         await refreshList(`composed:${name}`);
         await loadScene(`composed:${name}`, Boolean(area));
         return true;
@@ -2414,6 +3024,61 @@
         } catch (error) {
             fail(error);
         }
+    };
+    // ☰ Areas (Claude, 2026-11-03): other imported areas drawn alongside the scene, read-only, as
+    // an area a composed scene sits on is (Unity scenes share one world, so they line up), e.g.
+    // BeechScene Whole while viewing HawthornScene Whole. Remembered per scene in this browser; a
+    // composed scene's own Area lines are always drawn. The first area gives the settings (fog,
+    // environment); each area's pieces keep their own scene's stage for Conditions.
+    const alsoKey = value => `layout.also.${value}`;
+    function loadAlso(value) {
+        try {
+            const v = JSON.parse(localStorage.getItem(alsoKey(value)));
+            return Array.isArray(v) ? v.filter(a => typeof a === "string") : [];
+        } catch {
+            return []; // unreadable or blocked storage: none
+        }
+    }
+    function saveAlso(value, list) {
+        try {
+            localStorage.setItem(alsoKey(value), JSON.stringify(list));
+        } catch {
+            // storage blocked: the choice just isn't remembered
+        }
+    }
+    $("areasBtn").onclick = () => {
+        if (!state.scene) return;
+        const value = `${state.scene.kind}:${state.scene.name}`;
+        const fixed = new Set(state.scene.kind === "area" ? [state.scene.name] : state.areaLines);
+        const panel = $("folders");
+        panel.innerHTML = "<div class='row'><b>Areas drawn alongside</b></div>";
+        for (const area of state.areaNames) {
+            const row = document.createElement("label");
+            const box = document.createElement("input");
+            box.type = "checkbox";
+            box.checked = fixed.has(area) || state.also.includes(area);
+            box.disabled = fixed.has(area);
+            box.onchange = () => {
+                if (state.dirty) {
+                    box.checked = !box.checked;
+                    say("Save first: changing the areas reloads the scene");
+                    return;
+                }
+                const chosen = loadAlso(value).filter(a => a !== area && state.areaNames.includes(a));
+                if (box.checked) chosen.push(area);
+                saveAlso(value, chosen);
+                closePanels();
+                loadScene(value, true).catch(fail);
+            };
+            const why = fixed.has(area) ? (state.scene.kind === "area" ? " (this area)" : " (an Area line)") : "";
+            row.append(box, ` ${area}${why}`);
+            panel.appendChild(row);
+        }
+        const close = document.createElement("button");
+        close.textContent = "Close";
+        close.onclick = closePanels;
+        panel.appendChild(close);
+        toggle("folders");
     };
     $("foldersBtn").onclick = () => {
         const counts = new Map();
@@ -2447,6 +3112,59 @@
         updateUi();
         if (!state.carried) rebuildWorld();
     };
+    // Materials More Lights moved onto Canopy's shaders, drawn on Unity's again or not (materialFor).
+    // ☰ View › Normal maps (Ken, 2026-11-06: are they drawn at all?): off, every material lit by
+    // its mesh's own normals, to see what its normal map adds.
+    $("normalMapsBtn").onclick = () => {
+        state.normalMaps = !state.normalMaps;
+        saveToggles();
+        for (const m of materials.values()) {
+            if (!m.userData || !m.userData.normalMap) continue;
+            m.normalMap = state.normalMaps ? m.userData.normalMap : null;
+            m.needsUpdate = true;
+        }
+        say(state.normalMaps ? "Normal maps on." : "Normal maps off: lit by the meshes' own normals.");
+        updateUi();
+    };
+    $("noAmbientBtn").onclick = () => {
+        state.noAmbient = !state.noAmbient;
+        applyEnvironment();
+        say(state.noAmbient ? "Ambient light off: the sun alone (not remembered)." : "Ambient light on, as the game's.");
+        updateUi();
+    };
+    $("fullSunHighlightBtn").onclick = () => {
+        state.fullSunHighlight = !state.fullSunHighlight;
+        applyEnvironment();
+        say(state.fullSunHighlight ? "Highlights at the full sun, as the committed General (not remembered)." : "Highlights at the sun's intensity, as Canopy's shaders now.");
+        updateUi();
+    };
+    $("normals2Btn").onclick = () => {
+        state.normalsTimes2 = !state.normalsTimes2;
+        for (const m of materials.values()) if (m.userData && m.userData.tilt !== undefined) m.normalScale.setScalar(m.userData.tilt * (state.normalsTimes2 ? 2 : 1));
+        say(state.normalsTimes2 ? "Normal maps twice as strong (not remembered)." : "Normal maps at their own strength.");
+        updateUi();
+    };
+    $("lightsBtn").onclick = () => {
+        state.lights = !state.lights;
+        saveToggles();
+        updateUi();
+        say(state.lights ? `Lights on: up to ${Lights.SLOTS} point lights per mesh (${Lights.count()} near enough now).` : "Lights off: the sun and ambient only.");
+    };
+    $("lightViewBtn").onclick = () => {
+        state.lightView = !state.lightView;
+        saveToggles();
+        updateUi();
+        if (state.lightView) say("Light crowding: how many lights reach each mesh. Gray none, blue 1, green 2, yellow 3, red 4.");
+    };
+    $("unityShadersBtn").onclick = () => {
+        state.unityShaders = !state.unityShaders;
+        saveToggles();
+        updateUi();
+        if (!state.carried) {
+            rebuildBase();
+            rebuildWorld();
+        }
+    };
     $("fullBtn").onclick = () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen()).catch(() => {});
     $("sceneSelect").onchange = e => loadScene(e.target.value).catch(fail);
     window.addEventListener("beforeunload", e => {
@@ -2476,6 +3194,11 @@
     events.addEventListener("canopy", () => canopyReload());
     function canopyReload() {
         if (!state.scene || state.dirty) return;
+        // carrying (it may be tweaked), the reload waits for the carry to end, which would lose it
+        if (state.carried) {
+            state.reloadAfterCarry = true;
+            return;
+        }
         if (state.tweak && state.tweak.drag) {
             state.tweak.reloadAfterDrag = true;
             return;

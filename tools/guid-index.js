@@ -9,13 +9,13 @@ const GIT = ['--git-dir=' + process.env.HOME + '/git-repos/Canopy.git'];
 const git = (args, input) => execFileSync('git', GIT.concat(args), { input, maxBuffer: 1 << 30 });
 const HEAD_CACHE = 'cache/guid-index-head.json';
 // Bump when what an entry holds changes, so the committed part is read again.
-const ENTRIES = 2;
+const ENTRIES = 6;
 
 const commit = git(['rev-parse', 'HEAD']).toString().trim();
 const head = fs.existsSync(HEAD_CACHE) ? JSON.parse(fs.readFileSync(HEAD_CACHE, 'utf8')) : null;
 const { entries, blobOf } = head && head.commit === commit && head.entriesVersion === ENTRIES ? { entries: head.entries, blobOf: new Map(Object.entries(head.blobOf)) } : committed();
 
-// One .meta's entry: { path, blob, folder?, meshes?, import?, alpha? }.
+// One .meta's entry: { path, blob, folder?, meshes?, import?, alpha?, srgb?, fromGray?, gameSize? }.
 function entryFor(path, t, blob) {
   const g = /^guid: (\w+)/m.exec(t);
   if (!g) return null;
@@ -36,9 +36,30 @@ function entryFor(path, t, blob) {
   // from its brightness): 0 None (its alpha dropped), 2 From Gray Scale (the average of its RGB);
   // Input Texture Alpha, Unity's default, isn't noted. Older metas say grayScaleToAlpha instead.
   if (/^TextureImporter:/m.test(t)) {
+    // The largest side the Quest keeps: Android's own settings when they're on, else the default
+    // platform's (an older .meta: its one maxTextureSize, or Unity's default).
+    const platform = name => (new RegExp(`buildTarget: ${name}\\r?\\n[\\s\\S]*?(?=\\n {2}- serializedVersion|\\n {2}\\w)`).exec(t) || [])[0];
+    const android = platform('Android');
+    const max = /maxTextureSize: (\d+)/.exec(android && /overridden: 1/.test(android) ? android : platform('DefaultTexturePlatform') || t);
+    e.gameSize = max ? +max[1] : 2048;
     const usage = /^\s+alphaUsage: (\d)/m.exec(t);
     const a = usage ? +usage[1] : /^\s+grayScaleToAlpha: 1/m.test(t) ? 2 : 1;
     if (a !== 1) e.alpha = a;
+    // Whether Unity decodes it from sRGB as it samples it (Canopy draws in Linear): a Normal Map
+    // never is, others by their sRGB (Color Texture) box, which older metas keep as linearTexture,
+    // its opposite. Layout reads each texture the same way, whatever slot it fills (Ken,
+    // 2026-11-06: technically correct).
+    const type = /^\s+textureType: (-?\d+)/m.exec(t);
+    const srgb = /^\s+sRGBTexture: (\d)/m.exec(t), linear = /^\s+linearTexture: (\d)/m.exec(t);
+    if (type && +type[1] === 1) e.srgb = false;
+    else if (srgb) e.srgb = srgb[1] === '1';
+    else if (linear) e.srgb = linear[1] === '0';
+    // A Normal Map made from a gray height map on import (Create from Grayscale; Ken, 2026-11-06:
+    // the bouncers' Mushroom_a_bump.png): its Bumpiness and Filtering (0 Smooth, 1 Sharp).
+    if (type && +type[1] === 1 && /^\s+convertToNormalMap: 1/m.test(t)) {
+      const num = k => { const m = new RegExp('^\\s+' + k + ': (\\S+)', 'm').exec(t); return m ? +m[1] : 0; };
+      e.fromGray = { scale: num('heightScale'), filter: num('normalMapFilter') };
+    }
   }
   return [g[1], e];
 }

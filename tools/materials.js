@@ -3,6 +3,10 @@
 //   node tools/materials.js                 summary
 //   node tools/materials.js <name>          one material or shader's findings
 //   node tools/materials.js --json          every finding, as JSON
+//   node tools/materials.js --unity         the shaders the game draws that aren't Canopy's own
+//                                           lighting (see unityShaders), each drawn material and
+//                                           where (tools/uses.js drawnMaterials), then the rest;
+//                                           a built-in one's metallic, smoothness and maps (looks)
 // The raw text of every .mat, .shader and texture .meta is kept in cache/canopy-sources.json, by
 // blob, so each is read (or fetched, when the partial clone lacks it) once ever, and the store is
 // one file on this slow storage. cache/material-analysis.json keeps the analysis by blob, and each
@@ -17,10 +21,10 @@ const S = require('./scene.js');
 
 const CACHE_FILE = path.join(__dirname, '..', 'cache', 'material-analysis.json');
 const SOURCES_FILE = path.join(__dirname, '..', 'cache', 'canopy-sources.json');
-const VERSION = 1; // bump when what is read changes
+const VERSION = 3; // bump when what is read changes
 const GIT = ['--git-dir=' + process.env.HOME + '/git-repos/Canopy.git'];
 const BUILTIN = '0000000000000000f000000000000000';
-const BUILTIN_NAMES = { 45: 'Standard (Specular setup)', 46: 'Standard' };
+const BUILTIN_NAMES = { 7: 'Legacy Shaders/Diffuse', 45: 'Standard (Specular setup)', 46: 'Standard' };
 const QUEUES = { Background: 1000, Geometry: 2000, AlphaTest: 2450, Transparent: 3000, Overlay: 4000 };
 const BLEND = { Zero: 0, One: 1, DstColor: 2, SrcColor: 3, OneMinusDstColor: 4, SrcAlpha: 5, OneMinusSrcColor: 6, DstAlpha: 7, OneMinusDstAlpha: 8, SrcAlphaSaturate: 9, OneMinusSrcAlpha: 10 };
 
@@ -76,6 +80,7 @@ function analyzeShader(src) {
     fogLevel: /_FogLevel/.test(code), // a property that weakens the fog
     dims: /_DimAltitude/.test(code), // darkens below the sea
     stereo: surface || /UNITY_VERTEX_OUTPUT_STEREO/.test(code), // ready for Multiview
+    unityLight: /_LightColor0|_WorldSpaceLightPos0|\bShadeSH9\b|unity_4LightPos/.test(code), // reads Unity's lights (a ForwardBase tag alone doesn't)
     passes: count(/^\s*Pass\b/gm) || 1,
     textureReads: count(/\b(tex2D\w*|texCUBE\w*|tex2Dlod|UNITY_SAMPLE_TEX\w*)\s*\(/g),
     pow: count(/\bpow\s*\(/g),
@@ -240,14 +245,80 @@ function summary({ materials, shaders }) {
   list('Largest textures in use (Android size cap)', big.map(t => `${t.maxSize}${t.android ? ' (Android)' : ''} ${t.path}`));
 }
 
+// The shaders in use that don't light the Canopy way (one pass, ambient and the sun from
+// EnvironmentManager's globals, docs: Rendering Performance, More Lights), to move onto Canopy's
+// own (Ken, 2026-11-05): Unity's built-in shaders, surface shaders and hand-written ones lit by
+// Unity's lights, and shaders from packages outside Assets/Shaders. Unlit ones (particles, glows)
+// need no lights, but are listed so each can be checked. [{ shader, why, materials: [finding] }]
+function unityShaders({ materials, shaders }) {
+  const live = materials.filter(f => f.usedBy.length);
+  const out = [];
+  for (const name of [...new Set(live.filter(f => f.shader.startsWith('built-in')).map(f => f.shader))].sort()) {
+    out.push({ shader: name, why: ['Unity\'s built-in'], materials: live.filter(f => f.shader === name) });
+  }
+  for (const s of shaders) {
+    const mine = s.materials.filter(f => f.usedBy.length);
+    const why = [s.surface && 'surface shader (Unity\'s lights)', !s.surface && s.unityLight && 'Unity\'s lights', !s.path.startsWith('Assets/Shaders/') && `outside Assets/Shaders (${path.dirname(s.path)})`].filter(Boolean);
+    if (mine.length && why.length) out.push({ shader: s.name, why, materials: mine });
+  }
+  return out;
+}
+
+// What a built-in material asks of its shader, and what tools/convert-materials.js would do with
+// it: metallic and smoothness (General has a highlight, by _Glossiness, but no metallic), the maps
+// and modes General lacks.
+function looks(rel) {
+  const C = require('./convert-materials.js');
+  const text = fs.readFileSync(path.join('/sdcard/Canopy', rel), 'utf8').replace(/\r\n/g, '\n');
+  const kw = C.keywordsOf(text);
+  const id = +(/m_Shader: \{fileID: (-?\d+)/.exec(text) || [])[1];
+  const n = v => String(+(+v).toFixed(2));
+  const out = [];
+  if (id === 45 || id === 46) {
+    const map = C.texOf(text, '_MetallicGlossMap');
+    const fromAlbedo = C.floatOf(text, '_SmoothnessTextureChannel') === 1;
+    out.push(id === 45 ? 'specular setup' : map ? 'metallic map' : `metallic ${n(C.floatOf(text, '_Metallic') || 0)}`);
+    out.push(map || fromAlbedo ? `smoothness ${n(C.floatOf(text, '_GlossMapScale') ?? 1)} × ${map ? 'the map' : 'albedo'}'s alpha` : `smoothness ${n(C.floatOf(text, '_Glossiness') ?? 0.5)}`);
+    const mode = C.floatOf(text, '_Mode') || 0;
+    if (mode) out.push(['', 'cutout', 'fade', 'transparent'][mode]);
+    if (kw.includes('_NORMALMAP')) out.push('normal map');
+    if (kw.includes('_EMISSION') && ((C.colorOf(text, '_EmissionColor') || [0, 0, 0]).slice(0, 3).some(v => v > 0) || C.texOf(text, '_EmissionMap'))) out.push('emission');
+    if (C.texOf(text, '_OcclusionMap')) out.push('occlusion map');
+    if (kw.includes('_DETAIL_MULX2')) out.push('detail');
+    if (kw.includes('_PARALLAXMAP')) out.push('parallax');
+  } else if (id === 10705) out.push(`shininess ${n(C.floatOf(text, '_Shininess') ?? 0.078125)}`);
+  const p = C.plan(text);
+  return `${out.join(', ')}${out.length ? ' ' : ''}→ ${p.to ? `${p.to}${p.warnings.length ? ` (${p.warnings.length} dropped)` : ''}` : `not yet: ${p.blocked}`}`;
+}
+
+// Only what the game draws counts (Ken, 2026-11-06: a material placed only under inactive or test
+// objects, or always replaced by an instance's own, needs no work): tools/uses.js drawnMaterials.
+// Each drawn material shows where; the rest are named on one line per shader.
+function printUnityShaders(found) {
+  const drawn = require('./uses.js').drawnMaterials();
+  const rows = unityShaders(found).map(r => ({ ...r, drawn: r.materials.filter(f => drawn.has(f.guid)), idle: r.materials.filter(f => !drawn.has(f.guid)) }));
+  const shown = rows.filter(r => r.drawn.length);
+  console.log(`${shown.length} shaders the game draws aren't Canopy's own lighting, on ${shown.reduce((n, r) => n + r.drawn.length, 0)} drawn materials (${rows.reduce((n, r) => n + r.idle.length, 0)} more used by prefabs or scenes but never drawn)`);
+  for (const r of rows.sort((a, b) => b.drawn.length - a.drawn.length)) {
+    console.log(`\n${r.shader}: ${r.why.join('; ')}; ${r.drawn.length} drawn${r.idle.length ? `, ${r.idle.length} not` : ''}`);
+    for (const f of r.drawn) {
+      const where = drawn.get(f.guid);
+      console.log(`  ${path.basename(f.material)}: ${where.slice(0, 2).join('; ')}${where.length > 2 ? '; ...' : ''}`);
+      if (f.shader.startsWith('built-in')) console.log(`      ${looks(f.material)}`);
+    }
+    if (r.idle.length) console.log(`  not drawn: ${r.idle.map(f => path.basename(f.material, '.mat')).join(', ')}`);
+  }
+}
+
 if (require.main === module) {
   const arg = process.argv[2];
   const found = analyze();
   if (arg === '--json') console.log(JSON.stringify(found, null, 1));
+  else if (arg === '--unity') printUnityShaders(found);
   else if (arg) {
     const hit = [...found.materials.filter(f => path.basename(f.material, '.mat').toLowerCase() === arg.toLowerCase()), ...found.shaders.filter(s => s.name.toLowerCase() === arg.toLowerCase() || path.basename(s.path, '.shader').toLowerCase() === arg.toLowerCase()).map(s => ({ ...s, materials: s.materials.map(f => `${f.material}${f.usedBy.length ? ` (${f.usedBy.length} uses)` : ' (unused)'}`) }))];
     console.log(hit.length ? JSON.stringify(hit, null, 1) : `no material or shader named ${arg}`);
   } else summary(found);
 }
 
-module.exports = { analyze, analyzeShader, analyzeMaterial };
+module.exports = { analyze, analyzeShader, analyzeMaterial, unityShaders };

@@ -7,7 +7,9 @@ Tickable.register("Sea", class extends Tickable {
     tick() {
         const u = Surface.uniforms, f = this.fields, abyss = this.componentOf(f.abyss);
         u.canopySeaLevel.value = abyss ? abyss.altitude() : 0;
-        u.canopyDimAmount.value = f.dimAmountDefault ?? f.dimAmount ?? 0.3;
+        // the mood's dimAmount, live (web/environment.js), else the Sea's default
+        const env = this.environment() || {};
+        u.canopyDimAmount.value = typeof env.dimAmount === "number" ? env.dimAmount : f.dimAmountDefault ?? f.dimAmount ?? 0.3;
         u.canopyDimDepth.value = f.dimDepth ?? 3;
     }
     stop() {

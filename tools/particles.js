@@ -2,7 +2,7 @@
 // 2026-10-29: the Driller's smoke first). A ParticleSystem (class 198) and its renderer (199) become
 // a small description of what the stand-in draws: the main settings, emission (rate and bursts),
 // the emitter's shape, size, rotation, color and velocity over each particle's life, noise, a
-// texture sheet, and the renderer's mode and material. Modules it doesn't do are named in `unsupported`.
+// texture sheet, trails, and the renderer's mode and materials. Modules it doesn't do are named in `unsupported`.
 // Values that Unity keeps as curves are { mode, scalar, min, max, minKeys, maxKeys } (mode 0 a
 // constant, 1 a curve times scalar, 2 between two curves, 3 between two constants; keys
 // [time, value, inSlope, outSlope]); colors are { mode, min, max, minGradient, maxGradient }
@@ -81,7 +81,24 @@ function color(c) {
 const vec = v => (v ? [v.x ?? 0, v.y ?? 0, v.z ?? 0] : [0, 0, 0]);
 
 // The modules the stand-in does; others, when on, are listed as unsupported.
-const DONE = ['InitialModule', 'EmissionModule', 'ShapeModule', 'SizeModule', 'RotationModule', 'ColorModule', 'VelocityModule', 'UVModule', 'NoiseModule'];
+const DONE = ['InitialModule', 'EmissionModule', 'ShapeModule', 'SizeModule', 'RotationModule', 'ColorModule', 'VelocityModule', 'UVModule', 'NoiseModule', 'TrailModule'];
+
+// The Trails module (Ken, 2026-11-03: the sky beams are trails alone, their renderer's mode None):
+// mode 0 a trail behind each particle (ratio of them get one, each lasting its lifetime times the
+// particle's, a point added every minVertexDistance), 1 ribbons through the particles in the order
+// they were made (ribbonCount of them, every nth particle in each); width over the trail (times the
+// particle's size if sizeAffectsWidth), color over the particle's life and over the trail (times the
+// particle's color if inheritParticleColor); the texture stretched over it, tiled by length, or
+// spread or repeated per segment (textureMode 0 to 3). Unity's defaults for what isn't saved.
+function trailOf(t) {
+  return {
+    mode: t.mode || 0, ratio: t.ratio ?? 1, lifetime: curve(t.lifetime), minVertexDistance: t.minVertexDistance ?? 0.2,
+    textureMode: t.textureMode || 0, ribbonCount: Math.max(1, t.ribbonCount || 1), world: Boolean(t.worldSpace),
+    dieWithParticles: t.dieWithParticles !== 0, sizeAffectsWidth: t.sizeAffectsWidth !== 0, sizeAffectsLifetime: Boolean(t.sizeAffectsLifetime),
+    inheritColor: t.inheritParticleColor !== 0, attach: Boolean(t.attachRibbonsToTransform),
+    colorOverLife: color(t.colorOverLifetime), width: t.widthOverTrail ? curve(t.widthOverTrail) : { mode: 0, scalar: 1 }, colorOverTrail: color(t.colorOverTrail)
+  };
+}
 
 // Sets a property by Unity's path ("InitialModule.startSize.scalar", "m_Bursts.Array.data[0].time"),
 // as a prefab instance's modification does; a list's size is left to the items set.
@@ -113,7 +130,8 @@ function describe(systemText, rendererText, props = null, rprops = null) {
   for (const [k, v] of Object.entries(rprops || {})) setPath(r, k, v && v.asset ? { guid: v.asset } : v);
   const on = m => Boolean(ps[m] && ps[m].enabled);
   const init = ps.InitialModule || {}, em = ps.EmissionModule || {}, sh = ps.ShapeModule || {};
-  const material = r.m_Materials && r.m_Materials[0] && r.m_Materials[0].guid ? { asset: r.m_Materials[0].guid } : null;
+  const slot = k => (r.m_Materials && r.m_Materials[k] && r.m_Materials[k].guid ? { asset: r.m_Materials[k].guid } : null);
+  const material = slot(0);
   const unsupported = Object.keys(ps).filter(k => /Module$/.test(k) && on(k) && !DONE.includes(k));
   if (r.m_RenderMode === 4) unsupported.push('mesh particles');
   // Noise moves particles; what else it can do isn't done (Canopy uses none of it, 2026-10-29)
@@ -154,7 +172,8 @@ function describe(systemText, rendererText, props = null, rprops = null) {
     } : null,
     velocityOverLife: on('VelocityModule') ? { x: curve(ps.VelocityModule.x), y: curve(ps.VelocityModule.y), z: curve(ps.VelocityModule.z), world: Boolean(ps.VelocityModule.inWorldSpace) } : null,
     sheet: on('UVModule') ? { tilesX: ps.UVModule.tilesX || 1, tilesY: ps.UVModule.tilesY || 1, row: ps.UVModule.animationType === 1 ? (ps.UVModule.rowMode === 0 || ps.UVModule.randomRow ? -1 : ps.UVModule.rowIndex || 0) : null, frame: curve(ps.UVModule.frameOverTime), start: curve(ps.UVModule.startFrame), cycles: ps.UVModule.cycles || 1 } : null,
-    renderMode: r.m_RenderMode || 0, renderOn: r.m_Enabled !== 0,
+    trail: on('TrailModule') ? trailOf(ps.TrailModule) : null, trailMaterial: slot(1), // the renderer's second material
+    renderMode: r.m_RenderMode || 0, renderOn: r.m_Enabled !== 0, // mode 5, None: only its trails are drawn
     applyColorSpace: r.m_ApplyActiveColorSpace !== 0, // colors to linear for the shader (Unity's default when unsaved) minSize: r.m_MinParticleSize ?? 0, maxSize: r.m_MaxParticleSize ?? 0.5,
     material, unsupported
   };

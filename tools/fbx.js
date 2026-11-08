@@ -220,7 +220,8 @@ function readScene(buf) {
 }
 
 // ---------- geometry ----------
-// Triangles of one FBX mesh in its own space: { p, n, t (uv), c (color) } per triangle corner. Polygons are fanned; normals and UVs follow their mapping/reference modes.
+// Triangles of one FBX mesh in its own space: { p, n, t (uv), c (color) } per triangle corner, and
+// the triangle's material index as .material. Polygons are fanned; normals and UVs follow their mapping/reference modes.
 function triangles(geometry) {
   const n = geometry.node;
   const v = child(n, 'Vertices').props[0];
@@ -239,6 +240,9 @@ function triangles(geometry) {
   const normals = layer('LayerElementNormal', 'Normals', 'NormalsIndex');
   const uvs = layer('LayerElementUV', 'UV', 'UVIndex');
   const colors = layer('LayerElementColor', 'Colors', 'ColorIndex');
+  const materialLayer = child(n, 'LayerElementMaterial');
+  const materials = materialLayer && child(materialLayer, 'Materials') ? child(materialLayer, 'Materials').props[0] : null;
+  const byPolygon = materialLayer && child(materialLayer, 'MappingInformationType').props[0] === 'ByPolygon';
   const fetch = (l, polyVertex, controlPoint, polygon) => {
     if (!l) return null;
     let i = l.mapping === 'ByPolygonVertex' ? polyVertex : l.mapping === 'ByPolygon' ? polygon : l.mapping === 'AllSame' ? 0 : controlPoint;
@@ -253,7 +257,8 @@ function triangles(geometry) {
     if (last) cp = ~cp;
     poly.push({ p: [v[cp * 3], v[cp * 3 + 1], v[cp * 3 + 2]], n: fetch(normals, k, cp, polygon), t: fetch(uvs, k, cp, polygon), c: fetch(colors, k, cp, polygon) });
     if (last) {
-      for (let i = 1; i < poly.length - 1; i++) out.push([poly[0], poly[i], poly[i + 1]]);
+      const material = materials ? materials[byPolygon ? polygon : 0] : 0;
+      for (let i = 1; i < poly.length - 1; i++) out.push(Object.assign([poly[0], poly[i], poly[i + 1]], { material }));
       poly = [];
       polygon++;
     }
@@ -301,8 +306,11 @@ function modelToObj(scene, model, importScale, label) {
   const pivot = model.props.RotationPivot || model.props.ScalingPivot || [0, 0, 0];
   const m = mul(T(neg(pivot)), geometricMatrix(model.props));
   const nm = transpose3(invert3(m)); // for normals
-  const tris = triangles(g);
+  // Unity's submeshes: one per material the polygons use, in material order.
+  const tris = triangles(g).sort((a, b) => a.material - b.material);
   const L = ['# from ' + label];
+  const used = [...new Set(tris.map(t => t.material))];
+  if (used.length > 1) L.push('# submeshes ' + used.map(k => tris.filter(t => t.material === k).length).join(' '));
   const vs = [], vts = [], vns = [], fs = [];
   const f6 = x => +x.toFixed(6);
   let i = 0;

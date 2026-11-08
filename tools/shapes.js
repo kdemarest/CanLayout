@@ -113,7 +113,30 @@ function shapesIn(text) {
 // Every Asset line and Shape line in the docs vault (skipping source/ and build/):
 // { assets: { name: { chip, type, unity, source } } (defining lines only), shapes, sources,
 // errors: ["docs/<file> line N: ..."] }.
+// The last read, kept while no doc has changed (each .md's time and size the same, none added
+// or removed): reading them all took about a second a load (Ken, 2026-11-04).
+let lastDocs = null;
 function readDocs(docs) {
+  const fs = require('fs'), path = require('path');
+  const files = [];
+  (function list(dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name.startsWith('.') || ['source', 'build'].includes(e.name)) continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) list(p);
+      else if (e.name.endsWith('.md')) {
+        const st = fs.statSync(p);
+        files.push(`${p}:${st.mtimeMs}:${st.size}`);
+      }
+    }
+  })(docs);
+  const signature = docs + '\n' + files.join('\n');
+  if (lastDocs && lastDocs.signature === signature) return lastDocs.value;
+  const value = readAllDocs(docs);
+  lastDocs = { signature, value };
+  return value;
+}
+function readAllDocs(docs) {
   const fs = require('fs'), path = require('path');
   const assets = {}, shapes = {}, sources = {}, errors = [];
   (function walk(dir) {

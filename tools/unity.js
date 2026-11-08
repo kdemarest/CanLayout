@@ -4,10 +4,11 @@ const fs = require('fs');
 const path = require('path');
 const Particles = require('./particles.js');
 const Cond = () => require('./conditions.js'); // lazily: it requires this file
+const Config = () => require('./config.js');
 
 const REPO = '/sdcard/Canopy';
 // Bump when what this reads from prefabs changes, so imported areas (which bake prefabs' parts in) re-import.
-const READER = 14;
+const READER = 28;
 const BUILTIN_GUID = '0000000000000000e000000000000000';
 const BUILTIN = { 10202: 'Cube', 10206: 'Cylinder', 10207: 'Sphere', 10208: 'Capsule', 10209: 'Plane', 10210: 'Quad' };
 const MODEL_EXT = /\.(fbx|obj|blend|dae|3ds|max)$/i;
@@ -49,6 +50,32 @@ function eulerToQuat(e) {
   const qy = { x: 0, y: Math.sin(h(e.y)), z: 0, w: Math.cos(h(e.y)) };
   const qz = { x: 0, y: 0, z: Math.sin(h(e.z)), w: Math.cos(h(e.z)) };
   return qmul(qmul(qy, qx), qz);
+}
+// A row-major matrix's translation, rotation (from its axes, normalized) and per-axis (lossy) scale.
+function decompose(m) {
+  const scl = [0, 1, 2].map(c => Math.hypot(m[c], m[4 + c], m[8 + c]) || 1);
+  const r = (row, c) => m[row * 4 + c] / scl[c];
+  const tr = r(0, 0) + r(1, 1) + r(2, 2);
+  let q;
+  if (tr > 0) { const k = Math.sqrt(tr + 1) * 2; q = { w: k / 4, x: (r(2, 1) - r(1, 2)) / k, y: (r(0, 2) - r(2, 0)) / k, z: (r(1, 0) - r(0, 1)) / k }; }
+  else if (r(0, 0) > r(1, 1) && r(0, 0) > r(2, 2)) { const k = Math.sqrt(1 + r(0, 0) - r(1, 1) - r(2, 2)) * 2; q = { w: (r(2, 1) - r(1, 2)) / k, x: k / 4, y: (r(0, 1) + r(1, 0)) / k, z: (r(0, 2) + r(2, 0)) / k }; }
+  else if (r(1, 1) > r(2, 2)) { const k = Math.sqrt(1 + r(1, 1) - r(0, 0) - r(2, 2)) * 2; q = { w: (r(0, 2) - r(2, 0)) / k, x: (r(0, 1) + r(1, 0)) / k, y: k / 4, z: (r(1, 2) + r(2, 1)) / k }; }
+  else { const k = Math.sqrt(1 + r(2, 2) - r(0, 0) - r(1, 1)) * 2; q = { w: (r(1, 0) - r(0, 1)) / k, x: (r(0, 2) + r(2, 0)) / k, y: (r(1, 2) + r(2, 1)) / k, z: k / 4 }; }
+  return { pos: { x: m[3], y: m[7], z: m[11] }, rot: q, scl: { x: scl[0], y: scl[1], z: scl[2] } };
+}
+// An object inside a prefab instance that another object here is parented to (not its root): its
+// placement relative to the instance's root, and whether it is off, from the instance's prefab
+// (graph's objects); null for the root, or when it can't be found.
+// A stripped object's id in its instance's prefab.
+const sourceIn = (f, id, inst) => (process.env.XOR_ONLY ? null : f.sourceOf && f.sourceOf[id]) || xorId(id, inst);
+function innerParent(f, n, parentT) {
+  const inst = f.strippedT[parentT];
+  const x = inst && n['pi' + inst];
+  if (!x || !x.sub || !x.sub.objectOfT) return null;
+  const srcT = sourceIn(f, parentT, inst);
+  if (srcT === x.sub.rootId) return null;
+  const o = x.sub.objects && x.sub.objects[x.sub.objectOfT[srcT]];
+  return o ? { ...decompose(o.m), off: o.off } : null;
 }
 function quatToEuler(q) {
   const n = Math.hypot(q.x, q.y, q.z, q.w) || 1;
@@ -93,15 +120,37 @@ function modifications(body) {
     .map(m => ({ target: m[1], path: m[2].trim(), value: m[3].trim(), ref: m[4] && m[4] !== '0' && !m[5] ? m[4] : null, guid: m[5] || null }));
 }
 
+// A Light component (108) as Canopy's lights take it (CanopyLights.cs; Claude, 2026-11-08, More
+// Lights phase 4: Unity's point and spot Lights, sorted Canopy's way): its color (sRGB, as saved),
+// intensity, range and culling mask (the layers it lights: the ForLighting layer's dedicated lights
+// reach only it), and a spot's angles (spot: outer, inner, degrees; it shines along its object's
+// +Z, which graph() gives as dir), or null for any other kind, a switched-off one, or one that
+// lights nothing.
+function lightOf(body) {
+  const num = k => parseFloat((new RegExp('\\n {2}' + k + ': (\\S+)').exec(body) || [])[1]);
+  const type = num('m_Type');
+  if ((type !== 2 && type !== 0) || /\n {2}m_Enabled: 0/.test(body)) return null;
+  const c = /\n {2}m_Color: \{r: ([^,]+), g: ([^,]+), b: ([^,]+)/.exec(body);
+  const mask = +((/m_CullingMask:\n\s+serializedVersion: \d+\n\s+m_Bits: (\d+)/.exec(body) || [])[1] ?? 4294967295);
+  const light = { color: c ? [+c[1], +c[2], +c[3]] : [1, 1, 1], intensity: num('m_Intensity') || 0, range: num('m_Range') || 0, mask };
+  if (type === 0) {
+    const outer = num('m_SpotAngle') || 30;
+    light.spot = [outer, Math.min(num('m_InnerSpotAngle') || outer * 0.75, outer - 0.1)];
+  }
+  return light.intensity > 0 && light.range > 0 && mask !== 0 ? light : null;
+}
+
 // Parses one Unity file into transforms, game objects, mesh components, and prefab instances.
 function parse(text) {
   const d = documents(text.replace(/\r\n/g, '\n')); // some files have Windows line endings
-  const t = {}, go = {}, mesh = {}, inst = {}, strippedT = {}, strippedGo = {}, textId = {}, shown = {}, material = {};
+  const meshFilter = {}, renderer = {}; // game object -> its MeshFilter's and renderer's ids (an instance may remove them)
+  const t = {}, go = {}, mesh = {}, inst = {}, strippedT = {}, strippedGo = {}, sourceGo = {}, sourceOf = {}, textId = {}, shown = {}, material = {}, materials = {};
   const lodGroup = {}, rendererGo = {}; // LODGroups by game object; renderer id -> its game object
   const strippedRenderer = {}; // a renderer inside a nested prefab or model -> its prefab instance
   const strippedComponent = {}; // a script inside a nested prefab -> its prefab instance
   const colliders = {}; // game object -> its colliders' kinds (mesh, box, sphere, capsule; trigger, convex)
   const particles = {}; // game object -> [its ParticleSystem's id and document, its renderer's document]
+  const lights = {}; // game object -> its point Light, as lightOf describes it (More Lights phase 4)
   const scripts = []; // [game object, script guid, body] of every MonoBehaviour
   let takesText = false; // has a script that declares a textId field (Tablet, Sign, Note)
   for (const x of d) {
@@ -111,6 +160,7 @@ function parse(text) {
     if ((x.cls === 23 || x.cls === 137 || x.cls === 199) && x.stripped) strippedRenderer[x.id] = ref(x.body, 'm_PrefabInstance');
     if (x.cls === 114 && x.stripped) strippedComponent[x.id] = ref(x.body, 'm_PrefabInstance');
     if (x.cls === 198 && !x.stripped) (particles[ref(x.body, 'm_GameObject')] = particles[ref(x.body, 'm_GameObject')] || [null, null])[0] = { id: x.id, body: x.body };
+    if (x.cls === 108 && !x.stripped) { const l = lightOf(x.body); if (l) lights[ref(x.body, 'm_GameObject')] = l; }
     if (x.cls === 199 && !x.stripped) (particles[ref(x.body, 'm_GameObject')] = particles[ref(x.body, 'm_GameObject')] || [null, null])[1] = { id: x.id, body: x.body };
     if ([64, 65, 135, 136].includes(x.cls) && !x.stripped && !/\n {2}m_Enabled: 0/.test(x.body)) {
       const kind = { 64: 'mesh', 65: 'box', 135: 'sphere', 136: 'capsule' }[x.cls] + (/m_IsTrigger: 1/.test(x.body) ? ' trigger' : '') + (x.cls === 64 && /m_Convex: 1/.test(x.body) ? ' convex' : '');
@@ -124,12 +174,19 @@ function parse(text) {
       }));
       lodGroup[ref(x.body, 'm_GameObject')] = { point: vec(x.body, 'm_LocalReferencePoint') || { x: 0, y: 0, z: 0 }, size: num((/m_Size: (\S+)/.exec(x.body) || [])[1]) || 1, levels };
     }
+    if ((x.cls === 23 || x.cls === 137) && !x.stripped) renderer[ref(x.body, 'm_GameObject')] = x.id;
     if ((x.cls === 23 || x.cls === 137) && !x.stripped && !/\n {2}m_Enabled: 0/.test(x.body)) {
       shown[ref(x.body, 'm_GameObject')] = true;
-      // The first material; meshes with several submeshes use only it for now.
+      // The first material, and all of them when there are several: slot i draws submesh i.
       const m = /m_Materials:\n\s+- \{fileID: -?\d+, guid: ([0-9a-f]+)/.exec(x.body);
       if (m) material[ref(x.body, 'm_GameObject')] = m[1];
+      const slots = /m_Materials:\n((?:\s+- \{.*\}\n)+)/.exec(x.body);
+      const list = slots ? [...slots[1].matchAll(/- \{fileID: -?\d+(?:, guid: ([0-9a-f]+))?/g)].map(s => s[1] || null) : [];
+      if (list.length > 1) materials[ref(x.body, 'm_GameObject')] = list;
     }
+    // a stripped object's id in its instance's prefab: Unity's newer files make the stripped id the
+    // instance's XOR it, older ones (TangleScene) small numbers, so read it (Claude, 2026-11-08)
+    if (x.stripped) sourceOf[x.id] = ref(x.body, 'm_CorrespondingSourceObject');
     if ((x.cls === 4 || x.cls === 224) && x.stripped) strippedT[x.id] = ref(x.body, 'm_PrefabInstance');
     else if (x.cls === 4 || x.cls === 224) {
       t[x.id] = {
@@ -138,11 +195,15 @@ function parse(text) {
         rot: vec(x.body, 'm_LocalRotation') || { x: 0, y: 0, z: 0, w: 1 },
         scl: vec(x.body, 'm_LocalScale') || { x: 1, y: 1, z: 1 }
       };
-    } else if (x.cls === 1 && x.stripped) strippedGo[x.id] = ref(x.body, 'm_PrefabInstance');
+    } else if (x.cls === 1 && x.stripped) {
+      strippedGo[x.id] = ref(x.body, 'm_PrefabInstance');
+      sourceGo[x.id] = ref(x.body, 'm_CorrespondingSourceObject'); // its id in the instance's prefab
+    }
     else if (x.cls === 1) go[x.id] = { name: ((/m_Name: (.*)/.exec(x.body) || [])[1] || '').trim(), active: !/m_IsActive: 0/.test(x.body), layer: +((/m_Layer: (\d+)/.exec(x.body) || [])[1] || 0) };
     else if (x.cls === 33 || x.cls === 137) {
       const r = guidRef(x.body, 'm_Mesh');
       if (r) mesh[ref(x.body, 'm_GameObject')] = r;
+      if (!x.stripped) meshFilter[ref(x.body, 'm_GameObject')] = x.id;
     } else if (x.cls === 114) {
       const script = guidRef(x.body, 'm_Script');
       if (script && !x.stripped) scripts.push([ref(x.body, 'm_GameObject'), script.guid, x.body, x.id]);
@@ -151,9 +212,15 @@ function parse(text) {
       if (m && m[1].trim()) textId[ref(x.body, 'm_GameObject')] = m[1].trim();
     } else if (x.cls === 1001) {
       const src = guidRef(x.body, 'm_SourcePrefab');
-      inst[x.id] = { src: src && src.guid, parent: ref(x.body, 'm_TransformParent'), mods: modifications(x.body) };
+      // m_RemovedComponents: components of the source the instance removes (by their ids there)
+      const removed = [...((/\n {4}m_RemovedComponents:\n((?: {4}- \{[^\n]*\n)*)/.exec(x.body) || [])[1] || '').matchAll(/fileID: (-?\d+)/g)].map(m => m[1]);
+      inst[x.id] = { src: src && src.guid, parent: ref(x.body, 'm_TransformParent'), mods: modifications(x.body), removed };
     }
   }
+  // Spinners an EffectEnable turns on, by their text: drawn as on (Ken, 2026-11-07: a Cairn's pieces
+  // spin once its portal is bought; layout treats it as paid).
+  const turnedOn = new Set(scripts.filter(s => scriptName(s[1]) === 'EffectEnable' && !/\n {2}setToState: 0/.test(s[2])).map(s => (/\n {2}componentToEnable: \{fileID: (-?\d+)/.exec(s[2]) || [])[1]));
+  const enabledSpinners = new Set(scripts.filter(s => turnedOn.has(s[3]) && scriptName(s[1]) === 'Spinner').map(s => s[2]));
   // Scripts added to a prefab instance here sit on its stripped root game object.
   const addedScripts = {}, addedScriptBodies = {};
   for (const [g, guid, body] of scripts) {
@@ -161,7 +228,7 @@ function parse(text) {
     (addedScripts[strippedGo[g]] = addedScripts[strippedGo[g]] || []).push(guid);
     (addedScriptBodies[strippedGo[g]] = addedScriptBodies[strippedGo[g]] || []).push({ guid, body });
   }
-  return { t, go, mesh, inst, strippedT, strippedGo, textId, material, shown, takesText, lodGroup, rendererGo, strippedRenderer, strippedComponent, colliders, particles, scripts, addedScripts, addedScriptBodies };
+  return { lights, meshFilter, renderer, t, go, mesh, inst, strippedT, strippedGo, sourceGo, sourceOf, textId, material, materials, enabledSpinners, shown, takesText, lodGroup, rendererGo, strippedRenderer, strippedComponent, colliders, particles, scripts, addedScripts, addedScriptBodies };
 }
 
 // ---------- repository lookups ----------
@@ -192,6 +259,8 @@ function refreshIndex() {
     scriptText.clear();
     prefabGuids = null; // prefabByName's names, which new prefabs join
     prefabCache.clear(); // its parts hold mesh blobs, which change when a model is rewritten
+    sceneCache.clear(); // and scenes hold those prefabs
+    parsedPrefabs.clear();
   }
 }
 // A mesh reference ({fileID, guid}) described for the viewer and the mesh fetcher.
@@ -216,8 +285,20 @@ const xorId = (a, b) => ((BigInt(a) ^ BigInt(b)) & MASK).toString();
 
 // ---------- prefabs ----------
 const prefabCache = new Map();
+// Prefabs as read (parse), by file; null for none. An instance with overrides is built afresh from
+// its prefab, and this is shared storage, where each file call costs about a millisecond: OakScene
+// read 593 files 3547 times, 57% of its 21 s import (Ken, 2026-11-07).
+const parsedPrefabs = new Map();
+function parsedPrefab(file) {
+  if (!parsedPrefabs.has(file)) parsedPrefabs.set(file, fs.existsSync(file) ? parse(fs.readFileSync(file, 'utf8')) : null);
+  return parsedPrefabs.get(file);
+}
+// The last scenes read, for the areas cut from one scene (a few seconds to a quarter of a minute
+// each to read; 2 on a phone's memory). By file; a changed file is read again.
+const sceneCache = new Map();
+const SCENES_KEPT = 2;
 // Flattens a prefab (by guid) to { name, path, rootId, rootGoId, rootTrs, parts }, where each
-// part is { mesh, m, material, object, prefab, off } with m relative to the prefab root (the
+// part is { mesh, m, material, materials (when not the one slot), object, prefab, off } with m relative to the prefab root (the
 // root's own transform excluded); prefab is the prefab whose file holds the object, and off
 // marks objects switched off (inactive, or no enabled renderer), which callers drop unless a
 // show rule names them (tools/config.js).
@@ -230,9 +311,8 @@ function prefab(guid, depth = 0, overrides = null) {
   if (!overrides && prefabCache.has(guid)) return prefabCache.get(guid);
   const e = index()[guid];
   if (!e || !e.path.endsWith('.prefab') || depth > 12) return null;
-  const file = path.join(REPO, e.path);
-  if (!fs.existsSync(file)) return null;
-  const f = parse(fs.readFileSync(file, 'utf8'));
+  const f = parsedPrefab(path.join(REPO, e.path));
+  if (!f) return null;
   const name = path.basename(e.path, '.prefab');
   const result = { name, path: e.path, ...graph(f, depth, overrides, name) };
   // Takes a text id if it or any prefab nested in it has a script with a textId field.
@@ -264,6 +344,13 @@ function modelInstance(guid, mods) {
   };
 }
 
+// A renderer's materials by slot, after an instance's overrides (o.slots by index, o.slotCount for
+// m_Materials.Array.size), or null for the usual single slot.
+function materialSlots(own, first, o) {
+  const count = o && o.slotCount !== undefined ? o.slotCount : own ? own.length : 1;
+  const list = Array.from({ length: count }, (_, i) => (o && o.slots && o.slots[i]) || (i === 0 ? first : (own && own[i]) || null));
+  return own || list.length > 1 ? list : null;
+}
 // Builds the transform tree of a parsed file. Nodes are transform ids or 'pi<id>' for
 // prefab instances; stripped transforms alias to their instance node.
 function nodes(f, depth, overrides = null) {
@@ -273,11 +360,17 @@ function nodes(f, depth, overrides = null) {
     const g = f.go[t.go] || { name: '', active: true };
     const o = overrides && overrides[id];
     const ga = overrides && overrides[t.go] ? overrides[t.go].active : undefined;
+    // a MeshFilter or renderer an instance further out removes (m_RemovedComponents): no mesh drawn
+    // (Claude, 2026-11-03: NoteLore removes its NoteBase's paper cube)
+    const gone = c => c && overrides && overrides[c] && overrides[c].removed;
+    const removedMesh = gone(f.meshFilter[t.go]) || gone(f.renderer[t.go]);
+    const onRenderer = overrides && f.renderer[t.go] && overrides[f.renderer[t.go]];
+    const material = (onRenderer && onRenderer.material) || f.material[t.go] || null;
     n[id] = {
       kind: 't', father: alias(t.father), parentT: t.father,
       pos: o ? { ...t.pos, ...o.pos } : t.pos, rot: o ? { ...t.rot, ...o.rot } : t.rot, scl: o ? { ...t.scl, ...o.scl } : t.scl,
       name: g.name, active: ga === undefined ? g.active : ga, go: t.go,
-      mesh: f.mesh[t.go] || null, meshOff: !f.shown[t.go], material: f.material[t.go] || null, textId: f.textId[t.go] || null
+      mesh: removedMesh ? null : f.mesh[t.go] || null, meshOff: !f.shown[t.go], material, materials: materialSlots(f.materials[t.go], material, onRenderer), textId: f.textId[t.go] || null
     };
   }
   for (const [id, x] of Object.entries(f.inst)) {
@@ -290,6 +383,7 @@ function nodes(f, depth, overrides = null) {
     const rootT = sub && sub.rootId ? xorId(id, sub.rootId) : null;
     const rootGo = sub && sub.rootGoId ? xorId(id, sub.rootGoId) : null;
     const inner = {}; // modifications of objects inside the instance, by their fileID in its source
+    for (const r of x.removed || []) (inner[r] = inner[r] || { pos: {}, rot: {}, scl: {} }).removed = true;
     for (const m of x.mods) {
       const k2 = /^m_Local(Position|Rotation|Scale)\.([xyzw])$/.exec(m.path);
       if (sub && m.target !== sub.rootId && m.target !== sub.rootGoId && (k2 || m.path === 'm_IsActive')) {
@@ -304,7 +398,18 @@ function nodes(f, depth, overrides = null) {
         const o = inner[m.target] = inner[m.target] || { pos: {}, rot: {}, scl: {} };
         (o.props = o.props || {})[m.path] = m.guid ? { asset: m.guid } : m.value !== '' && Number.isFinite(+m.value) ? +m.value : m.value;
       }
-      if (m.path === 'm_Name') { name = m.value; continue; }
+      // the instance's own name, not one given to an object inside it (Claude, 2026-11-02: HawthornOutpost
+      // showed as OutpostSkyBeamPfx, a child's)
+      if (m.path === 'm_Name') { if (!sub || !sub.rootGoId || m.target === sub.rootGoId) name = m.value; continue; }
+      // A material set on a renderer inside the instance (Claude, 2026-11-06: 180 Canopy files set
+      // one, the eggs' and the portals' among them): that renderer draws in it, in that slot.
+      const slot = /^m_Materials\.Array\.data\[(\d+)\]$/.exec(m.path);
+      if (sub && !sub.model && slot && m.guid) {
+        const o = inner[m.target] = inner[m.target] || { pos: {}, rot: {}, scl: {} };
+        if (slot[1] === '0') o.material = m.guid;
+        else o.slots = { ...o.slots, [slot[1]]: m.guid };
+      }
+      if (sub && !sub.model && m.path === 'm_Materials.Array.size') (inner[m.target] = inner[m.target] || { pos: {}, rot: {}, scl: {} }).slotCount = +m.value;
       if (m.path === 'textId' && m.value) textId = m.value;
       if (m.path === 'm_IsActive' && sub && m.target === sub.rootGoId) active = m.value !== '0';
       const k = /^m_Local(Position|Rotation|Scale)\.([xyzw])$/.exec(m.path);
@@ -323,13 +428,17 @@ function nodes(f, depth, overrides = null) {
         Object.assign(cur.pos, v.pos); Object.assign(cur.rot, v.rot); Object.assign(cur.scl, v.scl);
         if (v.active !== undefined) cur.active = v.active;
         if (v.props) cur.props = { ...cur.props, ...v.props };
+        if (v.material) cur.material = v.material;
+        if (v.slots) cur.slots = { ...cur.slots, ...v.slots };
+        if (v.slotCount !== undefined) cur.slotCount = v.slotCount;
+        if (v.removed) cur.removed = true;
       }
     }
     const overridden = Object.keys(inner).length > 0;
-    if (overridden && !sub.model) sub = prefab(x.src, depth + 1, inner);
+    if (overridden && sub && !sub.model) sub = prefab(x.src, depth + 1, inner); // (an unreadable source: none)
     // Components added to the instance's stripped root game object (e.g. a MeshFilter).
     const addedGo = Object.keys(f.strippedGo).find(g => f.strippedGo[g] === id);
-    n['pi' + id] = { kind: 'pi', father: alias(x.parent), parentT: x.parent, pos, rot, scl, name, active, sub, overridden, mods: x.mods, addedScripts: f.addedScripts[id] || [], addedScriptBodies: f.addedScriptBodies[id] || [], mesh: addedGo ? f.mesh[addedGo] || null : null, meshOff: addedGo ? !f.shown[addedGo] : false, material: addedGo ? f.material[addedGo] || null : null, textId };
+    n['pi' + id] = { kind: 'pi', father: alias(x.parent), parentT: x.parent, pos, rot, scl, name, active, sub, overridden, mods: x.mods, addedScripts: f.addedScripts[id] || [], addedScriptBodies: f.addedScriptBodies[id] || [], mesh: addedGo ? f.mesh[addedGo] || null : null, meshOff: addedGo ? !f.shown[addedGo] : false, material: addedGo ? f.material[addedGo] || null : null, materials: addedGo ? f.materials[addedGo] || null : null, textId };
   }
   return n;
 }
@@ -340,11 +449,18 @@ function nodes(f, depth, overrides = null) {
 // "<instance>/" for each prefab instance they sit inside.
 const STANDINS = path.join(__dirname, '..', 'scripts');
 const scriptName = guid => { const e = index()[guid]; return e && e.path.endsWith('.cs') ? path.basename(e.path, '.cs') : null; };
-const hasStandIn = name => Boolean(name) && fs.existsSync(path.join(STANDINS, name + '.js'));
+// Listed once: a stand-in added or removed restarts the server (dev.js).
+let standIns = null;
+const hasStandIn = name => {
+  if (!standIns) standIns = new Set(fs.existsSync(STANDINS) ? fs.readdirSync(STANDINS) : []);
+  return Boolean(name) && standIns.has(name + '.js');
+};
 // Scripts layout doesn't run but reads when importing, to do what they do as the game starts
-// (Ken, 2026-10-29): GemLocus and Gem, for the gem each locus makes (tools/gems.js). Their entries
-// (with fields, and instances' overrides of them) are a graph's read, not its scripts.
-const READ = new Set(['GemLocus', 'Gem']);
+// (Ken, 2026-10-29): GemLocus and Gem, for the gem each locus makes (tools/gems.js); GateMini and
+// Lamp, for the lamps a gate shows (scenePieces). Their entries (with fields, and instances'
+// overrides of them) are a graph's read, not its scripts.
+const READ = new Set(['GemLocus', 'Gem', 'GateMini', 'Lamp']);
+const STAGE_FILTERS = new Set(['FilterWithStageData', 'FilterOnStage', 'FilterOnPopulate']);
 // A MonoBehaviour's own fields (its top-level lines, not Unity's m_ ones): numbers, vectors and
 // colors ({x, y, z, w} or {r, g, b, a}), references ({ ref: key } to an object or component in
 // this file, { asset: guid } to an asset, null for none) and the rest as text. Lists and
@@ -371,7 +487,7 @@ function unquote(v) {
 // A script description: { name, id, go, off, fields? }, its keys behind prefix.
 function scriptEntry(guid, body, id, go, off, prefix = '', f = null, props = null) {
   const name = scriptName(guid) || `script ${guid}`;
-  const s = { name, id: prefix + id, go: prefix + go, off: off || /\n {2}m_Enabled: 0/.test(body) };
+  const s = { name, id: prefix + id, go: prefix + go, off: off || (/\n {2}m_Enabled: 0/.test(body) && !(f && f.enabledSpinners.has(body))) };
   if (hasStandIn(name) || READ.has(name)) {
     const fields = { ...scriptFields(body) };
     for (const [k, v] of Object.entries(props || {})) if (!k.includes('.') && k !== 'm_Enabled') fields[k] = v; // an instance's settings
@@ -385,7 +501,7 @@ function scriptEntry(guid, body, id, go, off, prefix = '', f = null, props = nul
 function localRefs(fields, f) {
   const key = id => {
     const inst = f.strippedGo[id] || f.strippedComponent[id];
-    return inst ? `${inst}/${xorId(id, inst)}` : id;
+    return inst ? `${inst}/${sourceIn(f, id, inst)}` : id;
   };
   return Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, v && v.ref ? { ref: key(v.ref) } : v]));
 }
@@ -410,6 +526,7 @@ function graph(f, depth, overrides = null, prefabName = '') {
   const lodGroups = {}, lodOf = {}, lodOfInstance = {};
   // Scripts, and the objects they may name (each one's name, parent, place in the prefab, off).
   const scripts = [], objects = {}, scriptsOf = {}, read = [];
+  const lights = []; // its point Lights that are on: { at (prefab space), color, intensity, range, mask }
   // a transform's id -> its object's key, as objects are added: this file's own, and each nested
   // prefab's (at any depth) by the id Unity gives it here, the instance's id XOR its id there
   const goOfT = {};
@@ -432,6 +549,7 @@ function graph(f, depth, overrides = null, prefabName = '') {
       objects[x.go] = { name: x.name, father, m, off, layer: g.layer || 0, ...(f.colliders[x.go] ? { colliders: f.colliders[x.go] } : {}) };
       const propsOf = id => (overrides && overrides[id] && overrides[id].props) || null;
       for (const [guid, body, sid] of scriptsOf[x.go] || []) addScript(scriptEntry(guid, body, sid, x.go, off, '', f, propsOf(sid)));
+      if (f.lights[x.go] && !off) lights.push({ at: apply(m, [0, 0, 0]).map(v => round3(v)), ...f.lights[x.go], ...(f.lights[x.go].spot ? { dir: turn(m, [0, 0, 0], [0, 0, 1]) } : {}) });
       // A particle system, for the ParticleSystem stand-in (tools/particles.js describes it): only one
       // that plays by itself (on awake); the rest wait for game events layout doesn't run, and the
       // Tangle has some 1400 of them.
@@ -463,7 +581,7 @@ function graph(f, depth, overrides = null, prefabName = '') {
       const mesh = describeMesh(x.mesh);
       // off: not drawn (an inactive object, or no enabled renderer); rendererOff: no enabled
       // renderer, which is all GridRender checks (it draws a tree's chunks under its inactive Parts).
-      const part = { mesh, m, material: x.material, object: x.name, prefab: prefabName, off: off || x.meshOff, rendererOff: Boolean(x.meshOff), go: x.go, ...Cond().gameFields(terms, x.meshOff || rules.hidden.has(id)) };
+      const part = { mesh, m, material: x.material, ...(x.materials ? { materials: x.materials } : {}), object: x.name, prefab: prefabName, off: off || x.meshOff, rendererOff: Boolean(x.meshOff), go: x.go, ...((f.go[x.go] || {}).layer ? { layer: f.go[x.go].layer } : {}), ...Cond().gameFields(terms, x.meshOff || rules.hidden.has(id)) };
       if (lodOf[x.go]) part.lod = lodOf[x.go];
       else {
         // LODs are named on the object (Lod0, ring_LOD1) or on the mesh (Rock_Lod2).
@@ -477,6 +595,7 @@ function graph(f, depth, overrides = null, prefabName = '') {
       const outer = lodOfInstance[inst];
       for (const p of x.sub.parts) parts.push({ ...withoutGame(p), ...Cond().gameFields(terms.concat(p.when || []), Boolean(p.never)), m: mul(m, p.m), off: off || p.off, ...(p.go ? { go: inst + '/' + p.go } : {}), ...(p.lod ? { lod: { key: inst + '/' + p.lod.key, levels: p.lod.levels } } : outer ? { lod: { key: outer.key, levels: outer.levels } } : {}) });
       const prefix = inst + '/';
+      if (!off) for (const l of x.sub.lights || []) if (!l.off) lights.push({ ...l, at: apply(m, l.at).map(v => round3(v)), ...(l.dir ? { dir: turn(m, l.at, l.dir) } : {}) });
       for (const s of x.sub.read || []) read.push({ ...s, id: prefix + s.id, go: prefix + s.go, off: off || s.off, fields: prefixRefs(s.fields || {}, prefix) });
       for (const s of x.sub.scripts || []) scripts.push({ ...s, id: prefix + s.id, go: prefix + s.go, off: off || s.off, ...(s.fields ? { fields: prefixRefs(s.fields, prefix) } : {}), ...(s.lod ? { lod: { key: prefix + s.lod.key, levels: s.lod.levels } } : outer ? { lod: { key: outer.key, levels: outer.levels } } : {}) });
       for (const [k, o] of Object.entries(x.sub.objects || {})) objects[prefix + k] = { ...o, father: o.father ? prefix + o.father : father, m: mul(m, o.m), off: off || o.off };
@@ -490,7 +609,18 @@ function graph(f, depth, overrides = null, prefabName = '') {
       }
       for (const [k, sg] of Object.entries(x.sub.lodGroups || {})) lodGroups[inst + '/' + k] = { center: apply(m, sg.center), size: sg.size * maxScale(m), scale: sg.scale * maxScale(m), heights: sg.heights };
     }
-    for (const c of children[id] || []) visit(c, mul(m, trs(n[c].pos, n[c].rot, n[c].scl)), off, terms);
+    for (const c of children[id] || []) {
+      // one parented to an object inside this nested instance (NoteLore's stone, under its NoteBase's
+      // paper) hangs from that object, its placement and scale (Claude, 2026-11-03: it hung from the
+      // instance's root, unflattened, three meters long)
+      let pm = m, poff = off;
+      if (x.kind === 'pi' && x.sub && f.strippedT[n[c].parentT] === id.slice(2)) {
+        const key = x.sub.objectOfT && x.sub.objectOfT[sourceIn(f, n[c].parentT, id.slice(2))];
+        const o = key && x.sub.objects && x.sub.objects[key];
+        if (o) { pm = mul(m, o.m); poff = off || o.off; }
+      }
+      visit(c, mul(pm, trs(n[c].pos, n[c].rot, n[c].scl)), poff, terms);
+    }
   };
   visit(root, I(), false, []);
   // Of sibling LODs no LODGroup covers, keep the most detailed present (a prefab may hold only its Lod3).
@@ -514,8 +644,16 @@ function graph(f, depth, overrides = null, prefabName = '') {
   // XOR its own there), so overrides of their settings from further out can be kept.
   const fileId = key => key.split('/').reduceRight((id, k) => (id === null ? k : xorId(k, id)), null);
   const componentIds = new Set([...scripts, ...read].filter(s => s.fields && !/\/added|^added/.test(s.id)).flatMap(s => [s.id, s.renderer ? (s.id.includes('/') ? s.id.split('/').slice(0, -1).join('/') + '/' + s.renderer : s.renderer) : null]).filter(Boolean).map(fileId));
-  return { rootId, rootGoId, rootTrs: { pos: r.pos, rot: r.rot, scl: r.scl }, parts, lodGroups, scripts, objects, componentIds, read, objectOfT: goOfT };
+  return { rootId, rootGoId, rootTrs: { pos: r.pos, rot: r.rot, scl: r.scl }, parts, lodGroups, scripts, objects, componentIds, read, objectOfT: goOfT, lights };
 }
+const round3 = v => Math.round(v * 1000) / 1000;
+// A direction at a point, through a matrix: where the point plus it lands, less where the point
+// lands, made unit length.
+const turn = (m, at, dir) => {
+  const a = apply(m, at), b = apply(m, [at[0] + dir[0], at[1] + dir[1], at[2] + dir[2]]);
+  const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], n = Math.hypot(...d) || 1;
+  return d.map(v => round3(v / n));
+};
 const withoutGame = ({ when, never, ...rest }) => rest;
 // A point through a row-major 4x4 matrix, and the matrix's largest axis scale.
 const apply = (m, p) => { const [x, y, z] = Array.isArray(p) ? p : [p.x, p.y, p.z]; return [0, 1, 2].map(r => m[r * 4] * x + m[r * 4 + 1] * y + m[r * 4 + 2] * z + m[r * 4 + 3]); };
@@ -527,6 +665,16 @@ const maxScale = m => Math.max(...[0, 1, 2].map(c => Math.hypot(m[c], m[4 + c], 
 // its gate in the game (tools/conditions.js gameFields); moved: where the effects its triggers
 // play put it ({ when, pos, rot, scl }), when any do.
 function scenePieces(sceneFile) {
+  const { mtimeMs, size } = fs.statSync(sceneFile), stamp = `${mtimeMs}:${size}`;
+  const kept = sceneCache.get(sceneFile);
+  if (kept && kept.stamp === stamp) return kept.pieces;
+  const pieces = readScenePieces(sceneFile);
+  sceneCache.delete(sceneFile);
+  sceneCache.set(sceneFile, { stamp, pieces });
+  if (sceneCache.size > SCENES_KEPT) sceneCache.delete(sceneCache.keys().next().value);
+  return pieces;
+}
+function readScenePieces(sceneFile) {
   const f = parse(fs.readFileSync(sceneFile, 'utf8'));
   const n = nodes(f, 0);
   const rules = Cond().rulesOf(f);
@@ -550,7 +698,11 @@ function scenePieces(sceneFile) {
     const x = n[id];
     if (!x) return { pos: { x: 0, y: 0, z: 0 }, rot: { x: 0, y: 0, z: 0, w: 1 }, scl: { x: 1, y: 1, z: 1 }, path: '', active: true, terms: [], movedBy: [] };
     cache[id] = { pos: x.pos, rot: x.rot, scl: x.scl, path: '(cycle)', active: true, terms: [], movedBy: [] };
-    const p = x.father === '0' ? null : world(x.father, alt);
+    let p = x.father === '0' ? null : world(x.father, alt);
+    // parented to an object inside a prefab instance (Thrusters under RuinShaman's): it hangs from
+    // that object, not the instance's root (Claude, 2026-11-03); the path stays the instance's
+    const inner = p && innerParent(f, n, x.parentT);
+    if (inner) p = { ...p, ...compose(p, inner, p.path, p.active && !inner.off) };
     let w = !p ? { pos: x.pos, rot: x.rot, scl: x.scl, path: x.name, active: x.active } : compose(p, x, p.path + '/' + x.name, p.active && x.active);
     w.terms = (p ? p.terms : []).concat(Cond().nodeTerms(rules, id, x.active), revealOf[id] || []);
     w.movedBy = p ? p.movedBy : [];
@@ -580,18 +732,95 @@ function scenePieces(sceneFile) {
     if (x.kind !== 'pi' || !world(id).active) continue;
     for (const m of x.mods) if (m.path === 'thingGuarded' && m.ref && f.strippedComponent[m.ref]) guards['pi' + f.strippedComponent[m.ref]] = (guards['pi' + f.strippedComponent[m.ref]] || 0) + 1;
   }
-  const out = [];
+  const out = [], pieceOf = {};
   for (const [id, x] of Object.entries(n)) {
+    // a plain object with a point Light and no mesh: a piece that is only its light
+    if (x.kind === 't' && !x.mesh && f.lights[x.go] && world(id).active) { const w = world(id); out.push({ piece: x.name || 'Light', lightOnly: true, lights: [{ at: [0, 0, 0], ...f.lights[x.go], ...(f.lights[x.go].spot ? { dir: [0, 0, 1] } : {}) }], object: x.name, go: x.go, ...w, game: game(id) }); continue; }
     if (x.kind === 't' && !x.mesh) continue;
     const w = world(id);
-    if (x.kind === 'pi') out.push({ piece: x.sub ? x.sub.name : x.name, prefab: x.sub, overridden: x.overridden, mods: x.mods, addedScripts: x.addedScripts, addedScriptBodies: x.addedScriptBodies, ...w, textId: x.textId, guards: guards[id] || 0, game: game(id) });
+    // instance and go: the piece's PrefabInstance or GameObject id in the scene file (tools/uses.js --live)
+    if (x.kind === 'pi') out.push(pieceOf[id] = { piece: x.sub ? x.sub.name : x.name, prefab: x.sub, instance: id.slice(2), overridden: x.overridden, mods: x.mods, addedScripts: x.addedScripts, addedScriptBodies: x.addedScriptBodies, ...w, textId: x.textId, guards: guards[id] || 0, game: game(id) });
     else {
       const mesh = describeMesh(x.mesh);
       if (isLodBeyondZero(mesh.name)) continue;
-      out.push({ piece: mesh.name, mesh, material: x.material, object: x.name, meshOff: x.meshOff, ...w, textId: x.textId, game: game(id, x.meshOff || rules.hidden.has(id)) });
+      out.push({ piece: mesh.name, mesh, layer: (f.go[x.go] || {}).layer || 0, material: x.material, ...(x.materials ? { materials: x.materials } : {}), object: x.name, go: x.go, meshOff: x.meshOff, ...w, textId: x.textId, game: game(id, x.meshOff || rules.hidden.has(id)) });
     }
   }
+  sceneChildScripts(f, n, pieceOf);
+  gateLamps(f, n, pieceOf, sceneFile);
   return out;
+}
+
+// A stand-in script on a mesh-less game object a scene hangs under a prefab instance (Claude,
+// 2026-11-08: TangleScene's Dagger has a child "Spinner" whose Spinner turns the dagger) joins that
+// instance's scripts, on the object it hangs from. Its references into the instance (stripped ids)
+// become the prefab's own keys, as the instance's other scripts use.
+function sceneChildScripts(f, n, pieceOf) {
+  const nodeOfGo = {};
+  for (const x of Object.values(n)) if (x.kind === 't') nodeOfGo[x.go] = x;
+  for (const [g, guid, body, sid] of f.scripts) {
+    const x = nodeOfGo[g];
+    if (!x || x.mesh || !hasStandIn(scriptName(guid))) continue;
+    const inst = f.strippedT[x.parentT], piece = inst && pieceOf['pi' + inst];
+    if (!piece || !piece.prefab) continue;
+    const sub = piece.prefab, srcT = sourceIn(f, x.parentT, inst);
+    const on = srcT === sub.rootId ? sub.rootGoId : sub.objectOfT && sub.objectOfT[srcT];
+    if (!on) continue;
+    const s = scriptEntry(guid, body, 'scene' + sid, on, !x.active, '', f);
+    if (s.fields) {
+      s.fields = Object.fromEntries(Object.entries(s.fields).map(([k, v]) => {
+        const [i, inner] = v && v.ref ? v.ref.split('/') : [];
+        return [k, inner && i === inst ? { ref: inner } : v];
+      }));
+    }
+    piece.prefab = { ...sub, scripts: [...(sub.scripts || []), s] };
+  }
+}
+
+// A GateMini's lamps in the game (Ken, 2026-11-03: the spikes on the Approach's gate): only its
+// first depositsRequired lamps (the Lamps under its lampParent, in order) show, each unlit (its
+// lampOn off), and only while the gate runs, in its own stage (GateMini.OnStateRunning,
+// FindLamps); dormant before it and complete after, it hides them all. The gate's stage is its
+// appearStageId: its nearest stage filter's, else (Reliable.appearStageId) Stage.First in
+// Game.unity, and in a biome's scene that scene's stage (the filter the scene's region has). The
+// lamps' parts get these as game fields, on the piece holding the lampParent (a scene may point it
+// at an object of another instance: the Approach's BeechGate at its BeechMini's flowers).
+function gateLamps(f, n, pieceOf, sceneFile) {
+  const C = Cond(), stages = C.stageIds(), scene = path.basename(sceneFile, '.unity');
+  const nameOf = id => Object.keys(stages).find(k => stages[k] === id);
+  const stageOf = id => {
+    for (let k = id, i = 0; k && k !== '0' && n[k] && i < 200; k = n[k].father, i++) {
+      const x = n[k];
+      const filter = x.kind === 't' && f.scripts.find(([g, guid]) => g === x.go && STAGE_FILTERS.has(scriptName(guid)));
+      if (filter) return nameOf(+((/\n {2}stageId: (\d+)/.exec(filter[2]) || [])[1] || 0));
+    }
+    const own = Config().load(scene).stage || (C.sceneStage(scene, stages) || {}).name;
+    return own || nameOf(0);
+  };
+  for (const [id, x] of Object.entries(n)) {
+    // (GateMini sits on its prefab's root, a Gate instance's, added there: the scene's settings of it
+    // are this instance's mods)
+    const gate = x.kind === 'pi' && x.sub && (x.sub.read || []).find(s => s.name === 'GateMini');
+    if (!gate) continue;
+    const mod = x.mods.find(m => m.path === 'lampParent' && m.ref), count = x.mods.find(m => m.path === 'depositsRequired');
+    const inst = mod && f.strippedGo[mod.ref];
+    const holder = pieceOf[inst ? 'pi' + inst : id];
+    const lampParent = inst ? f.sourceGo[mod.ref] : gate.fields.lampParent && gate.fields.lampParent.ref;
+    if (!holder || !holder.prefab || !lampParent) continue;
+    const sub = holder.prefab, objects = sub.objects || {};
+    const chain = key => { const out = []; for (let k = key, i = 0; k && i < 200; k = objects[k] && objects[k].father, i++) out.push(k); return out; };
+    const lamps = (sub.read || []).filter(s => s.name === 'Lamp' && chain(s.go).includes(lampParent));
+    const shown = Number(count ? count.value : gate.fields.depositsRequired) || 0, running = `StageName="${stageOf(id)}"`;
+    const parts = sub.parts.map(p => {
+      const up = chain(p.go);
+      if (!up.includes(lampParent)) return p;
+      const lamp = lamps.findIndex(l => up.includes(l.go));
+      const lampOn = lamp >= 0 && lamps[lamp].fields.lampOn && lamps[lamp].fields.lampOn.ref;
+      if (p.never || lamp >= shown || (lampOn && up.includes(lampOn))) return { ...withoutGame(p), never: true };
+      return { ...p, when: (p.when || []).concat(running) };
+    });
+    holder.prefab = { ...sub, parts };
+  }
 }
 
 // A gridded tree's LOD settings, from the prefab file holding its chunks (by name): its GridGroup's
@@ -636,4 +865,4 @@ function prefabByName(name) {
   return hits.length ? prefab(hits[0][0]) : null;
 }
 
-module.exports = { REPO, READER, index, scriptName, scriptFields, xorId, refreshIndex, I, mul, trs, qmul, eulerToQuat, quatToEuler, parse, prefab, prefabByName, modelInstance, scenePieces, describeMesh, isLodBeyondZero, gridSettings, maxScale, scriptGuid };
+module.exports = { decompose, innerParent, REPO, READER, index, scriptName, scriptFields, xorId, refreshIndex, I, mul, trs, qmul, eulerToQuat, quatToEuler, parse, prefab, prefabByName, modelInstance, scenePieces, describeMesh, isLodBeyondZero, gridSettings, maxScale, scriptGuid };

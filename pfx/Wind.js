@@ -26,13 +26,13 @@ Tickable.register("Wind", class extends Pfx {
     static singleton = true;
     static space = "world";
     static params = {
-        rate: 1.2,            // the steady wind's lines a second, at strength 1 (medium)
+        rate: 0.4,            // the steady wind's lines a second, at strength 1 (medium); a third of what it was (Ken, 2026-11-03)
         life: 10,             // seconds from the head starting to the tail being eaten up
         max: 60,
         view: [4, 25],        // how far from the camera the point in view it passes through lies
         behind: [10, 30],     // how far upwind of that point the head starts, at most (the first is unused)
         speed: 5,             // the steady wind's lines' head, at strength 1 (strong)
-        gustRate: 3,          // a gust's lines a second, at strength 1
+        gustRate: 1,          // a gust's lines a second, at strength 1; a third of what it was (Ken, 2026-11-03)
         gustLife: 5,          // seconds a gust's line lasts
         gustInside: 0.7,      // the share of a gust's radius its lines start within
         weave: [0.2, 7],      // up and down: the most drift per meter travelled, wavelength

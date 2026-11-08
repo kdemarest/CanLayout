@@ -21,6 +21,7 @@ Tickable.register("Sun", class extends Tickable {
         const [x, y, z] = env.sunDirection;
         this.light.position.set(-x, y, z).normalize(); // Unity's world is Three.js's with X mirrored
         this.light.color.set(env.sunColor);
+        this.light.intensity = Math.PI * (env.sunIntensity ?? 1); // the mood's, live (web/environment.js)
         // Canopy's ambient is a gray as Unity's inspector shows it (sRGB), as web/surface.js takes it
         this.ambient.color.setRGB(env.ambient, env.ambient, env.ambient, this.THREE.SRGBColorSpace);
     }

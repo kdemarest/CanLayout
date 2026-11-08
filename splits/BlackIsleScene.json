@@ -1,0 +1,35 @@
+{
+  "about": "Black Isle out of OakScene (Ken, 2026-11-03: the thrusters, the ruins below them, the ink ejector enemies and everything at the bottom of the two big ruin stones, such as the tablet and fuel bottle: all of WhiteOak/Device-Thrusters), placed where Ken probed (2026-11-03T02:38:26.967Z: the hit at 44.464 155.313 -43.116, on a Beech bouncer seen from Hawthorn) plus ten meters on along the camera's direction. The point midway between the two big stones' bases (ThrusterShaman, WardingShaman) goes there; nothing is turned. node tools/split-scene.js splits/BlackIsleScene.json BlackIsle gets a copy of WhiteOak's FilterOnPopulate (stage Oak and beyond), so the pieces appear when they did. Its BlackIsleSceneTracker links it to OakBiome's region, as OakSceneTracker does Oak (Claude, 2026-11-03: the split had left it without one; Hawthorn has no region of its own yet).",
+  "scene": "OakScene",
+  "anchor": "OakSceneAnchor",
+  "newScene": "BlackIsleScene",
+  "newAnchor": "BlackIsleSceneAnchor",
+  "groups": [],
+  "create": [
+    {
+      "side": "new",
+      "path": "BlackIsle",
+      "from": [
+        -72.37,
+        180.93,
+        -58.61
+      ],
+      "to": [
+        53.96,
+        152.68,
+        -44.82
+      ],
+      "componentsOf": "WhiteOak"
+    }
+  ],
+  "toNew": [
+    {
+      "path": "WhiteOak/Device-Thrusters",
+      "into": "BlackIsle"
+    }
+  ],
+  "tracker": {
+    "name": "BlackIsleSceneTracker",
+    "linkToName": "OakBiome"
+  }
+}

@@ -29,6 +29,9 @@
 //   hide        rules removing objects
 //   symbols     progress flags code sets at run time, for the page's conditions (tools/conditions.js
 //               symbols): { "Underwater": 0 }, in every mode; a composed scene's "- Symbols:" win
+//   stage       the stage a scene plays in when its name (<Stage>Scene) is not one of StageId's,
+//               for Stage and StageName in the page's conditions: "Oak" for HawthornScene, split
+//               from OakScene and played in the Oak stage until it has its own (Claude, 2026-11-03)
 //   include     scenes (docs/scenes) every scene from Canopy includes: an imported area, or a
 //               composed scene on one (["World"]: its Sea, Wind and Sky)
 //   environment what Canopy's shaders get (ShaderVars.cs) and its sky, for the page:
@@ -39,7 +42,10 @@
 //               scene whose biome sets its own, as a BiomeZone does, says so, e.g. TutorialScene's
 //               200.48). The sea itself is Sea.prefab, run by layout/scripts' stand-ins. The game
 //               sets the light per biome and mood at run time, so those are stand-ins; per scene the
-//               values merge.
+//               values merge. live (true): the page works the sun, ambient, fog and sky out each
+//               frame from where the camera is, as the game's EnvironmentManager does from its
+//               BiomeZones' moods (tools/moods.js, web/environment.js; Claude, 2026-11-03), and
+//               these values stand only until it has; false keeps them.
 // A rule is "kind:pattern", * matching anything. Kinds: prefab (a piece's prefab, or
 // "Prefab/Object" for an object inside it), object, mesh, material, folder (prefab or mesh
 // folder, e.g. "Prefabs/PFX").
@@ -49,7 +55,7 @@ const path = require('path');
 const FILE = path.join(__dirname, '..', 'unity.json');
 const KINDS = ['prefab', 'object', 'mesh', 'material', 'folder'];
 const ENVIRONMENT = {
-  sunDirection: [-0.4, 1, 0.6], sunColor: '#ffffff', ambient: 0.5, fogColor: '#808080', fogDensity: 0.014,
+  live: true, sunDirection: [-0.4, 1, 0.6], sunColor: '#ffffff', sunIntensity: 1, ambient: 0.5, fogColor: '#808080', fogDensity: 0.014,
   seaLevel: null, sky: 'CanSky',
   // CanSky.shader's globals, as Game.unity's EnvironmentManager sets them from the head's height
   // y (ManageSky): fog color below y + skyBlendMin, blending to the sky texture from y + skyBlendMax
@@ -72,7 +78,8 @@ const ENVIRONMENT = {
   // 1, as long as each other); near: the share of it all at the eye, growing to all of it at
   // nearDistance m (calm close up, against VR sickness: Ken, 2026-10-31); fadeDistance (m: no sway
   // beyond it, full to half of it).
-  leafWind: { sway: 0.6, flutter: 0.15, frequency: 1.5, gustLength: 12, gustSpeed: 4, gustShape: 2, near: 0.25, nearDistance: 8, fadeDistance: 1000 }
+  // sway and flutter an eighth of what they were (Ken, 2026-11-02: 25% as vigorous, then half that)
+  leafWind: { sway: 0.075, flutter: 0.01875, frequency: 1.5, gustLength: 12, gustSpeed: 4, gustShape: 2, near: 0.25, nearDistance: 8, fadeDistance: 1000 }
 };
 
 function load(scene) {
@@ -99,6 +106,7 @@ function load(scene) {
     show: [...rules(d.show), ...rules(s.show)],
     hide: [...rules(d.hide), ...rules(s.hide)],
     include: s.include ?? d.include ?? [],
+    stage: s.stage ?? d.stage ?? null,
     symbols: { ...d.symbols, ...s.symbols },
     environment: { ...ENVIRONMENT, ...d.environment, ...s.environment, leafWind: { ...ENVIRONMENT.leafWind, ...(d.environment || {}).leafWind, ...(s.environment || {}).leafWind } }
   };

@@ -16,11 +16,13 @@ const Config = require('./config.js');
 const Timing = require('./timing.js');
 const Shapes = require('./shapes.js');
 const Gems = require('./gems.js');
+const Convert = require('./convert-materials.js');
 const crypto = require('crypto');
 
 const ROOT = path.join(__dirname, '..');
 const CACHE = path.join(ROOT, 'cache');
 const LIBRARY = path.join(CACHE, 'pieces.json');
+const SUBMESHES = crypto.createHash('sha1').update('submeshes').digest('hex').slice(0, 8);
 const MESHES = path.join(CACHE, 'meshes');
 const TEXTURES = path.join(CACHE, 'textures');
 const MATERIALS = path.join(CACHE, 'materials.json');
@@ -53,11 +55,9 @@ function parsePieceLines(text) {
   });
   return { pieces, errors };
 }
-// "- Area: <Scene> <Name>": the imported area a composed scene is built on, or null.
-function areaLine(text) {
-  const m = /^\s*-\s*Area:\s*(.+?)\s*$/m.exec(String(text || ''));
-  return m ? m[1] : null;
-}
+// "- Area: <Scene> <Name>" lines: the imported areas a composed scene is built on, the first
+// giving its Unity scene's settings (Claude, 2026-11-03: several, e.g. Beech beside Hawthorn).
+const areaLines = text => [...String(text || '').matchAll(/^\s*-\s*Area:\s*(.+?)\s*$/gm)].map(m => m[1]);
 // "- Origin: x y z": an assemblage's root (the point its prefab is built around), or null.
 function originLine(text) {
   const m = /^\s*-\s*Origin:\s*(\S+)\s+(\S+)\s+(\S+)\s*$/m.exec(String(text || ''));
@@ -356,8 +356,8 @@ function extractArea(scene, center, half, terrainOnly = false) {
   const trees = treeChunks(all, center, half, cfg);
   // Plain-mesh pieces are named by their mesh; remember how they resolve.
   const lib = library();
-  const meshPart = p => ({ mesh: p.mesh, m: U.I(), material: p.material || null, object: p.object, prefab: '', off: Boolean(p.meshOff) });
-  for (const p of found) if (!p.prefab && !lib[p.piece]) lib[p.piece] = { kind: 'mesh', source: p.mesh.path || p.mesh.kind, parts: [meshPart(p)] };
+  const meshPart = p => ({ mesh: p.mesh, m: U.I(), ...(p.layer ? { layer: p.layer } : {}), material: p.material || null, ...(p.materials ? { materials: p.materials } : {}), object: p.object, prefab: '', off: Boolean(p.meshOff) });
+  for (const p of found) if (!p.prefab && !p.lightOnly && !lib[p.piece]) lib[p.piece] = { kind: 'mesh', source: p.mesh.path || p.mesh.kind, parts: [meshPart(p)] };
   writeLibrary(lib);
   const place = (p, parts, extra, lodGroups) => {
     const e = U.quatToEuler(p.rot);
@@ -373,6 +373,8 @@ function extractArea(scene, center, half, terrainOnly = false) {
       extra: [p.textId ? `textId ${p.textId}` : '', p.active ? '' : 'inactive', p.guards ? `guards ${p.guards}` : '', extra || ''].filter(Boolean).join(', '),
       // in the game (web/conditions.js): never on, or on while its when holds; moved, where its triggers put it
       ...gamePlacement(p.game),
+      // its point Lights (More Lights phase 4), in its own space as its parts' matrices are
+      ...(((p.prefab && p.prefab.lights) || p.lights || []).length ? { lights: (p.prefab && p.prefab.lights) || p.lights } : {}),
       // its C# scripts that have stand-ins (their URLs are added when a scene loads), and the objects they move
       ...(p.prefab && (p.prefab.scripts || []).some(s => s.fields) ? { scripts: p.prefab.scripts.filter(s => s.fields), ...(p.prefab.objects ? { objects: p.prefab.objects } : {}) } : {})
     };
@@ -385,7 +387,7 @@ function extractArea(scene, center, half, terrainOnly = false) {
     if (trees.some(t => t.piece === imported)) continue;
     // a gem locus brings the gem the game makes on it (tools/gems.js)
     const p = imported.prefab ? { ...imported, prefab: Gems.withGem(imported.prefab, imported.scl) } : imported;
-    const parts = p.prefab ? p.prefab.parts : [meshPart(p)];
+    const parts = p.prefab ? p.prefab.parts : p.lightOnly ? [] : [meshPart(p)];
     const shown = Config.visibleParts(cfg, p.piece, parts, materialName);
     if (parts.length && !shown.length) continue;
     pieces.push(place(p, p.prefab ? servedParts(p.prefab, shown) : shown, '', groupsFor(shown, p.prefab && p.prefab.lodGroups, ((p.prefab && p.prefab.scripts) || []).filter(s => s.fields))));
@@ -399,10 +401,24 @@ function saveArea(name, area) {
 }
 
 // ---------- piece library and meshes ----------
-const library = () => (fs.existsSync(LIBRARY) ? JSON.parse(fs.readFileSync(LIBRARY, 'utf8')) : {});
+// The library, kept in memory while its file is as this process last read or wrote it (another
+// tool may write it too), and written only when it changed: a load prepares a dozen times, and
+// each read and wrote its 2 MB (Ken, 2026-11-04: a reload took 12 s).
+let libraryKept = null; // { lib, text, stamp }
+const libraryStamp = () => { try { const st = fs.statSync(LIBRARY); return `${st.mtimeMs}:${st.size}`; } catch { return null; } };
+function library() {
+  const stamp = libraryStamp();
+  if (libraryKept && libraryKept.stamp === stamp) return libraryKept.lib;
+  const text = stamp ? fs.readFileSync(LIBRARY, 'utf8') : '{}';
+  libraryKept = { lib: JSON.parse(text), text, stamp };
+  return libraryKept.lib;
+}
 function writeLibrary(lib) {
+  const text = JSON.stringify(lib);
+  if (libraryKept && libraryKept.lib === lib && libraryKept.text === text && libraryKept.stamp === libraryStamp()) return;
   fs.mkdirSync(CACHE, { recursive: true });
-  fs.writeFileSync(LIBRARY, JSON.stringify(lib));
+  fs.writeFileSync(LIBRARY, text);
+  libraryKept = { lib, text, stamp: libraryStamp() };
 }
 const git = (args, input, env) => execFileSync('git', GIT.concat(args), { input, maxBuffer: 1 << 30, env: { ...process.env, ...env } });
 // cat-file --batch output -> Map(id -> Buffer)
@@ -480,14 +496,19 @@ function prepare(names, extraParts = []) {
       // Unity prefab even where a layout prefab shares its name).
       const model = /\.(fbx|obj)$/i.test(name) && Object.entries(index()).find(([, e]) => e.path.endsWith('/' + name));
       const p = Timing.time('prefabs', () => (model ? U.modelInstance(model[0], []) : U.prefabByName(name.replace(/\.prefab$/i, ''))));
-      if (p) lib[name] = { kind: model ? 'model' : 'prefab', source: p.path, parts: servedParts(p, p.parts), takesText: Boolean(p.takesText), lodGroups: p.lodGroups || {}, ...scriptsOf(p) };
+      if (p) lib[name] = { kind: model ? 'model' : 'prefab', source: p.path, parts: servedParts(p, p.parts), takesText: Boolean(p.takesText), lodGroups: p.lodGroups || {}, ...((p.lights || []).length ? { lights: p.lights } : {}), ...scriptsOf(p) };
     }
     if (lib[name]) out[name] = { ...lib[name], parts: Config.visibleParts(cfg, name, lib[name].parts, materialName) };
   }
   const allParts = [...Object.values(out).flatMap(e => e.parts), ...extraParts];
-  const wanted = new Map();
+  // A part with several materials takes its own file, which knows its submeshes (those converted
+  // before they were written out stay as they are, under the plain name).
+  const assetFile = p => (p.materials ? `${p.mesh.blob}-${SUBMESHES}` : p.mesh.blob) + '.obj';
+  const wanted = new Map(), wantedFiles = new Map();
   for (const part of allParts) {
-    if (part.mesh.kind === 'asset' && part.mesh.blob && !cached(MESHES, part.mesh.blob + '.obj')) wanted.set(part.mesh.blob, part.mesh.name);
+    if (part.mesh.kind !== 'asset' || !part.mesh.blob || cached(MESHES, assetFile(part))) continue;
+    wanted.set(part.mesh.blob, part.mesh.name);
+    wantedFiles.set(part.mesh.blob, new Set([...(wantedFiles.get(part.mesh.blob) || []), assetFile(part)]));
   }
   fs.mkdirSync(MESHES, { recursive: true });
   const candidateFiles = new Map(allParts.filter(p => p.mesh.file).map(p => [p.mesh.blob, p.mesh.file]));
@@ -495,8 +516,11 @@ function prepare(names, extraParts = []) {
   for (const b of wanted.keys()) if (candidateFiles.has(b)) fromCanopy.set(b, fs.readFileSync(candidateFiles.get(b)));
   for (const [blob, data] of fromCanopy) {
     try {
-      fs.writeFileSync(path.join(MESHES, blob + '.obj'), Timing.time('meshes converted', () => assetToObj(data.toString(), wanted.get(blob))));
-      written(MESHES, blob + '.obj');
+      const obj = Timing.time('meshes converted', () => assetToObj(data.toString(), wanted.get(blob)));
+      for (const file of wantedFiles.get(blob)) {
+        fs.writeFileSync(path.join(MESHES, file), obj);
+        written(MESHES, file);
+      }
       Timing.count('meshes converted');
     } catch (error) {
       problems.push(`${wanted.get(blob)}: ${error.message}`);
@@ -504,7 +528,7 @@ function prepare(names, extraParts = []) {
   }
   // FBX models: one OBJ per model used, named by the file's blob and the model.
   const fbxParts = allParts.filter(p => p.mesh.kind === 'model' && !p.mesh.whole && p.mesh.blob && /\.fbx$/i.test(p.mesh.path));
-  const fbxKey = p => `${p.mesh.blob}-${crypto.createHash('sha1').update(`${p.mesh.listed ? p.mesh.name : ''}|${p.object || ''}|${p.mesh.fileID || ''}${/^43\d{5}$/.test(p.mesh.fileID || '') ? '' : '|hashed'}`).digest('hex').slice(0, 8)}`;
+  const fbxKey = p => `${p.mesh.blob}-${crypto.createHash('sha1').update(`${p.mesh.listed ? p.mesh.name : ''}|${p.object || ''}|${p.mesh.fileID || ''}${/^43\d{5}$/.test(p.mesh.fileID || '') ? '' : '|hashed'}|submeshes`).digest('hex').slice(0, 8)}`;
   const fbxWanted = fbxParts.filter(p => !cached(MESHES, fbxKey(p) + '.obj'));
   const fbxFiles = blobs([...new Set(fbxWanted.map(p => p.mesh.blob))]);
   const idx = index();
@@ -554,7 +578,7 @@ function prepare(names, extraParts = []) {
       part.obj = cached(MESHES, fbxKey(part) + '.obj') ? `meshes/${fbxKey(part)}.obj` : null;
       continue;
     }
-    part.obj = part.mesh.kind === 'asset' && cached(MESHES, part.mesh.blob + '.obj') ? `meshes/${part.mesh.blob}.obj` : null;
+    part.obj = part.mesh.kind === 'asset' && cached(MESHES, assetFile(part)) ? `meshes/${assetFile(part)}` : null;
   }
   // Parts cut to an area's cube (a tree's leaves): keep the triangles whose center is inside.
   for (const part of allParts) {
@@ -565,7 +589,15 @@ function prepare(names, extraParts = []) {
     part.obj = `meshes/${part.mesh.blob}-${key}.obj`;
   }
   writeLibrary(lib);
-  const materials = prepareMaterials(allParts.map(p => p.material).filter(Boolean), problems, cfg.maxTexture);
+  const materials = prepareMaterials(allParts.flatMap(p => [p.material, ...(p.materials || [])]).filter(Boolean), problems, cfg.maxTexture);
+  // A material tools/convert-materials.js moved onto a Canopy shader carries its copy as it was,
+  // on Unity's, as unity: ☰ View › Unity's shaders draws that (More Lights phase 3).
+  const pairs = new Map(Convert.switchPairs());
+  const converted = Object.keys(materials).filter(g => pairs.has(g));
+  if (converted.length) {
+    const copies = prepareMaterials(converted.map(g => pairs.get(g)), problems, cfg.maxTexture);
+    for (const g of converted) materials[g] = { ...materials[g], unity: copies[pairs.get(g)] || null };
+  }
   return { library: out, materials, problems };
 }
 
@@ -640,16 +672,28 @@ const index = () => shared.index || (shared.index = JSON.parse(fs.readFileSync(p
 // What a cache folder holds (paths relative to it, recursively), read once a request: on shared
 // storage each existsSync costs about as much as listing a folder, and a load checked thousands
 // (2026-10-29). Files a request writes are noted in it (written).
+// Kept across requests too (listings), while none of its folders has changed (a folder's time
+// changes when a file is added to it or removed): walking them took a second or two a load
+// (Ken, 2026-11-04).
+const listings = new Map(); // dir -> { out, folders: Map(folder, mtime) }
 function listing(dir) {
   const key = 'list:' + dir;
   if (!shared[key]) {
-    const out = new Set();
+    const kept = listings.get(dir);
+    const mtime = d => { try { return fs.statSync(d).mtimeMs; } catch { return -1; } };
+    if (kept && Timing.time('cache listings checked', () => [...kept.folders].every(([d, t]) => mtime(d) === t))) {
+      shared[key] = kept.out;
+      return kept.out;
+    }
+    const out = new Set(), folders = new Map();
     const walk = (d, rel) => {
       let entries;
+      folders.set(d, mtime(d));
       try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
       for (const e of entries) if (e.isDirectory()) walk(path.join(d, e.name), rel + e.name + '/'); else out.add(rel + e.name);
     };
     Timing.time('cache listings', () => walk(dir, ''));
+    listings.set(dir, { out, folders });
     shared[key] = out;
   }
   return shared[key];
@@ -659,7 +703,7 @@ const written = (dir, name) => listing(dir).add(name);
 // Reads what the viewer needs from a .mat: base color, color texture, normal map, and (for
 // Canopy/General) the detail texture, each texture with its tiling and offset. Bump
 // MATERIAL_PARSER when what it reads changes, so cached materials are read again.
-const MATERIAL_PARSER = 6;
+const MATERIAL_PARSER = 7;
 function parseMaterial(text) {
   text = text.replace(/\r\n/g, '\n');
   const tex = name => {
@@ -702,6 +746,8 @@ function parseMaterial(text) {
     normal1: tex('_Normal1'), normal2: tex('_Normal2'), // the sea's two (SeaSurface, WaterBelow)
     noise: tex('_NoiseTex'), // clouds' and goop's mottling (CloudTextured, Goop)
     detail: general ? tex('_DetailTex') : null,
+    emission: tex('_EmissionMap'), // Standard's emission and GlowLit's constant glow
+    glow: tex('_GlowTex'), // GlowLit's and the glow surface shaders' thresholded glow
     // Every float and color (or vector) property, for surface shaders (web/surface.js).
     values: Object.fromEntries([
       ...[...text.matchAll(/^\s+- (_\w+): (-?[\d.e+-]+)$/gm)].map(m => [m[1], [+m[2]]]),
@@ -717,8 +763,9 @@ const ALPHA_FROM = {
   0: ['-alpha', 'off'],
   2: ['-alpha', 'off', '(', '+clone', '-channel', 'RGB', '-separate', '+channel', '-evaluate-sequence', 'mean', ')', '-compose', 'CopyOpacity', '-composite']
 };
-function storeTexture(data, ext, dest, MAX_TEXTURE, alpha) {
+function storeTexture(data, ext, dest, MAX_TEXTURE, alpha, fromGray) {
   const fmt = { jpg: 'jpg', jpeg: 'jpg', tif: 'tiff', tiff: 'tiff', psd: 'psd', tga: 'tga', png: 'png' }[ext];
+  if (fromGray) return storeNormalFromGray(data, fmt, dest, MAX_TEXTURE, fromGray);
   const run = extra => execFileSync('magick', [`${fmt}:-[0]`, ...extra, '-resize', `${MAX_TEXTURE}x${MAX_TEXTURE}>`, '-depth', '8', dest], { input: data, stdio: ['pipe', 'ignore', 'pipe'] });
   if (ALPHA_FROM[alpha]) return run(ALPHA_FROM[alpha]);
   try {
@@ -726,6 +773,36 @@ function storeTexture(data, ext, dest, MAX_TEXTURE, alpha) {
   } catch {
     run([]); // no extra channel
   }
+}
+// A texture's source and how Unity imports it, for tools/texture-astc.js.
+function textureSource(guid) {
+  const file = workingTreeTextures()[guid], e = index()[guid];
+  return { data: file ? fs.readFileSync(file) : blobs([e.blob]).get(e.blob), ext: /\.(\w+)$/.exec(file || e.path)[1].toLowerCase(), alpha: e.alpha, fromGray: e.fromGray };
+}
+// A Normal Map Unity makes from a gray height map as it imports it (Create from Grayscale), at the
+// source's size, then shrunk: the height is the average of R, G and B; its slope by forward
+// differences (Filtering: Smooth) or a Sobel filter, unnormalized as such filters usually are
+// (Sharp), wrapping at the edges, in steps of 1/255 times Bumpiness (scale); the normal (-slope u,
+// -slope v, 1), v up the image as Unity's is, stored as Unity stores a normal map on Quest (RGB,
+// n / 2 + 1/2). Unity's own formula isn't published, so the strength is a guess, not yet judged
+// by eye or against Unity (docs: tasks/General.md, Calibrate Layout's normals).
+function storeNormalFromGray(data, fmt, dest, MAX_TEXTURE, { scale, filter }) {
+  const [w, h] = execFileSync('magick', ['identify', '-format', '%w %h', `${fmt}:-[0]`], { input: data }).toString().trim().split(' ').map(Number);
+  const rgb = execFileSync('magick', [`${fmt}:-[0]`, '-alpha', 'off', '-depth', '8', 'rgb:-'], { input: data, maxBuffer: 1 << 30 });
+  const height = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) height[i] = (rgb[i * 3] + rgb[i * 3 + 1] + rgb[i * 3 + 2]) / 3; // 0 to 255
+  const at = (x, y) => height[((y + h) % h) * w + ((x + w) % w)];
+  const out = Buffer.alloc(w * h * 3);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    // du: toward +x; dv: toward -y (up the image, +v)
+    const du = filter === 1 ? (at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2 * at(x - 1, y) - at(x - 1, y + 1)) : at(x + 1, y) - at(x, y);
+    const dv = filter === 1 ? (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1) - at(x - 1, y + 1) - 2 * at(x, y + 1) - at(x + 1, y + 1)) : at(x, y - 1) - at(x, y);
+    const nx = -du * scale, ny = -dv * scale, k = 1 / Math.hypot(nx, ny, 1), o = (y * w + x) * 3;
+    out[o] = Math.round((nx * k * 0.5 + 0.5) * 255);
+    out[o + 1] = Math.round((ny * k * 0.5 + 0.5) * 255);
+    out[o + 2] = Math.round((k * 0.5 + 0.5) * 255);
+  }
+  execFileSync('magick', ['-size', `${w}x${h}`, '-depth', '8', 'rgb:-', '-resize', `${MAX_TEXTURE}x${MAX_TEXTURE}>`, dest], { input: out, stdio: ['pipe', 'ignore', 'pipe'] });
 }
 // Textures changed in the Canopy working tree but not yet committed (e.g. TIFs converted to
 // PNG): guid -> absolute path, from the checked-out .meta files.
@@ -770,7 +847,15 @@ function pieceMaterial(name, problems) {
 }
 // Material descriptions by guid, with texture URLs (textures/<key>.png or .jpg). Textures are
 // fetched, capped at unity.json maxTexture px, and stored once per source and cap.
-const TEXTURE_SLOTS = ['map', 'normal', 'detail', 'normal1', 'normal2', 'noise'];
+const { astcJob } = require('./texture-astc.js');
+const astcWanted = new Map(); // .astcm name -> what tools/texture-astc.js needs; see takeAstcWanted
+// The textures a load found uncompressed, for the server to pass to tools/texture-astc.js.
+function takeAstcWanted() {
+  const list = [...astcWanted.values()];
+  astcWanted.clear();
+  return list;
+}
+const TEXTURE_SLOTS = ['map', 'normal', 'detail', 'normal1', 'normal2', 'noise', 'emission', 'glow'];
 function prepareMaterials(guids, problems, maxTexture) {
   const cache = fs.existsSync(MATERIALS) ? JSON.parse(fs.readFileSync(MATERIALS, 'utf8')) : {};
   const idx = index();
@@ -820,17 +905,22 @@ function prepareMaterials(guids, problems, maxTexture) {
     const t = cache[g] && cache[g][slot];
     if (!t) continue;
     t.url = null;
+    // decoded from sRGB or not as Unity decodes it (tools/guid-index.js); unknown, by its slot
+    if (idx[t.guid] && idx[t.guid].srgb !== undefined) t.srgb = idx[t.guid].srgb;
+    else delete t.srgb;
     const file = workingTreeTextures()[t.guid];
     const source = file || (idx[t.guid] && idx[t.guid].path);
     const ext = source && ((/\.(png|jpe?g|tga|tiff?|psd)$/i.exec(source) || [])[1] || '').toLowerCase();
     if (!ext) continue;
     const key = file ? 'wt' + crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex').slice(0, 38) : idx[t.guid].blob;
     const alpha = idx[t.guid] && idx[t.guid].alpha; // Unity's Alpha Source, when not the texture's own
-    const name = `${key}-${maxTexture}${alpha !== undefined ? '-a' + alpha : ''}.${/^jpe?g$/.test(ext) && alpha !== 2 ? 'jpg' : 'png'}`;
+    const fromGray = idx[t.guid] && idx[t.guid].fromGray; // a Normal Map Unity makes from its gray
+    const gray = fromGray ? `-n${fromGray.scale}f${fromGray.filter}s2` : ''; // s2: the formula's second version
+    const name = `${key}-${maxTexture}${alpha !== undefined ? '-a' + alpha : ''}${gray}.${/^jpe?g$/.test(ext) && alpha !== 2 && !fromGray ? 'jpg' : 'png'}`;
     if (!cached(TEXTURES, name)) {
       if (file) {
         try {
-          Timing.time('textures converted', () => storeTexture(fs.readFileSync(file), ext, path.join(TEXTURES, name), maxTexture, alpha));
+          Timing.time('textures converted', () => storeTexture(fs.readFileSync(file), ext, path.join(TEXTURES, name), maxTexture, alpha, fromGray));
           written(TEXTURES, name);
           Timing.count('textures converted');
         } catch (error) {
@@ -838,15 +928,25 @@ function prepareMaterials(guids, problems, maxTexture) {
           continue;
         }
       } else {
-        fromGit.set(key, { ext, name, path: source, alpha });
+        fromGit.set(key, { ext, name, path: source, alpha, fromGray });
       }
     }
     t.url = `textures/${name}`;
+    delete t.size;
+    // The compressed copy the page takes when it can, at the size the game draws it, where the PNG
+    // is capped (tools/texture-astc.js): the server makes the missing ones in the background after
+    // a load, so a new texture is a PNG until the next load.
+    const job = astcJob(name, slot, t, cache[g], idx[t.guid]);
+    if (cached(TEXTURES, job.astc)) t.astc = `textures/${job.astc}`;
+    else {
+      delete t.astc;
+      astcWanted.set(job.astc, job);
+    }
   }
   for (const [blob, data] of blobs([...fromGit.keys()])) {
     const t = fromGit.get(blob);
     try {
-      Timing.time('textures converted', () => storeTexture(data, t.ext, path.join(TEXTURES, t.name), maxTexture, t.alpha));
+      Timing.time('textures converted', () => storeTexture(data, t.ext, path.join(TEXTURES, t.name), maxTexture, t.alpha, t.fromGray));
       written(TEXTURES, t.name);
       Timing.count('textures converted');
     } catch (error) {
@@ -855,7 +955,10 @@ function prepareMaterials(guids, problems, maxTexture) {
   }
   for (const g of new Set(guids)) for (const slot of TEXTURE_SLOTS) {
     const t = cache[g] && cache[g][slot];
-    if (t && t.url && !cached(TEXTURES, t.url.replace(/^textures\//, ''))) t.url = null;
+    if (t && t.url && !cached(TEXTURES, t.url.replace(/^textures\//, ''))) {
+      t.url = null;
+      delete t.astc;
+    }
   }
   fs.writeFileSync(MATERIALS, JSON.stringify(cache));
   const out = {};
@@ -895,7 +998,7 @@ function clipObj(text, M, center, half, leaves) {
   return [`# leaves ${leaves} ${per} ${list}`, ...lines.filter(l => !l.startsWith('f ') || keep.has(l))].join('\n');
 }
 
-module.exports = { REPO: U.REPO, ROOT, AREAS, MESHES, TEXTURES, LOCAL_MATERIALS, beginRequest, blobs, withCandidates, parseMaterial, materialGuid, shapeMaterials, materialSetting, pieceMaterial, parsePieceLines, areaLine, originLine, switchLine, includeLines, layoutPrefabs, withScriptUrls, fieldMaterials, isAssemblage, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };
+module.exports = { REPO: U.REPO, ROOT, AREAS, MESHES, TEXTURES, LOCAL_MATERIALS, beginRequest, blobs, withCandidates, parseMaterial, materialGuid, shapeMaterials, materialSetting, pieceMaterial, parsePieceLines, areaLines, originLine, switchLine, includeLines, layoutPrefabs, withScriptUrls, fieldMaterials, isAssemblage, takeAstcWanted, textureSource, storeTexture, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };
 
 if (require.main === module) {
   const [command, ...args] = process.argv.slice(2);

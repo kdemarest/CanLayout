@@ -22,5 +22,7 @@
     "hide": []
   },
   "scenes": {
+    "HawthornScene": { "stage": "Oak" },
+    "BlackIsleScene": { "stage": "Oak" }
   }
 }

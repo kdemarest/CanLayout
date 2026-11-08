@@ -56,7 +56,7 @@ void main() {
 `;
     const LIGHT = `
 uniform vec3 canopySunDirection;
-uniform vec3 canopySunColor;
+uniform vec3 canopySunLight;
 uniform vec3 canopyAmbient;
 uniform vec3 canopyFogColor;
 uniform float canopyFogDensitySquared;
@@ -77,13 +77,13 @@ vec4 canopyLight(SurfIn s, SurfOut o) {
     vec3 L = normalize(canopySunDirection);
     vec3 H = normalize(L + s.viewDir);
     vec3 N = normalize(o.normal);
-    vec3 diffuse = max(dot(N, L), 0.0) * albedo;
+    vec3 diffuse = max(dot(N, L), 0.0) * canopySunLight * albedo;
     float ndoth = max(dot(N, H), 0.0);
     float n2 = ndoth * ndoth;
     float n8 = n2 * n2 * n2 * n2;
     float n64 = n8 * n8 * n8 * n8 * n8 * n8 * n8 * n8;
     float specTerm = o.gloss == 0.0 ? 0.0 : mix(n8, n64, o.gloss);
-    vec3 specular = specTerm * o.specular * canopySunColor * o.gloss;
+    vec3 specular = specTerm * o.specular * canopySunLight * o.gloss;
     vec3 lit = canopyAmbient * albedo + diffuse + specular + o.emission;
     if (below) return vec4(lit, o.alpha);
     vec3 d = cameraPosition * vec3(-1.0, 1.0, 1.0) - s.worldPos;
@@ -152,10 +152,11 @@ mat3 waterFrame() {
 }
 `;
     // Unity's SeaSurface, as Canopy/SeaSurface.shader: the two normals added; only the sun's
-    // glints show (Blinn to the 8th, times gloss), and it is clear looking down, opaque toward the
+    // glints show (Blinn to the 8th, times gloss, times the sun), and it is clear looking down, opaque toward the
     // horizon. Drawn from above only, as in Unity (Cull Back).
     const SEA_FRAGMENT = `${WATER_COMMON}
 uniform vec3 canopySunDirection;
+uniform vec3 canopySunLight;
 uniform vec4 seaColor;
 uniform float seaGloss;
 uniform float seaAnglePct;
@@ -172,7 +173,7 @@ void main() {
     float ndoth = clamp(dot(N, H), 0.0, 1.0);
     float n2h = ndoth * ndoth;
     float n8 = n2h * n2h * n2h * n2h;
-    vec3 color = seaColor.rgb * n8 * seaGloss;
+    vec3 color = seaColor.rgb * n8 * seaGloss * canopySunLight;
     float distanceSquared = dot(toCamera, toCamera);
     color = mix(canopyFogColor, color, exp2(-canopyFogDensitySquared * distanceSquared));
     float viewAngleAlpha = clamp(1.0 - seaAnglePct * abs(V.y), 0.0, 1.0);
@@ -216,7 +217,7 @@ void main() {
     // below the waterline seen from above; _Color's alpha.
     const BUBBLE_FRAGMENT = `${WATER_COMMON}
 uniform vec3 canopySunDirection;
-uniform vec3 canopySunColor;
+uniform vec3 canopySunLight;
 uniform vec3 canopyAmbient;
 uniform float canopySeaLevel;
 uniform float canopyHeadUnder;
@@ -235,7 +236,7 @@ void main() {
     vec3 toCamera = cameraPosition * vec3(-1.0, 1.0, 1.0) - vWorldPos;
     vec3 H = normalize(L + normalize(toCamera));
     float h = max(dot(N, H), 0.0), h2 = h * h, h4 = h2 * h2, h8 = h4 * h4;
-    vec3 color = canopyAmbient * bubbleColor.rgb + max(dot(N, L), 0.0) * canopySunColor * bubbleColor.rgb + (bubbleSpecular > 0.5 ? h8 * h8 * bubbleGloss * canopySunColor : vec3(0.0));
+    vec3 color = canopyAmbient * bubbleColor.rgb + max(dot(N, L), 0.0) * canopySunLight * bubbleColor.rgb + (bubbleSpecular > 0.5 ? h8 * h8 * bubbleGloss * canopySunLight : vec3(0.0));
     if (canopyHeadUnder > 0.5 || vWorldPos.y >= canopySeaLevel) color = mix(canopyFogColor, color, clamp(exp2(-canopyFogDensitySquared * bubbleFogLevel * dot(toCamera, toCamera)), 0.0, 1.0));
     gl_FragColor = vec4(color, bubbleColor.a);
     #include <colorspace_fragment>
@@ -269,7 +270,7 @@ void main() {
     // position (times _NoiseScale), times _Brightness; lit by the sun (its direction times
     // _Inverted, 1 lit from above; never darker than _Underglow), a highlight (_Glossiness times
     // 128 its power, times _Metallic) and the ambient light; Canopy's fog at _FogLevel, except
-    // below the waterline seen from above. Opaque. (_SunIntensity is taken as 1.)
+    // below the waterline seen from above. Opaque.
     const CLOUD_FRAGMENT = `
 varying vec3 vWorldPos;
 varying vec3 vNormal;
@@ -278,7 +279,7 @@ uniform sampler2D noiseMap;
 uniform vec4 cloudTint;
 uniform vec4 cloudEdge;
 uniform float cloudMetallic, cloudGloss, cloudBrightness, cloudUnderglow, cloudNoiseScale, cloudNoiseStrength, cloudInverted, cloudFogLevel;
-uniform vec3 canopySunDirection, canopySunColor, canopyAmbient, canopyFogColor;
+uniform vec3 canopySunDirection, canopySunLight, canopyAmbient, canopyFogColor;
 uniform float canopyFogDensitySquared, canopySeaLevel, canopyHeadUnder;
 void main() {
     vec3 N = normalize(vNormal);
@@ -290,9 +291,9 @@ void main() {
     vec3 albedo = mix(base, texture2D(noiseMap, uv), cloudNoiseStrength).rgb * cloudBrightness;
     vec3 L = normalize(cloudInverted * canopySunDirection + 1e-8);
     float ndotl = max(dot(N, L), 0.0);
-    vec3 diffuse = albedo * canopySunColor * (cloudUnderglow + ndotl * (1.0 - cloudUnderglow));
+    vec3 diffuse = albedo * canopySunLight * (cloudUnderglow + ndotl * (1.0 - cloudUnderglow));
     float specular = pow(max(dot(N, normalize(L + V)), 0.0), cloudGloss * 128.0);
-    vec3 color = diffuse + specular * canopySunColor * cloudMetallic + canopyAmbient;
+    vec3 color = diffuse + specular * canopySunLight * cloudMetallic + canopyAmbient;
     if (canopyHeadUnder > 0.5 || vWorldPos.y >= canopySeaLevel) color = mix(canopyFogColor, color, clamp(exp2(-canopyFogDensitySquared * cloudFogLevel * cloudFogLevel * dot(toCamera, toCamera)), 0.0, 1.0));
     gl_FragColor = vec4(color, 1.0);
     #include <colorspace_fragment>
@@ -302,15 +303,15 @@ void main() {
     // 2 (_NearColor - 0.5) within _TransitionDistance of the eye (cubed), mottled by _NoiseTex times
     // 2 (_InnerTint - 0.5), looked up at sines of the world position drifting with _GoopScroll
     // (seconds since the start: canopyTime) times _ScrollRate, times _Brightness; its normal map at
-    // the same place times _NormalScale, tilted by _NormalStrength. Unity lights it with Standard;
-    // here, simply: the sun (Lambert) and the ambient light on the albedo (less what _Metallic
-    // reflects), a highlight from _Glossiness, and Canopy's fog (Canopy turns Unity's on at start). Opaque.
+    // the same place times _NormalScale, tilted by _NormalStrength. Lit as its shader is since
+    // 2026-11-06 (More Lights phase 3: CanopyLighting.cginc, as Canopy/General): the ambient and the
+    // sun (N·L) on the albedo, General's highlight by _Glossiness, Canopy's fog. Opaque.
     const GOOP_FRAGMENT = `${WATER_COMMON}
 uniform sampler2D noiseMap;
 uniform sampler2D normalMap;
 uniform vec4 goopTint, goopInner, goopNear;
-uniform float goopTransition, goopScrollRate, goopMetallic, goopGloss, goopBrightness, goopNoiseScale, goopNoiseStrength, goopNormalStrength, goopNormalScale;
-uniform vec3 canopySunDirection, canopySunColor, canopyAmbient;
+uniform float goopTransition, goopScrollRate, goopGloss, goopBrightness, goopNoiseScale, goopNoiseStrength, goopNormalStrength, goopNormalScale;
+uniform vec3 canopySunDirection, canopySunLight, canopyAmbient;
 uniform float canopyTime;
 void main() {
     vec3 toCamera = cameraPosition * vec3(-1.0, 1.0, 1.0) - vWorldPos;
@@ -323,9 +324,11 @@ void main() {
     n.xy *= goopNormalStrength;
     vec3 N = normalize(waterFrame() * normalize(n));
     vec3 L = normalize(canopySunDirection), V = normalize(toCamera);
-    float shine = exp2(10.0 * goopGloss + 1.0);
-    vec3 color = albedo * (1.0 - goopMetallic) * (canopyAmbient + canopySunColor * max(dot(N, L), 0.0))
-        + canopySunColor * mix(vec3(0.04), albedo, goopMetallic) * goopGloss * pow(max(dot(N, normalize(L + V)), 0.0), shine);
+    float n2 = max(dot(N, normalize(L + V)), 0.0);
+    n2 *= n2;
+    float n8 = n2 * n2 * n2 * n2, n64 = pow(n8, 8.0);
+    vec3 color = albedo * (canopyAmbient + canopySunLight * max(dot(N, L), 0.0))
+        + (goopGloss == 0.0 ? 0.0 : mix(n8, n64, goopGloss)) * 0.2 * goopGloss * canopySunLight;
     color = mix(canopyFogColor, color, clamp(exp2(-canopyFogDensitySquared * dot(toCamera, toCamera)), 0.0, 1.0));
     gl_FragColor = vec4(color, 1.0);
     #include <colorspace_fragment>
@@ -356,11 +359,113 @@ void main() {
     #include <colorspace_fragment>
 }
 `;
+    // Canopy/RimLit (the portal's vacancy, the tutorial's mannequin, the Foyer's pointer hands): its
+    // _InnerColor, lit by the sun and the ambient when _InnerLit is 1 (as Oculus's Lambert was), plus
+    // _RimColor times (1 - N·V) to the _RimPower, added over what is behind (Blend One One); no fog.
+    const RIM_FRAGMENT = `
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+uniform vec4 rimInner, rimColor;
+uniform float rimPower, rimInnerLit;
+uniform vec3 canopySunDirection, canopySunLight, canopyAmbient;
+void main() {
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(cameraPosition * vec3(-1.0, 1.0, 1.0) - vWorldPos);
+    float rim = 1.0 - clamp(dot(V, N), 0.0, 1.0);
+    vec3 inner = rimInner.rgb;
+    if (rimInnerLit > 0.0) inner = mix(inner, inner * (canopyAmbient + max(dot(N, normalize(canopySunDirection)), 0.0) * canopySunLight), rimInnerLit);
+    gl_FragColor = vec4(inner + rimColor.rgb * pow(rim, rimPower), 1.0);
+    #include <colorspace_fragment>
+}
+`;
+    // Canopy/Amber (Ken, 2026-11-07: amber, opaque but seeming translucent), as its shader
+    // (Assets/Shaders/Amber.shader says why): the inside read twice, shifted by the view; how much
+    // amber is looked through from the view; the rims to amberRim; the sun through it and gathered away from it; a band of sky
+    // in the reflection; General's highlight; Canopy's fog.
+    const AMBER_FRAGMENT = `${WATER_COMMON}
+uniform sampler2D fieldMap;
+uniform sampler2D normalMap;
+uniform vec3 amberRim;
+uniform float amberDepth, amberGlow, amberThrough, amberReflect, amberGloss, amberHighlight, amberBrightness, amberNormal, amberRimReach;
+uniform vec3 canopySunDirection, canopySunLight, canopyAmbient;
+void main() {
+    mat3 frame = waterFrame();
+    vec3 N0 = frame[2];
+    vec3 toCamera = cameraPosition * vec3(-1.0, 1.0, 1.0) - vWorldPos;
+    vec3 V = normalize(toCamera), L = normalize(canopySunDirection);
+    float nv = clamp(dot(N0, V), 0.0, 1.0);
+    vec3 here = texture2D(fieldMap, vUv).rgb;
+    float thick = nv, edge = 1.0 - nv;
+    vec2 border = min(vUv, 1.0 - vUv), centered = abs(vUv * 2.0 - 1.0);
+    float fold = min(min(border.x, border.y) * 2.0, abs(centered.x + centered.y - 1.0));
+    float reach = clamp(fold * 10.0, 0.0, 1.0) * clamp(thick * 3.0, 0.0, 1.0);
+    vec2 shift = vec2(dot(V, frame[0]), dot(V, frame[1])) / (nv + 0.35);
+    vec3 behind = texture2D(fieldMap, clamp(vUv - shift * (amberDepth * reach), 0.001, 0.999)).rgb;
+    vec3 color = mix(mix(here, behind, 0.65), amberRim, clamp(edge * edge * edge * (1.2 - thick) * amberRimReach, 0.0, 1.0));
+    vec3 bent = normalize(L + N0 * 0.35);
+    float toward = pow(clamp(dot(V, -bent), 0.0, 1.0), 4.0), gathered = clamp(-dot(N0, L), 0.0, 1.0);
+    vec3 lit = amberGlow * (canopyAmbient + 0.5 * canopySunLight) + amberThrough * canopySunLight * (toward * (1.15 - thick) + 0.35 * gathered * (1.0 - 0.5 * thick));
+    vec3 n = texture2D(normalMap, vUv).xyz * 2.0 - 1.0;
+    n.xy *= amberNormal;
+    vec3 N = normalize(frame * normalize(n));
+    float nh = max(dot(N, normalize(L + V)), 0.0);
+    float n2 = nh * nh, n8 = n2 * n2 * n2 * n2, n64 = pow(n8, 8.0);
+    vec3 R = reflect(-V, N);
+    float sky = smoothstep(0.45, 0.85, R.y), fresnel = 0.04 + 0.96 * pow(edge, 5.0);
+    vec3 albedo = color * 0.55 * amberBrightness;
+    vec3 result = albedo * (canopyAmbient + canopySunLight * max(dot(N, L), 0.0))
+        + mix(n8, n64, amberGloss) * amberHighlight * amberGloss * canopySunLight
+        + color * lit * amberBrightness + (canopyFogColor + 0.3) * (0.3 + color) * sky * amberReflect * (0.25 + fresnel);
+    result = mix(canopyFogColor, result, clamp(exp2(-canopyFogDensitySquared * dot(toCamera, toCamera)), 0.0, 1.0));
+    gl_FragColor = vec4(result, 1.0);
+    #include <colorspace_fragment>
+}
+`;
+    // Canopy/AmberShell (Ken, 2026-11-07: the translucent skin over a dark core of the same mesh),
+    // as its shader: premultiplied, clear looking in, gold toward the edges. Blended here in sRGB, as
+    // this page's frame is; the game blends in linear, so the two differ a little.
+    const AMBER_SHELL_FRAGMENT = `${WATER_COMMON}
+uniform sampler2D fieldMap;
+uniform sampler2D normalMap;
+uniform vec3 amberRim;
+uniform float amberBody, amberGlow, amberThrough, amberReflect, amberGloss, amberHighlight, amberBrightness, amberNormal;
+uniform vec3 canopySunDirection, canopySunLight, canopyAmbient;
+void main() {
+    mat3 frame = waterFrame();
+    vec3 N0 = frame[2];
+    vec3 toCamera = cameraPosition * vec3(-1.0, 1.0, 1.0) - vWorldPos;
+    vec3 V = normalize(toCamera), L = normalize(canopySunDirection);
+    float nv = clamp(dot(N0, V), 0.0, 1.0), edge = 1.0 - nv;
+    vec3 here = texture2D(fieldMap, vUv).rgb;
+    float thick = nv;
+    float alpha = (amberBody + (1.0 - amberBody) * edge * edge) * mix(0.85, 1.0, clamp(thick * 2.0, 0.0, 1.0));
+    vec3 color = mix(here, amberRim, clamp(edge * edge * edge * (1.2 - thick), 0.0, 1.0));
+    vec3 bent = normalize(L + N0 * 0.35);
+    float toward = pow(clamp(dot(V, -bent), 0.0, 1.0), 4.0), gathered = clamp(-dot(N0, L), 0.0, 1.0);
+    vec3 lit = amberGlow * (canopyAmbient + 0.5 * canopySunLight) + amberThrough * canopySunLight * (toward * (1.15 - thick) + 0.35 * gathered * (1.0 - 0.5 * thick));
+    vec3 n = texture2D(normalMap, vUv).xyz * 2.0 - 1.0;
+    n.xy *= amberNormal;
+    vec3 N = normalize(frame * normalize(n));
+    float nh = max(dot(N, normalize(L + V)), 0.0);
+    float n2 = nh * nh, n8 = n2 * n2 * n2 * n2, n64 = pow(n8, 8.0);
+    vec3 R = reflect(-V, N);
+    float sky = smoothstep(0.45, 0.85, R.y), fresnel = 0.04 + 0.96 * pow(edge, 5.0);
+    vec3 albedo = color * 0.55 * amberBrightness * alpha;
+    vec3 result = albedo * (canopyAmbient + canopySunLight * max(dot(N, L), 0.0))
+        + mix(n8, n64, amberGloss) * amberHighlight * amberGloss * canopySunLight
+        + color * lit * amberBrightness * alpha + (canopyFogColor + 0.3) * (0.3 + color) * sky * amberReflect * (0.25 + fresnel);
+    float fogged = clamp(exp2(-canopyFogDensitySquared * dot(toCamera, toCamera)), 0.0, 1.0);
+    result = mix(result, mix(canopyFogColor, result, fogged), alpha);
+    gl_FragColor = vec4(result, alpha);
+    #include <colorspace_fragment>
+}
+`;
     // Canopy's globals, shared by every surface material (set by setEnvironment; canopyTime and
     // canopyHeadUnder each frame).
     const uniforms = {
         canopySunDirection: { value: new THREE.Vector3(0, 1, 0) },
-        canopySunColor: { value: new THREE.Color(1, 1, 1) },
+        canopySunLight: { value: new THREE.Color(1, 1, 1) },
+        canopySunHighlight: { value: new THREE.Color(1, 1, 1) }, // the sun in General's highlight: canopySunLight, but for ☰ View › Full sun highlight
         canopyAmbient: { value: new THREE.Color(0.5, 0.5, 0.5) },
         canopyFogColor: { value: new THREE.Color(0.5, 0.5, 0.5) },
         canopyFogDensitySquared: { value: 0 },
@@ -382,7 +487,10 @@ void main() {
     function setEnvironment(env, fog) {
         const sun = env.sunDirection;
         uniforms.canopySunDirection.value.set(sun[0], sun[1], sun[2]).normalize();
-        uniforms.canopySunColor.value.set(env.sunColor);
+        // the sun's light, Canopy's _SunLight: its color made linear (THREE.Color does), times its
+        // intensity
+        uniforms.canopySunLight.value.set(env.sunColor).multiplyScalar(env.sunIntensity ?? 1);
+        uniforms.canopySunHighlight.value.copy(uniforms.canopySunLight.value);
         uniforms.canopyAmbient.value.copy(linear(env.ambient, env.ambient, env.ambient));
         uniforms.canopyFogColor.value.set(env.fogColor);
         uniforms.canopyFogDensitySquared.value = fog ? env.fogDensity * env.fogDensity : 0;
@@ -431,7 +539,7 @@ uniform float canopyHeadUnder;`)
         const shared = { seaNormal: { value: flat }, seaST1: { value: st(d.normal1) }, seaST2: { value: st(d.normal2 || d.normal1) }, canopyFogColor: uniforms.canopyFogColor, canopyFogDensitySquared: uniforms.canopyFogDensitySquared };
         const make = (own, fragmentShader, look = {}) => new THREE.ShaderMaterial({ uniforms: { ...shared, ...own }, vertexShader: WATER_VERTEX, fragmentShader, transparent: true, depthWrite: false, ...look, ...options });
         if (d.shaderName === "Canopy/SeaSurface") return make({
-            canopySunDirection: uniforms.canopySunDirection,
+            canopySunDirection: uniforms.canopySunDirection, canopySunLight: uniforms.canopySunLight,
             seaColor: { value: new THREE.Vector4(rgb.r, rgb.g, rgb.b, c[3]) },
             seaGloss: { value: v("_Glossiness", [0.6])[0] },
             seaAnglePct: { value: v("_AnglePct", [1])[0] },
@@ -449,7 +557,7 @@ uniform float canopyHeadUnder;`)
             canopyWaterScrollBelow2: uniforms.canopyWaterScrollBelow2
         }, BELOW_FRAGMENT);
         if (d.shaderName === "Canopy/Water") return make({
-            canopySunDirection: uniforms.canopySunDirection, canopySunColor: uniforms.canopySunColor, canopyAmbient: uniforms.canopyAmbient,
+            canopySunDirection: uniforms.canopySunDirection, canopySunLight: uniforms.canopySunLight, canopyAmbient: uniforms.canopyAmbient,
             canopySeaLevel: uniforms.canopySeaLevel, canopyHeadUnder: uniforms.canopyHeadUnder,
             bubbleColor: { value: new THREE.Vector4(rgb.r, rgb.g, rgb.b, c[3]) },
             bubbleStrength: { value: new THREE.Vector2(v("_NormalStrength1", [0.17])[0], v("_NormalStrength2", [0.8])[0]) },
@@ -468,22 +576,41 @@ uniform float canopyHeadUnder;`)
             cloudMetallic: { value: one("_Metallic", 0) }, cloudGloss: { value: one("_Glossiness", 0) }, cloudBrightness: { value: one("_Brightness", 1) },
             cloudUnderglow: { value: one("_Underglow", 0) }, cloudNoiseScale: { value: one("_NoiseScale", 1) }, cloudNoiseStrength: { value: one("_NoiseStrength", 0.5) },
             cloudInverted: { value: one("_Inverted", 1) }, cloudFogLevel: { value: one("_FogLevel", 1) },
-            canopySunDirection: uniforms.canopySunDirection, canopySunColor: uniforms.canopySunColor, canopyAmbient: uniforms.canopyAmbient,
+            canopySunDirection: uniforms.canopySunDirection, canopySunLight: uniforms.canopySunLight, canopyAmbient: uniforms.canopyAmbient,
             canopySeaLevel: uniforms.canopySeaLevel, canopyHeadUnder: uniforms.canopyHeadUnder
         }, CLOUD_FRAGMENT, opaque);
         if (d.shaderName === "Canopy/Goop") return make({
             noiseMap: { value: white }, normalMap: { value: flat },
             goopTint: { value: col("_Tint", [0.5, 0.5, 0.5, 1]) }, goopInner: { value: col("_InnerTint", [0.2, 0.2, 0.2, 1]) }, goopNear: { value: col("_NearColor", [1, 0.5, 0.5, 1]) },
             goopTransition: { value: one("_TransitionDistance", 10) }, goopScrollRate: { value: one("_ScrollRate", 1) },
-            goopMetallic: { value: one("_Metallic", 0) }, goopGloss: { value: one("_Glossiness", 0) }, goopBrightness: { value: one("_Brightness", 1) },
+            goopGloss: { value: one("_Glossiness", 0) }, goopBrightness: { value: one("_Brightness", 1) },
             goopNoiseScale: { value: one("_NoiseScale", 1) }, goopNoiseStrength: { value: one("_NoiseStrength", 0.5) },
             goopNormalStrength: { value: one("_NormalStrength", 1) }, goopNormalScale: { value: one("_NormalScale", 1) },
-            canopySunDirection: uniforms.canopySunDirection, canopySunColor: uniforms.canopySunColor, canopyAmbient: uniforms.canopyAmbient, canopyTime: uniforms.canopyTime
+            canopySunDirection: uniforms.canopySunDirection, canopySunLight: uniforms.canopySunLight, canopyAmbient: uniforms.canopyAmbient, canopyTime: uniforms.canopyTime
         }, GOOP_FRAGMENT, opaque);
         if (d.shaderName === "Canopy/DiffuseGlow") return make({
             fieldMap: { value: white }, fieldST: { value: st(d.map) },
             glowThreshold: { value: one("_GlowThreshold", 0.5) }, glowBrightness: { value: one("_GlowBrightness", 100) }, glowFogLevel: { value: one("_GlowFogLevel", 1) }
         }, GLOW_FRAGMENT, opaque);
+        if (d.shaderName === "Canopy/Amber") return make({
+            fieldMap: { value: white }, normalMap: { value: flat },
+            amberRim: { value: new THREE.Vector3(...["x", "y", "z"].map(k => col("_RimColor", [1, 0.77, 0.16, 1])[k])) },
+            amberDepth: { value: one("_Depth", 0.05) }, amberRimReach: { value: one("_RimReach", 1) }, amberGlow: { value: one("_Glow", 0.55) }, amberThrough: { value: one("_Through", 1.6) }, amberReflect: { value: one("_Reflect", 0.3) },
+            amberGloss: { value: one("_Glossiness", 0.9) }, amberHighlight: { value: one("_HighlightStrength", 1.5) }, amberBrightness: { value: one("_Brightness", 1) }, amberNormal: { value: one("_NormalStrength", 1) },
+            canopySunDirection: uniforms.canopySunDirection, canopySunLight: uniforms.canopySunLight, canopyAmbient: uniforms.canopyAmbient
+        }, AMBER_FRAGMENT, opaque);
+        if (d.shaderName === "Canopy/AmberShell") return make({
+            fieldMap: { value: white }, normalMap: { value: flat },
+            amberRim: { value: new THREE.Vector3(...["x", "y", "z"].map(k => col("_RimColor", [1, 0.77, 0.16, 1])[k])) },
+            amberBody: { value: one("_Body", 0.5) }, amberGlow: { value: one("_Glow", 0.9) }, amberThrough: { value: one("_Through", 1.6) }, amberReflect: { value: one("_Reflect", 0.12) },
+            amberGloss: { value: one("_Glossiness", 0.97) }, amberHighlight: { value: one("_HighlightStrength", 2) }, amberBrightness: { value: one("_Brightness", 1) }, amberNormal: { value: one("_NormalStrength", 1) },
+            canopySunDirection: uniforms.canopySunDirection, canopySunLight: uniforms.canopySunLight, canopyAmbient: uniforms.canopyAmbient
+        }, AMBER_SHELL_FRAGMENT, { transparent: true, depthWrite: false, blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+        if (d.shaderName === "Canopy/RimLit") return make({
+            rimInner: { value: col("_InnerColor", [1, 1, 1, 1]) }, rimColor: { value: col("_RimColor", [0.26, 0.19, 0.16, 0]) },
+            rimPower: { value: one("_RimPower", 3) }, rimInnerLit: { value: one("_InnerLit", 0) },
+            canopySunDirection: uniforms.canopySunDirection, canopySunLight: uniforms.canopySunLight, canopyAmbient: uniforms.canopyAmbient
+        }, RIM_FRAGMENT, { blending: THREE.AdditiveBlending });
         if (d.shaderName === "Canopy/Force Field") {
             const f = v("_Color", [1, 1, 1, 1]), fc = linear(f[0], f[1], f[2]), scroll = v("_ScrollDirection", [0, 0]);
             return make({

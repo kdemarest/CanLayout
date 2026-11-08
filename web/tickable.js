@@ -78,13 +78,15 @@
             });
         }
         // Stand-ins: draws a game object and everything under it in a Unity material (by guid; the
-        // scene brings materials stand-ins' fields name), as RemapAllOwnedMaterials does.
+        // scene brings materials stand-ins' fields name), as RemapAllOwnedMaterials does: it sets
+        // sharedMaterial, the first slot, and a mesh's other slots stay.
         useMaterial(ref, guid) {
             const m = guid && world.material(guid);
             if (!m) return;
+            const first = now => (Array.isArray(now) ? [m, ...now.slice(1)] : m);
             for (const mesh of this.meshesUnder(ref)) {
-                if (mesh.userData.untinted) mesh.userData.untinted = m; // LOD tint is showing: put back to this
-                else if (mesh.material !== m) mesh.material = m;
+                if (mesh.userData.untinted) mesh.userData.untinted = first(mesh.userData.untinted); // LOD tint is showing: put back to this
+                else if ([mesh.material].flat()[0] !== m) mesh.material = first(mesh.material);
             }
         }
         // Stand-ins: moves a game object and everything under it by offset (Unity meters, from

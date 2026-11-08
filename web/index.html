@@ -27,7 +27,9 @@
   #status { position: fixed; left: 0.6em; top: 3.4em; max-width: 70%; padding: 0.3em 0.6em; border-radius: 8px; background: rgba(0, 0, 0, 0.45); font-size: 0.85em; }
   #actions { bottom: 0; justify-content: flex-start; }
   /* A keyboard's WASD cluster: Q W E over A S D. */
-  #pad { position: fixed; right: 0.6em; bottom: 4em; display: grid; grid-template-columns: repeat(3, 3.4em); grid-template-rows: repeat(2, 3.4em); gap: 0.3em; }
+  #pad { position: fixed; right: 0.6em; bottom: 4em; display: grid; grid-template-columns: repeat(3, 3.4em); grid-auto-rows: 3.4em; gap: 0.3em; }
+  #pad .spin { display: none; }
+  body.carrying #pad .spin { display: block; }
   #pad button { padding: 0; font-size: 1.15em; font-weight: 600; }
   #pad button small { display: block; font-size: 0.55em; font-weight: 400; color: var(--dim); }
   #scalebar { position: fixed; left: 0.6em; right: 12em; bottom: 4em; display: none; align-items: center; gap: 0.5em; padding: 0.4em 0.6em; border-radius: 8px; background: var(--panel); }
@@ -54,6 +56,9 @@
   #probeBtn { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } /* held 1.2 s: back to the probe */
   #tweakList div.on { background: #2a3344; border-left: 3px solid var(--accent); }
   #tweakList small { color: var(--dim); }
+  /* Game mode (Ken, 2026-11-02): nothing on screen but ☰ (holding only Edit mode and Reframe scene) and ⛶. */
+  body.game #top > :not(#menuBtn):not(#fullBtn), body.game #actions, body.game #pad, body.game #status, body.game #lodLegend,
+  body.game #reticle, body.game #scalebar, body.game #tweakHud, body.game .panel, body.game #viewMenu, body.game #menu > :not(#gameBtn):not(#reframeBtn) { display: none !important; }
   #tweakHud { position: fixed; left: 50%; top: 3.4em; transform: translateX(-50%); display: none; padding: 0.35em 0.8em; border-radius: 8px; background: var(--panel); border: 1px solid var(--accent); font-weight: 600; z-index: 4; }
 </style>
 </head>
@@ -94,14 +99,24 @@ window.addEventListener("unhandledrejection", function (e) {
   <button id="newBtn">New</button>
   <button id="saveBtn">Save</button>
   <button id="importBtn">Import area</button>
+  <button id="areasBtn">Areas</button>
   <button id="foldersBtn">Folders</button>
   <button id="inspectBtn" hidden>Inspect layers ▸</button>
   <button id="snapBtn">Snap</button>
   <button id="refCubeBtn">Reference cube</button>
+  <button id="reframeBtn">Reframe scene</button>
   <button id="viewBtn">View ▸</button>
+  <button id="gameBtn">Game mode</button>
 </div>
 <div id="viewMenu">
   <button id="texturesBtn" class="on">Textures</button>
+  <button id="normalMapsBtn" class="on">Normal maps</button>
+  <button id="normals2Btn">Normal maps × 2</button>
+  <button id="noAmbientBtn">No ambient</button>
+  <button id="fullSunHighlightBtn">Full sun highlight</button>
+  <button id="lightsBtn" class="on">Lights</button>
+  <button id="lightViewBtn">Light crowding</button>
+  <button id="unityShadersBtn" hidden>Unity's shaders</button>
   <button id="labelsBtn">Labels</button>
   <button id="wireframeBtn">Wireframe</button>
   <button id="lodTintBtn">LOD tint</button>
@@ -121,6 +136,7 @@ window.addEventListener("unhandledrejection", function (e) {
 <div id="scalebar"><span>Scale</span><input id="scale" type="range" min="-2" max="5.615" step="0.005" value="0"><span id="scaleValue">×1.00</span></div>
 
 <div id="pad">
+  <button data-move="spinLeft" class="spin" title="Spin left" aria-label="Spin left"><svg viewBox="0 0 24 24" width="1.3em" height="1.3em" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg></button><span class="spin"></span><button data-move="spinRight" class="spin" title="Spin right" aria-label="Spin right"><svg viewBox="0 0 24 24" width="1.3em" height="1.3em" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" transform="scale(-1 1)"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg></button>
   <button data-move="down">Q<small>down</small></button><button data-move="forward">W</button><button data-move="up">E<small>up</small></button>
   <button data-move="left">A</button><button data-move="back">S</button><button data-move="right">D</button>
 </div>
@@ -160,6 +176,8 @@ window.addEventListener("unhandledrejection", function (e) {
 <script src="three.js"></script>
 <script src="space.js"></script>
 <script src="surface.js"></script>
+<script src="lights.js"></script>
+<script src="environment.js"></script>
 <script src="ticker.js"></script>
 <script src="conditions.js"></script>
 <script src="tickable.js"></script>

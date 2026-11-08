@@ -1,0 +1,173 @@
+{
+  "about": "Hawthorn out of OakScene (Ken, 2026-11-02: a clean split; Hawthorn rises after Tangle, Oak after Hawthorn). Groups as Ken made them, the ruler head (Colossus, ColossusSummon) and the rocks from Beech and in the sea between Oak and Beech (TempleAttachments) to Hawthorn; then pieces resting on the other tree (by distance to each tree's surface) cross the line. node tools/split-scene.js splits/HawthornScene.json The Luma fuse box's cloud lamps (at Hawthorn's outpost) send their clouds to four markers in AccessToClouds, at Oak's top; a reference can't cross scenes, so the markers go with the lamps, to Hawthorn, keeping their places (Ken: the clouds move to Oak later). Its HawthornSceneTracker links it to OakBiome's region, as OakSceneTracker does Oak (Claude, 2026-11-03: the split had left it without one; Hawthorn has no region of its own yet).",
+  "scene": "OakScene",
+  "anchor": "OakSceneAnchor",
+  "newScene": "HawthornScene",
+  "newAnchor": "HawthornSceneAnchor",
+  "groups": [
+    "Hawthorn",
+    "HawthornGems",
+    "Cages-InsideForcefield",
+    "Colossus",
+    "ColossusSummon",
+    "BouncerWide (3)",
+    "AirBlooms",
+    "OakRings",
+    "HawthornOutpost",
+    "TempleAttachments"
+  ],
+  "create": [
+    {
+      "side": "new",
+      "path": "Hawthorn/Fruiters"
+    },
+    {
+      "side": "new",
+      "path": "Cages-OutsideForcefield"
+    },
+    {
+      "side": "old",
+      "path": "WhiteOak/HawthornToOakLow"
+    },
+    {
+      "side": "old",
+      "path": "WhiteOak/HawthornToOakHigh"
+    },
+    {
+      "side": "old",
+      "path": "WhiteOak/AroundMegaShield"
+    },
+    {
+      "side": "new",
+      "path": "AccessToClouds"
+    }
+  ],
+  "toNew": [
+    {
+      "path": "WhiteOak/AmberBowls",
+      "into": "Hawthorn"
+    },
+    {
+      "path": "WhiteOak/FarTurtle",
+      "into": "Hawthorn"
+    },
+    {
+      "path": "WhiteOak/FruitLocus",
+      "into": "Hawthorn"
+    },
+    {
+      "path": "WhiteOak/FruitLocus (1)",
+      "into": "Hawthorn"
+    },
+    {
+      "path": "WhiteOak/Portal-OakWild3",
+      "into": "Hawthorn"
+    },
+    {
+      "path": "WhiteOak/Fruiters/WaterDispenserWithFruit",
+      "into": "Hawthorn/Fruiters"
+    },
+    {
+      "path": "WhiteOak/Fruiters/WaterDispenserWithFruit (1)",
+      "into": "Hawthorn/Fruiters"
+    },
+    {
+      "path": "WhiteOak/Fruiters/WaterDispenserWithFruit (2)",
+      "into": "Hawthorn/Fruiters"
+    },
+    {
+      "path": "WhiteOakGems/Gem-ResistFire",
+      "into": "HawthornGems"
+    },
+    {
+      "path": "Cages-OutsideForcefield/CageBeyondForceShield",
+      "into": "Cages-OutsideForcefield"
+    },
+    {
+      "path": "AccessToClouds/Cloud12",
+      "into": "AccessToClouds"
+    },
+    {
+      "path": "AccessToClouds/Cloud13",
+      "into": "AccessToClouds"
+    },
+    {
+      "path": "AccessToClouds/Cloud14",
+      "into": "AccessToClouds"
+    },
+    {
+      "path": "AccessToClouds/Cloud15",
+      "into": "AccessToClouds"
+    }
+  ],
+  "toOld": [
+    {
+      "path": "HawthornGems/Gem-CloudClimb",
+      "into": "WhiteOakGems"
+    },
+    {
+      "path": "Hawthorn/AirFruitLoci/FruitLocus",
+      "near": [
+        -57.6,
+        -48.3
+      ],
+      "into": "WhiteOak"
+    },
+    {
+      "path": "Hawthorn/Gem-WaterShot/Driller",
+      "into": "WhiteOak"
+    },
+    {
+      "path": "Hawthorn/Gem-WaterShot/Shooter",
+      "into": "WhiteOak"
+    },
+    {
+      "path": "Hawthorn/AroundMegaShield/WaterBloom (6)",
+      "into": "WhiteOak/AroundMegaShield"
+    },
+    {
+      "path": "Hawthorn/AroundMegaShield/WaterBloom (7)",
+      "into": "WhiteOak/AroundMegaShield"
+    },
+    {
+      "path": "Hawthorn/AroundMegaShield/WaterBloom (8)",
+      "into": "WhiteOak/AroundMegaShield"
+    },
+    {
+      "path": "Hawthorn/AroundMegaShield/WaterBloom (9)",
+      "into": "WhiteOak/AroundMegaShield"
+    },
+    {
+      "path": "Hawthorn/HawthornToOakHigh/StructHeadGrin",
+      "into": "WhiteOak/HawthornToOakHigh"
+    },
+    {
+      "path": "Hawthorn/HawthornToOakLow/Rock (22)",
+      "into": "WhiteOak/HawthornToOakLow"
+    },
+    {
+      "path": "Hawthorn/HawthornToOakLow/Rock (24)",
+      "into": "WhiteOak/HawthornToOakLow"
+    },
+    {
+      "path": "Hawthorn/HawthornToOakLow/Rock (25)",
+      "into": "WhiteOak/HawthornToOakLow"
+    },
+    {
+      "path": "Hawthorn/HawthornToOakLow/Rock (26)",
+      "into": "WhiteOak/HawthornToOakLow"
+    },
+    {
+      "path": "Hawthorn/HawthornToOakLow/Rock (27)",
+      "into": "WhiteOak/HawthornToOakLow"
+    },
+    {
+      "path": "Hawthorn/HawthornToOakLow/Rock (28)",
+      "into": "WhiteOak/HawthornToOakLow"
+    }
+  ],
+  "tracker": {
+    "name": "HawthornSceneTracker",
+    "linkToName": "OakBiome"
+  }
+}

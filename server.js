@@ -12,6 +12,7 @@ const Shapes = require('./tools/shapes.js');
 const Timing = require('./tools/timing.js');
 const Assemblage = require('./tools/assemblage.js');
 const Conditions = require('./tools/conditions.js');
+const Moods = require('./tools/moods.js');
 
 const PORT = +process.env.PORT || 8080;
 const DEV = path.join(__dirname, '..');
@@ -97,7 +98,19 @@ setInterval(() => {
     checkTweakSources();
     const now = canopyTimes();
     if (!watched) {
-      watched = now;
+      // the first poll: catch up on what changed while the server was down or unwatched (a modl
+      // install during a restart left its new material out of the index; Claude, 2026-11-04)
+      refreshing = true;
+      const before = fs.readFileSync(INDEX, 'utf8');
+      execFile(process.execPath, [path.join(__dirname, 'tools', 'guid-index.js')], { cwd: __dirname }, error => {
+        if (error) console.error(`canopy: guid-index failed: ${error.message}`);
+        refreshing = false;
+        watched = canopyTimes();
+        if (fs.readFileSync(INDEX, 'utf8') === before) return;
+        console.log('canopy: changed while unwatched; scenes reload');
+        const data = JSON.stringify({ at: Date.now(), changed: [] });
+        for (const res of listeners) res.write(`event: canopy\ndata: ${data}\n\n`);
+      });
       return;
     }
     const changed = [];
@@ -226,7 +239,7 @@ function docsAssets() {
 // with their scripts.
 function withShapes(result, names) {
   const docs = docsAssets();
-  const own = S.layoutPrefabs();
+  const own = Timing.time('layout prefabs', () => S.layoutPrefabs());
   const problems = [...(result.problems || []), ...docs.shapeErrors, ...Object.values(own).flatMap(p => p.errors)];
   const add = (name, trail) => {
     if (result.library[name] && !(own[name] && result.library[name].kind !== 'shapes')) return;
@@ -237,7 +250,7 @@ function withShapes(result, names) {
     // where it is its Unity name (Cocoon in Cocoon Basket drew its shapes, not modl's Cocoon).
     const unity = Shapes.unityName(name, docs.unity[name] && docs.unity[name].unity);
     if (!own[name] && (unity !== name || trail.length)) {
-      const prefab = S.prepare([unity]);
+      const prefab = Timing.time('shape prefabs', () => S.prepare([unity]));
       const found = prefab.library[unity];
       if (found && !(docs.shapes[name] && String(found.source).startsWith('Assets/Placeholder/'))) {
         result.library[name] = found;
@@ -251,8 +264,8 @@ function withShapes(result, names) {
     const shapes = spec.shapes.map(shape => {
       if (!shape.material) return shape;
       try {
-        const guid = S.materialGuid(shape.material);
-        Object.assign(result.materials, S.shapeMaterials([guid], problems));
+        const guid = Timing.time('shape materials', () => S.materialGuid(shape.material));
+        Object.assign(result.materials, Timing.time('shape materials', () => S.shapeMaterials([guid], problems)));
         return { ...shape, materialGuid: guid };
       } catch (error) {
         problems.push(`${spec.source}: ${name}: ${error.message}`);
@@ -318,8 +331,21 @@ function includedPieces(list, seen, problems) {
 }
 
 // unity.json's environment for a Unity scene, its sky's named material made a description.
-function environment(unityScene, problems) {
+// unity.json's environment, and (unless its live is false) the game's moods and zones for the
+// page to work the light out from where the camera is (tools/moods.js, web/environment.js);
+// scenes: the Unity scenes being drawn, whose zones count beside the game's.
+function environment(unityScene, problems, scenes = []) {
   const env = { ...Config.load(unityScene).environment };
+  if (env.live !== false) {
+    try {
+      const live = Timing.time('moods', () => Moods.environment(scenes));
+      for (const p of live.problems) problems.push(`moods: ${p}`);
+      env.live = { ...live, skyMaterials: S.shapeMaterials(live.materials, problems) };
+    } catch (error) {
+      problems.push(`moods: ${error.message}`);
+      env.live = null;
+    }
+  } else env.live = null;
   for (const key of ['sky']) {
     try {
       const guid = S.materialGuid(env[key]);
@@ -355,44 +381,61 @@ const api = {
   'GET /api/scene': q => {
     const name = safeName(q.get('name'));
     let pieces, editable, area = null, base = [], unityScene = null, origin = null, assemblage = false, switches = null, includes = [], symbolLines = {};
+    // Other areas drawn alongside, read-only (☰ Areas, "also"; a composed scene's later Area lines):
+    // their pieces carry their Unity scene, whose stage their conditions are tested against.
+    let lines = [];
+    const also = [];
     if (q.get('kind') === 'area') {
       const loaded = loadArea(name);
       pieces = loaded.pieces;
       unityScene = loaded.source.scene;
       editable = false;
     } else {
-      // A composed scene may sit on an imported area ("- Area: <name>"), drawn read-only beneath it.
+      // A composed scene may sit on imported areas ("- Area: <name>"), drawn read-only beneath it.
       const text = fs.readFileSync(path.join(SCENES, name + '.md'), 'utf8');
-      const parsed = S.parsePieceLines(text);
+      const parsed = Timing.time('scene file', () => S.parsePieceLines(text));
       if (parsed.errors.length) throw new Error(`${name}: ${parsed.errors[0]}`);
       pieces = parsed.pieces;
       editable = true;
-      area = S.areaLine(text);
+      lines = S.areaLines(text);
+      area = lines[0] || null;
       origin = S.originLine(text);
       switches = S.switchLine(text);
       assemblage = S.isAssemblage(text);
       if (area) {
-        const loaded = loadArea(area);
+        const loaded = Timing.time('areas', () => loadArea(area));
         base = loaded.pieces;
         unityScene = loaded.source.scene;
       }
       includes = S.includeLines(text);
       symbolLines = Conditions.symbolLines(text);
     }
+    const scenesOf = {};
+    for (const other of new Set([...lines.slice(1), ...q.getAll('also').map(safeName)])) {
+      if (other === name || other === area || !fs.existsSync(path.join(S.AREAS, other + '.json'))) continue;
+      const loaded = loadArea(other);
+      if (!unityScene) unityScene = loaded.source.scene;
+      if (loaded.source.scene !== unityScene) {
+        for (const p of loaded.pieces) p.unityScene = loaded.source.scene;
+        scenesOf[loaded.source.scene] = true;
+      }
+      base = [...base, ...loaded.pieces];
+      also.push(other);
+    }
     // Included scenes' pieces go beneath, first (so their singletons win): unity.json's include
     // (World) for what comes from Canopy, an imported area or a scene on one, then "- Include:" lines.
     const includeProblems = [];
-    const fromCanopy = q.get('kind') === 'area' || area ? Config.load(unityScene).include : [];
-    base = [...includedPieces([...fromCanopy, ...includes], new Set([name]), includeProblems), ...base];
+    const fromCanopy = unityScene ? Config.load(unityScene).include : [];
+    base = [...Timing.time('includes', () => includedPieces([...fromCanopy, ...includes], new Set([name]), includeProblems)), ...base];
     // Pieces with their own parts (trees, overridden instances) are not resolved as whole prefabs.
     const all = [...base, ...pieces];
     const candidates = S.withCandidates(all);
     const names = all.filter(p => !p.parts).map(p => p.name);
-    const { library, materials, problems } = withShapes(S.prepare(names, all.flatMap(p => p.parts || [])), names);
+    const { library, materials, problems } = Timing.time('shapes', () => withShapes(Timing.time('prepare', () => S.prepare(names, all.flatMap(p => p.parts || []))), names));
     problems.push(...includeProblems);
     // Scripts: imported pieces' stand-ins get their URLs; materials their fields name come along.
     for (const p of all) if (p.scripts) p.scripts = S.withScriptUrls(p.scripts);
-    Object.assign(materials, S.fieldMaterials([...all.flatMap(p => p.scripts || []), ...Object.values(library).flatMap(e => e.scripts || [])], problems));
+    Object.assign(materials, Timing.time('script materials', () => S.fieldMaterials([...all.flatMap(p => p.scripts || []), ...Object.values(library).flatMap(e => e.scripts || [])], problems)));
     // "material <Name>" in a piece's settings: all of it drawn in that material (scene.js pieceMaterial).
     for (const p of all) {
       const named = S.materialSetting(p.extra);
@@ -405,15 +448,20 @@ const api = {
         problems.push(`${name}: ${p.name}: ${error.message}`);
       }
     }
-    console.log(`load: ${name}: server ${Timing.report()}; ${pieces.length} pieces${area ? ` on ${area} (${base.length})` : ''}`);
     const cfg = Config.load(unityScene || null);
     // What each progress flag is in the page's condition modes (met, start), for its gates.
-    const symbols = Timing.time('symbols', () => Conditions.symbols(unityScene, { ...cfg.symbols, ...symbolLines }));
+    const symbols = Timing.time('symbols', () => Conditions.symbols(unityScene, { ...cfg.symbols, ...symbolLines }, cfg.stage));
+    const sceneSymbols = Object.fromEntries(Object.keys(scenesOf).map(s => { const c = Config.load(s); return [s, Conditions.symbols(s, { ...c.symbols, ...symbolLines }, c.stage)]; }));
     for (const p of [...base, ...pieces]) p.cull = Config.cullDistance(cfg, { ...p, source: p.source || (library[p.name] && library[p.name].source) || '' });
-    return { name, editable, pieces, area, origin, switch: switches, assemblage, base, library, materials, problems, environment: environment(unityScene, problems), lod: { fov: cfg.lodFov, bias: cfg.lodBias }, clip: { near: cfg.near, far: cfg.far, fog: cfg.farClip }, culling: { perFrame: cfg.culling.perFrame, margin: cfg.culling.margin }, candidates, symbols };
+    const env = Timing.time('environment', () => environment(unityScene, problems, [unityScene, ...Object.keys(scenesOf)]));
+    // logged once the reply is made (only its JSON comes after), so the log has nearly all its time
+    compressTextures();
+    console.log(`load: ${name}: server ${Timing.report()}; ${pieces.length} pieces${area ? ` on ${area}` : ''}${also.length ? ` with ${also.join(', ')}` : ''} (${base.length} beneath)`);
+    return { name, editable, pieces, area, origin, switch: switches, assemblage, base, library, materials, problems, environment: env, lod: { fov: cfg.lodFov, bias: cfg.lodBias }, clip: { near: cfg.near, far: cfg.far, fog: cfg.farClip }, culling: { perFrame: cfg.culling.perFrame, margin: cfg.culling.margin }, candidates, symbols, sceneSymbols, also, areaLines: lines };
   },
   'POST /api/prepare': body => {
     const result = withShapes(S.prepare(body.names || []), body.names || []);
+    compressTextures();
     console.log(`load: prepare ${(body.names || []).join(', ')}: server ${Timing.report()}`);
     return result;
   },
@@ -425,6 +473,16 @@ const api = {
   // Page errors, so they can be read in layout.log.
   'POST /api/log': body => {
     console.error(`page error: ${String(body.text).slice(0, 2000)}`);
+    return {};
+  },
+  // Tweak's changes to a Canopy material, into its .mat in the working tree (never committed here).
+  'POST /api/material/write': body => {
+    const entry = JSON.parse(fs.readFileSync(INDEX, 'utf8')).entries[body.guid];
+    if (!entry || !entry.path.endsWith('.mat')) throw new Error(`no material ${body.guid}`);
+    const file = path.join(S.REPO, entry.path);
+    if (!fs.existsSync(file)) throw new Error(`${entry.path} isn't checked out`);
+    fs.writeFileSync(file, require('./tools/convert-materials.js').setTweaks(fs.readFileSync(file, 'utf8'), body.values || {}));
+    console.log(`tweak: ${entry.path}: ${JSON.stringify(body.values)}`);
     return {};
   },
   // Tweak: the families among these prefab sources, with their vars and the pieces they make.
@@ -450,13 +508,14 @@ const api = {
   'POST /api/tweak/textures': async body => {
     const w = tweakFolder(body.folder);
     const reply = await ask(w.folder, w.command, { op: 'textures', values: body.values || {} });
-    const out = {};
-    for (const key of ['map', 'normal']) {
-      const name = `tw${Date.now().toString(16)}${key === 'map' ? 'c' : 'n'}.png`;
-      fs.copyFileSync(reply[key], path.join(S.TEXTURES, name));
-      out[key] = `textures/${name}`;
-    }
-    return out;
+    // each pair its own stamp (hex, as the texture route wants), so none overwrites another
+    const copy = (pair, k) => Object.fromEntries(['map', 'normal'].map(key => {
+      const name = `tw${(Date.now() * 16 + k).toString(16)}${key === 'map' ? 'c' : 'n'}.png`;
+      fs.copyFileSync(pair[key], path.join(S.TEXTURES, name));
+      return [key, `textures/${name}`];
+    }));
+    // more: the atlases of the assets that have their own (a family's second material)
+    return { ...copy(reply, 0), more: (reply.more || []).map((m, k) => ({ assets: m.assets, ...copy(m, k + 1) })) };
   },
   // The values into the model's doc and the full build into Canopy (the page then reloads).
   'POST /api/tweak/write': body => {
@@ -507,8 +566,9 @@ const api = {
     const file = path.join(SCENES, name + '.md');
     if (fs.existsSync(file)) throw new Error(`${name} already exists`);
     fs.mkdirSync(SCENES, { recursive: true });
-    const area = body.area ? `- Area: ${safeName(body.area)}\n` : '';
-    if (area && !fs.existsSync(path.join(S.AREAS, body.area.trim() + '.json'))) throw new Error(`no area ${body.area}`);
+    const areas = body.area ? [body.area, ...(body.also || [])].map(a => safeName(String(a))) : [];
+    for (const a of areas) if (!fs.existsSync(path.join(S.AREAS, a + '.json'))) throw new Error(`no area ${a}`);
+    const area = areas.map(a => `- Area: ${a}\n`).join('');
     fs.writeFileSync(file, `---\nname: ${name}\ntype: scene\n---\n# Scene\n\n${area}`);
     return { name };
   },
@@ -528,6 +588,23 @@ function send(res, status, type, data) {
 // client): its ETag is its size and modification time, so an unchanged file costs a stat and a
 // 304, not a read (Oak's 1272 meshes: about 0.4 s of stats against 2.5 s of reads), and a file
 // rebuilt or edited is sent again.
+// Compresses what loads found uncompressed (tools/texture-astc.js), one run at a time, at low
+// priority so it doesn't slow the page it is working for.
+let compressing = false;
+const compressQueue = new Map();
+function compressTextures() {
+  for (const t of S.takeAstcWanted()) compressQueue.set(t.astc, t);
+  if (compressing || !compressQueue.size) return;
+  compressing = true;
+  const run = spawn('nice', ['-n', '10', process.execPath, path.join(S.ROOT, 'tools', 'texture-astc.js')], { stdio: ['pipe', 'inherit', 'inherit'] });
+  run.stdin.end(JSON.stringify([...compressQueue.values()]));
+  compressQueue.clear();
+  run.on('close', () => {
+    compressing = false;
+    compressTextures();
+  });
+}
+
 function serveFile(req, res, file) {
   fs.stat(file, (error, st) => {
     if (error || !st.isFile()) return send(res, 404, 'text/plain', 'not found');
@@ -589,7 +666,8 @@ http.createServer((req, res) => {
   // Inspection models (tools such as mesh-clean.js write them; scene pieces "inspect:<Name>").
   const inspect = /^\/inspect\/([\w .%-]+\.obj)$/.exec(url.pathname);
   if (inspect) return serveFile(req, res, path.join(S.ROOT, 'cache', 'inspect', path.basename(decodeURIComponent(inspect[1]))));
-  const texture = /^\/textures\/((?:wt)?[0-9a-f]{38,40}-\d+\.(png|jpg)|tw[0-9a-f]+[cn]\.png)$/.exec(url.pathname);
+  // Any name without a slash: a stricter pattern hid the normal maps from gray, whose new suffix it refused.
+  const texture = /^\/textures\/([\w.-]+\.(?:png|jpg|astcm))$/.exec(url.pathname);
   if (texture) return serveFile(req, res, path.join(S.TEXTURES, texture[1]));
   // Layout's own materials' textures (materials/, beside their .json).
   const local = /^\/materials\/([\w .%-]+\.(?:png|jpg))$/.exec(url.pathname);
