@@ -11,6 +11,7 @@ const Texts = require('./tools/texts.js');
 const Shapes = require('./tools/shapes.js');
 const Timing = require('./tools/timing.js');
 const Assemblage = require('./tools/assemblage.js');
+const Placements = require('./tools/placements.js');
 const Conditions = require('./tools/conditions.js');
 const Moods = require('./tools/moods.js');
 
@@ -39,6 +40,7 @@ const INDEX = path.join(__dirname, 'cache', 'guid-index.json');
 const CANOPY_GIT = ['--git-dir=' + process.env.HOME + '/git-repos/Canopy.git'];
 const listeners = new Set();
 let watched = null, refreshing = false;
+const selfWritten = new Map(); // Canopy path -> the time Layout wrote it (assemblage placements)
 function canopyTimes() {
   const local = Object.values(JSON.parse(fs.readFileSync(INDEX, 'utf8')).entries).filter(e => e.local).map(e => e.path);
   const files = new Map(), dirs = new Map();
@@ -116,6 +118,8 @@ setInterval(() => {
     const changed = [];
     for (const [k, t] of now.files) if (watched.files.get(k) !== t) changed.push(k);
     for (const [k, t] of now.dirs) if (watched.dirs.get(k) !== t) changed.push(k);
+    // a scene the page itself just changed (an assemblage placed: the page already shows it)
+    for (let i = changed.length - 1; i >= 0; i--) if (selfWritten.get(changed[i]) === now.files.get(changed[i])) changed.splice(i, 1);
     if (!changed.length) {
       settling = null;
       watched = now;
@@ -218,6 +222,48 @@ function tweakFolder(folder) {
   return w;
 }
 
+// Areas in the order their places are played (Ken, 2026-11-09), by name: Game first (drawn with
+// every Canopy scene), then a biome's (Tangle), an
+// outland's unity.json title (Black Isle, after Hawthorn, whose part it is), one of Game's places
+// (Temple with Beech, the Stronghold last); anything else after (Tangle Terrain, a work in
+// progress, not a Canopy scene), by name.
+function areaOrder(areas) {
+  const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'unity.json'), 'utf8'));
+  const { rank } = Conditions.stageOrder(), raw = config.scenes || {}, everywhere = (config.defaults || {}).with || [];
+  const placeOf = a => {
+    if (everywhere.includes(a)) return -1; // Game, drawn with every Canopy scene: first
+    if (a in rank) return rank[a];
+    for (const [scene, c] of Object.entries(raw)) {
+      const stage = c.title === a && Config.load(scene).stage; // an outland: after its biome
+      if (stage && stage in rank) return rank[stage] + 0.25;
+      const place = (c.places || []).find(p => p.title === a);
+      if (place) return place.from === null ? 1e3 : (rank[place.from] ?? 1e3) + 0.5;
+    }
+    return 1e4;
+  };
+  return areas.slice().sort((a, b) => placeOf(a) - placeOf(b) || a.localeCompare(b));
+}
+// When each area is needed for ☰ Fast forward (Ken, 2026-11-09: fast-forwarding loads every scene
+// the game would show at that stage): the earliest stage among its pieces' places
+// (Conditions.placeStage: Temple's is the Tutorial, for the Approach), or null for one with no staged
+// piece, always shown (the Stronghold); auto false for a terrain-only area (Tangle Terrain, a work
+// in progress), never loaded this way. Kept by the file's time.
+const areaStageCache = new Map();
+function areaStage(area) {
+  const file = path.join(S.AREAS, area + '.json'), mtime = fs.statSync(file).mtimeMs;
+  const kept = areaStageCache.get(area);
+  if (kept && kept.mtime === mtime) return kept.value;
+  const a = JSON.parse(fs.readFileSync(file, 'utf8')), { rank } = Conditions.stageOrder();
+  let from = null;
+  const placeStage = Conditions.placeStager(a.source.scene);
+  for (const p of a.pieces) {
+    const stage = p.path ? placeStage(p.path) : null;
+    if (stage && stage in rank && (from === null || rank[stage] < rank[from])) from = stage;
+  }
+  const value = { from, auto: !a.source.terrainOnly };
+  areaStageCache.set(area, { mtime, value });
+  return value;
+}
 const listNames = (dir, ext) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith(ext)).map(f => f.slice(0, -ext.length)).sort() : []);
 // A scene or area name is a file name; it may not walk out of its folder.
 const safeName = name => {
@@ -361,7 +407,9 @@ function environment(unityScene, problems, scenes = []) {
 const api = {
   'GET /api/list': () => ({
     composed: listNames(SCENES, '.md'),
-    areas: listNames(S.AREAS, '.json'),
+    areas: areaOrder(listNames(S.AREAS, '.json')),
+    areaStages: Object.fromEntries(listNames(S.AREAS, '.json').map(a => [a, areaStage(a)])),
+    stageOrder: Conditions.stageOrder().order, // the chooser's FF: <stage> entries, in play order
     unityScenes: listNames(UNITY_SCENES, '.unity')
   }),
   'GET /api/palette': () => {
@@ -374,7 +422,8 @@ const api = {
     const index = JSON.parse(fs.readFileSync(path.join(__dirname, 'cache', 'guid-index.json'), 'utf8')).entries;
     const under = dir => new Set(Object.values(index).filter(e => e.path.startsWith(dir) && e.path.endsWith('.prefab')).map(e => path.basename(e.path, '.prefab')));
     const assembled = under('Assets/Assemblages/'), modl = under('Assets/Modl/');
-    const scenes = Assemblage.scenes().map(name => ({ name, prefab: Assemblage.pascal(name) })).filter(s => assembled.has(s.prefab));
+    // origin: where a one-of-a-kind was authored (its "- Origin:"), where Add puts it first
+    const scenes = Assemblage.scenes().map(name => ({ name, prefab: Assemblage.pascal(name), origin: S.originLine(fs.readFileSync(path.join(SCENES, name + '.md'), 'utf8')) })).filter(s => assembled.has(s.prefab));
     return { newAssets: docs.newAssets, shaped: Object.keys(docs.shapes), shapeErrors: docs.shapeErrors, reuses, prefabs: prefabs.filter(p => !assembled.has(p)), modl: [...modl].sort(), scenes };
   },
   'GET /api/texts': () => ({ file: Texts.FILE, texts: Texts.loadTexts(S.REPO, JSON.parse(fs.readFileSync(path.join(__dirname, 'cache', 'guid-index.json'), 'utf8')).entries, S.blobs) }),
@@ -411,8 +460,11 @@ const api = {
       symbolLines = Conditions.symbolLines(text);
     }
     const scenesOf = {};
-    for (const other of new Set([...lines.slice(1), ...q.getAll('also').map(safeName)])) {
-      if (other === name || other === area || !fs.existsSync(path.join(S.AREAS, other + '.json'))) continue;
+    // and those unity.json says go with the scene's Canopy scene (Game with every one; Hawthorn's
+    // outland Black Isle), which may be known only once the first area alongside is read (a
+    // composed scene with no Area line, Tangle added by ☰ Areas: Ken, 2026-11-09).
+    const addArea = other => {
+      if (other === name || other === area || also.includes(other) || !fs.existsSync(path.join(S.AREAS, other + '.json'))) return;
       const loaded = loadArea(other);
       if (!unityScene) unityScene = loaded.source.scene;
       if (loaded.source.scene !== unityScene) {
@@ -421,7 +473,10 @@ const api = {
       }
       base = [...base, ...loaded.pieces];
       also.push(other);
-    }
+    };
+    for (const other of new Set([...lines.slice(1), ...q.getAll('also').map(safeName)])) addArea(other);
+    const withAreas = unityScene ? Config.load(unityScene).with : [];
+    for (const other of withAreas) addArea(other);
     // Included scenes' pieces go beneath, first (so their singletons win): unity.json's include
     // (World) for what comes from Canopy, an imported area or a scene on one, then "- Include:" lines.
     const includeProblems = [];
@@ -453,11 +508,20 @@ const api = {
     const symbols = Timing.time('symbols', () => Conditions.symbols(unityScene, { ...cfg.symbols, ...symbolLines }, cfg.stage));
     const sceneSymbols = Object.fromEntries(Object.keys(scenesOf).map(s => { const c = Config.load(s); return [s, Conditions.symbols(s, { ...c.symbols, ...symbolLines }, c.stage)]; }));
     for (const p of [...base, ...pieces]) p.cull = Config.cullDistance(cfg, { ...p, source: p.source || (library[p.name] && library[p.name].source) || '' });
+    // the stage each Canopy piece shows from, for ☰ Fast forward (Conditions.placeStage); none: always
+    const stagers = new Map(); // by scene: its unity.json and the stages read once
+    for (const p of [...base, ...pieces]) {
+      const scene = p.unityScene || unityScene;
+      if (!p.path || !scene) continue;
+      if (!stagers.has(scene)) stagers.set(scene, Conditions.placeStager(scene));
+      const from = stagers.get(scene)(p.path);
+      if (from) p.from = from;
+    }
     const env = Timing.time('environment', () => environment(unityScene, problems, [unityScene, ...Object.keys(scenesOf)]));
     // logged once the reply is made (only its JSON comes after), so the log has nearly all its time
     compressTextures();
     console.log(`load: ${name}: server ${Timing.report()}; ${pieces.length} pieces${area ? ` on ${area}` : ''}${also.length ? ` with ${also.join(', ')}` : ''} (${base.length} beneath)`);
-    return { name, editable, pieces, area, origin, switch: switches, assemblage, base, library, materials, problems, environment: env, lod: { fov: cfg.lodFov, bias: cfg.lodBias }, clip: { near: cfg.near, far: cfg.far, fog: cfg.farClip }, culling: { perFrame: cfg.culling.perFrame, margin: cfg.culling.margin }, candidates, symbols, sceneSymbols, also, areaLines: lines };
+    return { name, editable, pieces, area, origin, switch: switches, assemblage, base, library, materials, problems, environment: env, lod: { fov: cfg.lodFov, bias: cfg.lodBias }, clip: { near: cfg.near, far: cfg.far, fog: cfg.farClip }, culling: { perFrame: cfg.culling.perFrame, margin: cfg.culling.margin }, candidates, symbols, sceneSymbols, fastForward: Timing.time('fast forward', () => Conditions.fastForward()), immune: S.daggerImmune(), gravity: S.physicsGravity(), also, withAreas, areaLines: lines, unityScene, assemblagePrefab: assemblage ? Assemblage.pascal(name) : null };
   },
   'POST /api/prepare': body => {
     const result = withShapes(S.prepare(body.names || []), body.names || []);
@@ -471,6 +535,26 @@ const api = {
     return {};
   },
   // Page errors, so they can be read in layout.log.
+  // How often Ken uses each control (Ken, 2026-11-08: records for future revisions of the ☰ menu):
+  // the page sends counts by name ("Light › Fog", "game: take") every so often; usage.json keeps
+  // each one's count and its first and last day.
+  'POST /api/usage': body => {
+    const file = path.join(__dirname, 'usage.json');
+    let usage = {};
+    try {
+      usage = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch { /* none yet */ }
+    const day = new Date().toISOString().slice(0, 10);
+    for (const [name, n] of Object.entries(body.counts || {})) {
+      if (!Number.isInteger(n) || n <= 0 || name.length > 80) continue;
+      const u = usage[name] = usage[name] || { count: 0, first: day, last: day };
+      u.count += n;
+      u.last = day;
+    }
+    const sorted = Object.fromEntries(Object.entries(usage).sort((a, b) => b[1].count - a[1].count));
+    fs.writeFileSync(file, JSON.stringify(sorted, null, 1) + '\n');
+    return {};
+  },
   'POST /api/log': body => {
     console.error(`page error: ${String(body.text).slice(0, 2000)}`);
     return {};
@@ -572,8 +656,22 @@ const api = {
     fs.writeFileSync(file, `---\nname: ${name}\ntype: scene\n---\n# Scene\n\n${area}`);
     return { name };
   },
+  // An assemblage placed, moved or deleted in a Canopy scene from an imported area (Ken, 2026-11-09:
+  // the scene refers to each instance it wants; tools/placements.js).
+  'POST /api/placement': body => {
+    const scene = safeName(body.scene);
+    const done = result => {
+      const rel = `Assets/Scenes/${scene}.unity`;
+      selfWritten.set(rel, fs.statSync(path.join(S.REPO, rel)).mtimeMs);
+      return result;
+    };
+    if (body.op === 'add') return done(Placements.add(scene, safeName(body.prefab), body.placement));
+    if (body.op === 'move') return done(Placements.move(scene, String(body.instance), body.placement));
+    if (body.op === 'delete') return done(Placements.remove(scene, String(body.instance)) || { ok: true });
+    throw new Error(`bad op ${body.op}`);
+  },
   'POST /api/extract': body => {
-    const name = `${safeName(body.scene)} ${safeName(body.name)}`;
+    const name = safeName(body.name); // the biome or place it holds (Tangle)
     const area = S.extractArea(body.scene, body.center.map(Number), +body.half, Boolean(body.terrainOnly));
     S.saveArea(name, area);
     return { name, count: area.pieces.length };

@@ -9,10 +9,10 @@
 //   top (the scene piece's object); piece; params (the class's static params, then the script
 //   line's settings, then the piece's); fields (a stand-in's saved C# fields, else {}); object
 //   (a stand-in's game object key); environment() (unity.json's, as the scene has it); leafWind()
-//   (the leaf wind's shader uniforms, app.js windPatch, for LeafGust and Wind); windLevels() (☰ View's
+//   (the leaf wind's shader uniforms, app.js windPatch, for LeafGust and Wind); windLevels() (☰ World's
 //   wind and gust levels and kind);
 //   texture(description, srgb) (a material's texture, a promise); describe(guid) (a material's
-//   description, tools/scene.js); textures() (whether ☰ View ▸ Textures is on); eye (the camera in this.space's
+//   description, tools/scene.js); textures() (whether ☰ Surfaces › Textures is on); eye (the camera in this.space's
 //   coordinates, once makeSpace has made one).
 // A class with static singleton = true runs once: a second piece with it is hidden and its scripts
 // stopped (the first loaded wins; a scene's included pieces load before its own).
@@ -203,7 +203,7 @@
                 if (!cls) return;
                 const s = scripts[i];
                 const t = new cls();
-                Object.assign(t, { THREE: world.THREE, camera: world.camera, scene: world.scene, environment: world.environment, leafWind: world.leafWind, windLevels: world.windLevels, texture: world.texture, describe: world.describe, textures: world.textures,
+                Object.assign(t, { THREE: world.THREE, camera: world.camera, scene: world.scene, environment: world.environment, leafWind: world.leafWind, windLevels: world.windLevels, texture: world.texture, describe: world.describe, textures: world.textures, gravity: world.gravity,
                     group, top, piece, prefab, name: s.name, object: s.go || null, fields: s.fields || {}, lod: s.lod || null, eye: new world.THREE.Vector3(),
                     params: { ...paramsOf(cls), ...settingsOf(s.settings), ...settingsOf(piece.extra) } });
                 if (s.id) prefab.components.set(s.id, t);
@@ -281,6 +281,7 @@
         for (const mesh of p.group.children) {
             const part = mesh.userData.part;
             if (!part || !part.go) continue;
+            if (mesh.userData.taken) continue; // taken in game mode (web/play.js): where the player put it, until game mode ends
             movesDown(p, part.go, all);
             if (!mesh.userData.placed) {
                 if (all.equals(IDENTITY)) continue; // never moved: as the prefab put it

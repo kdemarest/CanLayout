@@ -424,4 +424,4 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { split, dangling, sameObjects };
+module.exports = { split, dangling, sameObjects, readScene, find, documents, compose, relative, vec, num, ref };

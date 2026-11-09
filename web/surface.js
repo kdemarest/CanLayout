@@ -465,7 +465,7 @@ void main() {
     const uniforms = {
         canopySunDirection: { value: new THREE.Vector3(0, 1, 0) },
         canopySunLight: { value: new THREE.Color(1, 1, 1) },
-        canopySunHighlight: { value: new THREE.Color(1, 1, 1) }, // the sun in General's highlight: canopySunLight, but for ☰ View › Full sun highlight
+        canopySunHighlight: { value: new THREE.Color(1, 1, 1) }, // the sun in General's highlight: canopySunLight, but for ☰ Light › Full sun highlight
         canopyAmbient: { value: new THREE.Color(0.5, 0.5, 0.5) },
         canopyFogColor: { value: new THREE.Color(0.5, 0.5, 0.5) },
         canopyFogDensitySquared: { value: 0 },

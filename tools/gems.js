@@ -2,8 +2,9 @@
 // GemLocus makes it (GemLocus.MakeGem, GemCreatorService.Make): GemTypes (Prefabs/Shared/GemTypes
 // .prefab, with Game.unity's additions) gives the locus's ability a shape and a color; the shape's
 // gem prefab is made at the locus's gemHolder, keeping its own rotation (relative to the locus)
-// and its own world size (Make.cs); everything under its model takes the color's material, and
-// its two effects the color's color (Gem.SetBreadcrumbColor). On a locus its breadcrumbs show and
+// and its own world size (Make.cs) times Rules' gemScaleInWorld (IcGemPlacement); everything under
+// its model takes the color's material, and its two effects the color's color
+// (Gem.SetBreadcrumbColor). On a locus its breadcrumbs show and
 // its puisance doesn't (Gem.UpdateEffects: puisance is for a gem locked in place); the rest only
 // play on events. Layout does the same when importing a scene: the gem's parts, its breadcrumbs'
 // particle system and their objects join the locus's piece. A locus whose ability has no gem type
@@ -41,6 +42,11 @@ function gemTypes() {
   addTypes(f);
   const game = 'Assets/Scenes/Game.unity';
   if (fs.existsSync(path.join(U.REPO, game))) addTypes(read(game)); // its own GemTypes' added types
+  // A gem's prefab is modeled the size it is in a ring; out of a ring it is gemScaleInWorld times
+  // that (IcGemPlacement.OnInception; Ken, 2026-11-08: about a softball).
+  // (a field of a struct in the prefab, so matched by name)
+  const rules = /\n\s+gemScaleInWorld: ([\d.]+)/.exec(fs.readFileSync(path.join(U.REPO, 'Assets/Prefabs/Shared/Rules.prefab'), 'utf8'));
+  out.scaleInWorld = rules ? +rules[1] : 3; // else Rules.cs's default
   types = out;
   typesKey = key;
   return out;
@@ -64,10 +70,11 @@ function withGem(prefab, pieceScale) {
   const model = refKey(info.fields.model), puisance = refKey(info.fields.puisancePfx);
   // Its matrix in the locus's space: at the holder, its prefab's rotation, its own world size.
   const h = holder.m, s = gem.rootTrs.scl;
-  const G = U.trs({ x: h[3], y: h[7], z: h[11] }, gem.rootTrs.rot, { x: s.x / (pieceScale.x || 1), y: s.y / (pieceScale.y || 1), z: s.z / (pieceScale.z || 1) });
+  const k = t.scaleInWorld || 1;
+  const G = U.trs({ x: h[3], y: h[7], z: h[11] }, gem.rootTrs.rot, { x: k * s.x / (pieceScale.x || 1), y: k * s.y / (pieceScale.y || 1), z: k * s.z / (pieceScale.z || 1) });
   const material = t.materials[type.color] || null;
   const color = t.colors[type.color];
-  const parts = gem.parts.map(p => ({ ...p, m: U.mul(G, p.m), go: key(p.go), ...(p.lod ? { lod: { key: key(p.lod.key), levels: p.lod.levels } } : {}), ...(model && p.go && under(p.go, model) && material ? { material } : {}) }));
+  const parts = gem.parts.map(p => ({ ...p, m: U.mul(G, p.m), go: key(p.go), ...(p.item ? { item: { ...p.item, key: key(p.item.key), abilityId: locus.fields.abilityId, color: color.slice(0, 3) } } : {}), ...(p.lod ? { lod: { key: key(p.lod.key), levels: p.lod.levels } } : {}), ...(model && p.go && under(p.go, model) && material ? { material } : {}) }));
   const prefixFields = fields => Object.fromEntries(Object.entries(fields || {}).map(([k, v]) => [k, v && v.ref ? { ref: key(v.ref) } : v]));
   const scripts = (gem.scripts || []).filter(sc => sc.fields && !(puisance && under(sc.go, puisance))).map(sc => ({
     ...sc, id: key(sc.id), go: key(sc.go), ...(sc.renderer ? { renderer: key(sc.renderer) } : {}),

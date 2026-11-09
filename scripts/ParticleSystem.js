@@ -251,6 +251,7 @@ void main() {
             this.missed = 0; // seconds off screen, for pause and catch up
             this.emitted = 0; // particles made so far: a ribbon takes every ribbonCount-th
             this.orphans = []; // trails whose particles died, fading out point by point (dieWithParticles off)
+            this.scaling();
             this.build(Math.min(f.maxParticles, 2000));
             if (f.trail) this.buildTrails(TRAIL_POINTS);
             if (f.prewarm && f.looping) for (let t = 0; t < f.duration; t += 0.1) this.step(0.1);
@@ -308,7 +309,7 @@ void main() {
         }
         // A particle's size and color (sRGB, as Unity keeps it) now, tl its life so far (0 to 1).
         sizeOf(p, tl) {
-            return p.size * (this.fields.sizeOverLife ? sample(this.fields.sizeOverLife, tl, p.rz) : 1);
+            return p.size * this.sizeScale * (this.fields.sizeOverLife ? sample(this.fields.sizeOverLife, tl, p.rz) : 1);
         }
         colorOf(p, tl) {
             const c = this.fields.colorOverLife ? colorAt(this.fields.colorOverLife, tl, p.rc) : [1, 1, 1, 1];
@@ -325,10 +326,31 @@ void main() {
             this.mesh.visible = on && this.fields.renderMode !== 5;
             if (this.trails) this.trails.mesh.visible = on;
         }
+        // Unity's scalingMode (Claude, 2026-11-09: 850 of the 1379 systems drawn, hierarchy-scaled under
+        // a cage's 0.25 and the like, were drawn up to 4 times too big and, in local space, moving 4
+        // times too far): hierarchy (0) scales the particles' size, where they start and, in local
+        // space, how they move by the emitter's world scale; local (1) by its own scale only, never
+        // its parents'; shape (2) only where they start, by its world scale. A local-space system is
+        // drawn inside its piece (scaled by the piece's scale), a world-space one in the world, so
+        // each scale is taken over what its space already gives. Sets eScale (the emitter matrix's),
+        // shapeScale (where particles start, before it) and sizeScale.
+        scaling() {
+            const f = this.fields, THREE = this.THREE, o = this.objectOf(this.object), objects = this.prefab.objects || {};
+            if (![0, 1, 2].includes(f.scaling)) throw new Error(`particles: no scalingMode on ${(o || {}).name || this.object}: re-import its area (tools/particles.js reads it)`);
+            if (!o) throw new Error(`particles: no object ${this.object} for the system`);
+            const len = m => Math.hypot(m[0], m[4], m[8]);
+            this.group.updateWorldMatrix(true, false);
+            const piece = Math.abs(new THREE.Vector3().setFromMatrixScale(this.group.matrixWorld).x) || 1;
+            const father = o.father && objects[o.father];
+            const world = len(o.m) * piece, own = father ? len(o.m) / (len(father.m) || 1) : world;
+            const k = f.scaling === 0 ? { size: world, shape: world, move: world } : f.scaling === 1 ? { size: own, shape: own, move: own } : { size: 1, shape: world, move: 1 };
+            if (f.world) Object.assign(this, { eScale: k.shape / piece, shapeScale: 1, sizeScale: k.size });
+            else Object.assign(this, { eScale: k.move / piece, shapeScale: k.shape / (k.move || 1), sizeScale: k.size / piece });
+        }
         // The emitter's place and turn in the space particles live in (the world's, or the prefab's).
         emitter() {
             const p = this.positionOf(this.object), q = this.rotationOf(this.object);
-            this.E.compose(p, q, this.v.set(1, 1, 1));
+            this.E.compose(p, q, this.v.set(this.eScale, this.eScale, this.eScale));
             if (this.fields.world) {
                 this.group.updateWorldMatrix(true, false);
                 this.E.premultiply(Space.mirrorX(this.group.matrixWorld.clone())); // Unity's world, from Three.js's
@@ -373,6 +395,7 @@ void main() {
             const f = this.fields, r = Math.random;
             for (let n = 0; n < count && this.particles.length < this.max; n++) {
                 const { pos, dir } = this.shape();
+                pos.multiplyScalar(this.shapeScale);
                 const vel = dir.multiplyScalar(sample(f.speed, tn, r()));
                 if (f.world) { pos.applyMatrix4(this.E); vel.applyQuaternion(this.Q); }
                 let rot = sample(f.rotation, tn, r());
@@ -403,8 +426,11 @@ void main() {
                     }
                 }
             }
-            // gravity, down in the world (in the emitter's axes when particles live there)
-            const down = new THREE.Vector3(0, -9.81, 0);
+            // gravity, down in the world (in the emitter's axes when particles live there): Canopy's
+            // physics gravity times the system's gravityModifier, as Unity's (Claude, 2026-11-09: it
+            // was 9.81, Unity's default, but Canopy's is 3, ProjectSettings/DynamicsManager.asset, so
+            // the 607 systems rising by a negative modifier, -0.2 mostly, rose 3.3 times too fast)
+            const down = new THREE.Vector3(0, -this.gravity(), 0);
             const toLocal = this.Q.clone().invert();
             if (!f.world) down.applyQuaternion(toLocal);
             const vol = f.velocityOverLife, noise = f.noise;

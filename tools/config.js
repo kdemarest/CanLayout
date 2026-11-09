@@ -70,7 +70,7 @@ const ENVIRONMENT = {
   skyBlendMin: 60, skyBlendMax: 300, skyBlackMult: -9, skyBlackAdd: 1200, skyTint: '#808080', skyTintLevel: 0, skyRadius: null,
   // LeafSplit's leaves in the wind (Ken, 2026-10-31): Canopy's iLeafCutWind shader's properties, the
   // same defaults (web/app.js windPatch draws its motion), to tune here and then set on the material.
-  // The levels, the direction and the gusts are LeafGust's (scripts/LeafGust.js; ☰ View sets the
+  // The levels, the direction and the gusts are LeafGust's (scripts/LeafGust.js; ☰ World sets the
   // levels). sway and flutter: how far wind at strength 1 (medium) turns a leaf downwind and across
   // its face (the share of downwind or the face's direction added to the leaf's: 1 turns a leaf
   // across the wind 45 degrees), the steady wind and gusts added; frequency (flutters a second); the wave gusts' gustLength (m between them), gustSpeed (m/s) and gustShape
@@ -106,7 +106,18 @@ function load(scene) {
     show: [...rules(d.show), ...rules(s.show)],
     hide: [...rules(d.hide), ...rules(s.hide)],
     include: s.include ?? d.include ?? [],
-    stage: s.stage ?? d.stage ?? null,
+    // An outland's scene (Black Isle, the aerial island where Hawthorn's thrusters are: Ken,
+    // 2026-11-09) is part of its biome's (partOf), with no stage of its own: it plays as that scene.
+    partOf: s.partOf ?? null,
+    stage: s.stage ?? (s.partOf ? ((raw.scenes || {})[s.partOf] || {}).stage ?? (/^(\w+)Scene$/.exec(s.partOf) || [])[1] ?? null : null) ?? d.stage ?? null,
+    // areas drawn with this scene's whenever it is open: Game's World with every Canopy scene, as the
+    // game always has Game.unity loaded (defaults; Ken, 2026-11-09), Hawthorn's outland Black Isle
+    with: [...new Set([...(d.with || []), ...(s.with || [])])],
+    // where in the scene each place is and the stage it shows from (Ken, 2026-11-09): [{ path, from, title }]
+    places: s.places ?? [],
+    // after the places: a path naming its stage (Game's World/<Stage>Biome/...), a regex
+    stagePath: s.stagePath ? new RegExp(s.stagePath) : null,
+    title: s.title ?? null, // the name of its area when not its scene's (BlackIsleScene: Black Isle)
     symbols: { ...d.symbols, ...s.symbols },
     environment: { ...ENVIRONMENT, ...d.environment, ...s.environment, leafWind: { ...ENVIRONMENT.leafWind, ...(d.environment || {}).leafWind, ...(s.environment || {}).leafWind } }
   };
@@ -136,7 +147,7 @@ function extractKey(scene) {
   const c = load(scene), rules = list => list.map(r => `${r.kind}:${r.pattern}`);
   // which C# scripts have stand-ins (layout/scripts/): an area keeps theirs only
   const standIns = fs.existsSync(STANDINS) ? fs.readdirSync(STANDINS).filter(f => f.endsWith('.js')).sort() : [];
-  return JSON.stringify({ show: rules(c.show), hide: rules(c.hide), treeChunks: c.treeChunks.source, gridDrawsInactiveParts: c.gridDrawsInactiveParts, gridLodByDistance: c.gridLodByDistance, leafThinning: c.leafThinning, standIns, reader: require('./unity.js').READER });
+  return JSON.stringify({ show: rules(c.show), hide: rules(c.hide), treeChunks: c.treeChunks.source, gridDrawsInactiveParts: c.gridDrawsInactiveParts, gridLodByDistance: c.gridLodByDistance, leafThinning: c.leafThinning, standIns, reader: require('./unity.js').READER, substitute: (JSON.parse(fs.readFileSync(FILE, 'utf8')).defaults || {}).substitute || [] });
 }
 const STANDINS = path.join(__dirname, '..', 'scripts');
 
