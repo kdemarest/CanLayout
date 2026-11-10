@@ -29,8 +29,8 @@
             canopyLightPos: { value: pos }, // view space, w: 1 / range squared
             canopyLightColor: { value: color }, // linear color times intensity; a: 1 / (cos inner - cos outer)
             canopyLightSpot: { value: spot }, // a spot's forward (view space) and cos of its outer half angle; a point 0, 0, 0, -1
-            canopyLightCount: { value: SLOTS }, // ☰ View › Lights: 4, or 0 off
-            canopyLightView: { value: 0 } // ☰ View › Light crowding: color by how many lights reach
+            canopyLightCount: { value: SLOTS }, // ☰ Light › Lights: 4, or 0 off
+            canopyLightView: { value: 0 } // ☰ Light › Light crowding: color by how many lights reach
         };
         const slots = new Array(MAX).fill(null); // [index] -> a light (1..31), each keeping its slot while chosen
         const tracked = []; // objects lit as General, as they load: { group, meshes, lights }, a LOD group's levels one object

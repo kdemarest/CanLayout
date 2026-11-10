@@ -230,6 +230,10 @@ void main() {
             const f = this.fields;
             const d = (f.material && this.describe(f.material.asset)) || null;
             this.playing = f.playOnAwake && f.renderOn !== false && Boolean(f.emission) && !(d && d.shaderName === "Canopy/Blank");
+            // one an EffectBoolFade fades in (tools/unity.js fades): it plays while a gate on it or its
+            // piece holds (web/tickable.js switches it off when it doesn't); with none, nothing in
+            // Layout would ever fade it in
+            if (f.fades && !this.when && !(this.piece && this.piece.when)) this.playing = false;
             if (!this.playing) return;
             for (const u of f.unsupported) {
                 if (warned.has(u)) continue;
@@ -238,9 +242,6 @@ void main() {
             }
             const THREE = this.THREE;
             this.makeSpace(f.world);
-            this.particles = [];
-            this.clock = -sample(f.startDelay, 0, Math.random());
-            this.owed = 0;
             this.E = new THREE.Matrix4();
             this.R = new THREE.Matrix4();
             this.Q = new THREE.Quaternion();
@@ -248,13 +249,36 @@ void main() {
             this.w = new THREE.Vector3();
             this.box = new THREE.Box3(); // round its particles, in its space's axes, as of the last update
             this.seen = new THREE.Box3();
+            this.scaling();
+            this.build(Math.min(f.maxParticles, 2000));
+            if (f.trail) this.buildTrails(TRAIL_POINTS);
+            this.restart();
+        }
+        // Playing from the start, none yet (prewarmed, a looping one that says so), as on awake.
+        restart() {
+            const f = this.fields;
+            this.particles = [];
+            this.clock = -sample(f.startDelay, 0, Math.random());
+            this.owed = 0;
+            this.stepped = false; // no step yet: a burst at time 0 is still to fire
             this.missed = 0; // seconds off screen, for pause and catch up
             this.emitted = 0; // particles made so far: a ribbon takes every ribbonCount-th
             this.orphans = []; // trails whose particles died, fading out point by point (dieWithParticles off)
-            this.build(Math.min(f.maxParticles, 2000));
-            if (f.trail) this.buildTrails(TRAIL_POINTS);
+            this.box.makeEmpty();
             if (f.prewarm && f.looping) for (let t = 0; t < f.duration; t += 0.1) this.step(0.1);
         }
+        // Its object switched off (web/tickable.js): its particles gone, as Unity's SetActive(false)
+        // takes them; back on, it plays from the start, as on awake.
+        switchOff() {
+            if (!this.playing) return;
+            this.particles = [];
+            this.orphans = [];
+            this.show(false);
+        }
+        switchOn() {
+            if (this.playing) this.restart();
+        }
+
         build(max) {
             const THREE = this.THREE, f = this.fields;
             const geometry = new THREE.InstancedBufferGeometry();
@@ -308,7 +332,7 @@ void main() {
         }
         // A particle's size and color (sRGB, as Unity keeps it) now, tl its life so far (0 to 1).
         sizeOf(p, tl) {
-            return p.size * (this.fields.sizeOverLife ? sample(this.fields.sizeOverLife, tl, p.rz) : 1);
+            return p.size * this.sizeScale * (this.fields.sizeOverLife ? sample(this.fields.sizeOverLife, tl, p.rz) : 1);
         }
         colorOf(p, tl) {
             const c = this.fields.colorOverLife ? colorAt(this.fields.colorOverLife, tl, p.rc) : [1, 1, 1, 1];
@@ -325,16 +349,41 @@ void main() {
             this.mesh.visible = on && this.fields.renderMode !== 5;
             if (this.trails) this.trails.mesh.visible = on;
         }
+        // Unity's scalingMode (Claude, 2026-11-09: 850 of the 1379 systems drawn, hierarchy-scaled under
+        // a cage's 0.25 and the like, were drawn up to 4 times too big and, in local space, moving 4
+        // times too far): hierarchy (0) scales the particles' size, where they start and, in local
+        // space, how they move by the emitter's world scale; local (1) by its own scale only, never
+        // its parents'; shape (2) only where they start, by its world scale. A local-space system is
+        // drawn inside its piece (scaled by the piece's scale), a world-space one in the world, so
+        // each scale is taken over what its space already gives. Sets eScale (the emitter matrix's),
+        // shapeScale (where particles start, before it) and sizeScale.
+        scaling() {
+            const f = this.fields, THREE = this.THREE, o = this.objectOf(this.object), objects = this.prefab.objects || {};
+            if (![0, 1, 2].includes(f.scaling)) throw new Error(`particles: no scalingMode on ${(o || {}).name || this.object}: re-import its area (tools/particles.js reads it)`);
+            if (!o) throw new Error(`particles: no object ${this.object} for the system`);
+            const len = m => Math.hypot(m[0], m[4], m[8]);
+            this.group.updateWorldMatrix(true, false);
+            const piece = Math.abs(new THREE.Vector3().setFromMatrixScale(this.group.matrixWorld).x) || 1;
+            const father = o.father && objects[o.father];
+            const world = len(o.m) * piece, own = father ? len(o.m) / (len(father.m) || 1) : world;
+            const k = f.scaling === 0 ? { size: world, shape: world, move: world } : f.scaling === 1 ? { size: own, shape: own, move: own } : { size: 1, shape: world, move: 1 };
+            if (f.world) Object.assign(this, { eScale: k.shape / piece, shapeScale: 1, sizeScale: k.size });
+            else Object.assign(this, { eScale: k.move / piece, shapeScale: k.shape / (k.move || 1), sizeScale: k.size / piece });
+        }
         // The emitter's place and turn in the space particles live in (the world's, or the prefab's).
         emitter() {
-            const p = this.positionOf(this.object), q = this.rotationOf(this.object);
-            this.E.compose(p, q, this.v.set(1, 1, 1));
-            if (this.fields.world) {
-                this.group.updateWorldMatrix(true, false);
-                this.E.premultiply(Space.mirrorX(this.group.matrixWorld.clone())); // Unity's world, from Three.js's
-            }
+            const p = this.positionOf(this.object), q = this.fields.aim ? this.aimed(p) : this.rotationOf(this.object);
+            this.E.compose(p, q, this.v.set(this.eScale, this.eScale, this.eScale));
+            if (this.fields.world) this.E.premultiply(Space.mirrorX(this.worldMatrix())); // Unity's world, from Three.js's (moved with a carried item)
             this.Q.setFromRotationMatrix(this.R.extractRotation(this.E));
             return this.E;
+        }
+        // A guard's beam (tools/unity.js guardBeams): turned to fields.aim (the cage, in the prefab's
+        // axes) from p, as Transform.LookAt turns it: its Z there, its Y as near up as can be.
+        aimed(p) {
+            const THREE = this.THREE, z = new THREE.Vector3(...this.fields.aim).sub(p).normalize();
+            const x = new THREE.Vector3(0, 1, 0).cross(z).normalize(), y = z.clone().cross(x);
+            return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
         }
         // Where a new particle starts and which way it goes, in the emitter's own axes.
         shape() {
@@ -373,6 +422,7 @@ void main() {
             const f = this.fields, r = Math.random;
             for (let n = 0; n < count && this.particles.length < this.max; n++) {
                 const { pos, dir } = this.shape();
+                pos.multiplyScalar(this.shapeScale);
                 const vel = dir.multiplyScalar(sample(f.speed, tn, r()));
                 if (f.world) { pos.applyMatrix4(this.E); vel.applyQuaternion(this.Q); }
                 let rot = sample(f.rotation, tn, r());
@@ -390,21 +440,29 @@ void main() {
             const before = this.clock;
             this.clock += dt * f.simulationSpeed;
             if (this.clock >= 0 && (f.looping || this.clock <= f.duration)) {
-                const t = f.looping ? this.clock % f.duration : this.clock, prev = f.looping ? before % f.duration : before, tn = t / f.duration;
+                // prev: just before 0 on its first step, so a burst at time 0 fires as it starts
+                const t = f.looping ? this.clock % f.duration : this.clock, prev = !this.stepped ? -1e-9 : f.looping ? before % f.duration : before, tn = t / f.duration;
+                this.stepped = true;
                 this.owed += sample(f.emission.rate, tn, Math.random()) * factor * dt * f.simulationSpeed;
                 const whole = Math.floor(this.owed);
                 this.owed -= whole;
                 this.emit(whole, tn);
                 for (const b of f.emission.bursts) {
-                    for (let c = 0; c < b.cycles; c++) {
+                    // cycles 0 is Unity's Infinite: every interval through the system's duration
+                    // (Claude, 2026-11-10: the Tangle's DeviceSkyPfx, 20 every 10 s, never emitted)
+                    const cycles = b.cycles > 0 ? b.cycles : Math.max(1, Math.ceil((f.duration - b.time) / Math.max(b.interval, 0.01)));
+                    for (let c = 0; c < cycles; c++) {
                         const at = b.time + c * b.interval;
                         const crossed = prev <= t ? at > prev && at <= t : at > prev || at <= t; // the loop wrapped
                         if (crossed && Math.random() < b.probability) this.emit(Math.round(sample(b.count, tn, Math.random())), tn);
                     }
                 }
             }
-            // gravity, down in the world (in the emitter's axes when particles live there)
-            const down = new THREE.Vector3(0, -9.81, 0);
+            // gravity, down in the world (in the emitter's axes when particles live there): Canopy's
+            // physics gravity times the system's gravityModifier, as Unity's (Claude, 2026-11-09: it
+            // was 9.81, Unity's default, but Canopy's is 3, ProjectSettings/DynamicsManager.asset, so
+            // the 607 systems rising by a negative modifier, -0.2 mostly, rose 3.3 times too fast)
+            const down = new THREE.Vector3(0, -this.gravity(), 0);
             const toLocal = this.Q.clone().invert();
             if (!f.world) down.applyQuaternion(toLocal);
             const vol = f.velocityOverLife, noise = f.noise;

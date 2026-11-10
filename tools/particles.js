@@ -144,6 +144,9 @@ function describe(systemText, rendererText, props = null, rprops = null) {
     startDelay: curve(ps.startDelay), simulationSpeed: ps.simulationSpeed ?? 1,
     cullingMode: ps.cullingMode ?? 0, // off screen: 0 automatic, 1 pause and catch up, 2 pause, 3 always simulate
     world: ps.moveWithTransform === 1, // simulation space: 0 local, 1 world (2, custom, is taken as local)
+    // Unity's scalingMode: 0 hierarchy (every parent's scale), 1 local (its own only), 2 shape (only
+    // where particles start); unsaved, Unity's default for a new system, local
+    scaling: ps.scalingMode ?? 1,
     maxParticles: init.maxNumParticles ?? 1000,
     lifetime: curve(init.startLifetime), speed: curve(init.startSpeed), size: curve(init.startSize),
     rotation: curve(init.startRotation), randomizeRotation: init.randomizeRotationDirection || 0,

@@ -1,9 +1,10 @@
 // Pieces, areas, and the piece library for layout. Positions, rotations (Unity euler degrees),
 // and scales are Unity's (left-handed); the browser mirrors X.
 //   Composed scenes: docs/scenes/<Type> <Name>.md, Piece lines, edited in layout or by hand.
-//   Imported areas: layout/areas/<Scene> <Name>.json, cut from a Unity scene, never edited.
+//   Imported areas: layout/areas/<Name>.json, cut from a Unity scene, never edited; named for the
+//   biome or place they hold (Ken, 2026-11-09: Tangle, not TangleScene Whole).
 // CLI (from layout/):
-//   node tools/scene.js extract <Scene> <cx> <cy> <cz> <halfSize> <Name>
+//   node tools/scene.js extract <Scene> <cx> <cy> <cz> <halfSize> <Name> [--terrain] [--under <path>]
 //   node tools/scene.js prepare <piece name>...
 const fs = require('fs');
 const path = require('path');
@@ -21,6 +22,7 @@ const crypto = require('crypto');
 
 const ROOT = path.join(__dirname, '..');
 const CACHE = path.join(ROOT, 'cache');
+const { keep: Keep } = require('./keep.js');
 const LIBRARY = path.join(CACHE, 'pieces.json');
 const SUBMESHES = crypto.createHash('sha1').update('submeshes').digest('hex').slice(0, 8);
 const MESHES = path.join(CACHE, 'meshes');
@@ -91,6 +93,113 @@ function scriptsOf(p) {
 }
 // A prefab's parts as served: their object keys (part.go) only where a stand-in may move them.
 const servedParts = (p, parts) => ((p.scripts || []).some(s => s.fields) ? parts : parts.map(({ go, ...rest }) => rest));
+// What a tap in game mode can be on (Ken, 2026-11-09: a tap should always figure out what you
+// tapped): a prefab's portals, harvesters and cages, each the object its script is on with every
+// object under it. Each part is tagged with the innermost one it is in (part.thing, an index into
+// things; a part in none is ground, or an item). A thing: { name, root?, in?, portal?, harvester?,
+// cage? }: root, it is the prefab's top object (the whole piece: a cairn, a harvester, a cage); in,
+// the thing it is inside; portal { name (its object's, as CrossSceneLookup finds it), target (its
+// CrossSceneReference's), landing (Portal.landing, in the prefab's space), linkBack?
+// (linkMeToIncomers) }. A harvester inside a harvester is part of it. { things, parts } or null.
+function gameThings(prefab) {
+  const objects = prefab.objects || {};
+  const above = go => { const out = []; for (let k = go, i = 0; k && objects[k] && i < 64; k = objects[k].father, i++) out.push(k); return out; };
+  const found = new Map(); // object key -> thing
+  const at = go => { if (!found.has(go)) found.set(go, { go, name: objects[go].name || '' }); return found.get(go); };
+  // A portal is its bubble (Portal.bubble, the TeleBubble: only it teleports; its ring and stones
+  // are ground, Ken, 2026-11-09), else its object when it names none. Its name is its object's;
+  // atRoot: that object is the prefab's top, so in a scene it goes by the instance's name.
+  for (const r of prefab.read || []) {
+    if (r.name !== 'Portal' || r.off || !objects[r.go]) continue;
+    const bubble = r.fields.bubble && r.fields.bubble.ref && objects[r.fields.bubble.ref] ? r.fields.bubble.ref : r.go;
+    if ((found.get(bubble) || {}).portal) continue;
+    const t = at(bubble), ref = prefab.read.find(c => c.name === 'CrossSceneReference' && c.go === r.go);
+    const landing = r.fields.landing && r.fields.landing.ref && objects[r.fields.landing.ref];
+    const m = (landing || objects[r.go]).m;
+    t.name = objects[r.go].name || t.name;
+    t.portalGo = r.go;
+    t.payeeId = r.fields.payee && r.fields.payee.ref;
+    // paid: as saved (Portal.isPaid; Ken, 2026-11-09: in game mode an unpaid portal has no bubble)
+    t.portal = { name: t.name, target: (ref && ref.fields.target) || '', landing: [m[3], m[7], m[11]].map(v => round(v, 3)), ...(r.fields.linkMeToIncomers ? { linkBack: true } : {}), ...(objects[r.go].father ? {} : { atRoot: true }), ...(r.fields.isPaid ? { paid: true } : {}) };
+  }
+  // Payees (Payee.cs: what a portal costs): each its prices (its PaymentScheduleArray's priceList,
+  // by priceIndex) and the markers of the Payments right under its paymentRoot. { prices, index }.
+  const payees = [], payeeOf = new Map(); // payee component key, paymentRoot object key -> index
+  const rootOf = new Map();
+  for (const r of prefab.read || []) {
+    if (r.name !== 'Payee') continue;
+    const where = `${prefab.path}: the Payee on ${(objects[r.go] || {}).name || r.go}`;
+    const schedule = r.fields.paymentSchedule && r.fields.paymentSchedule.ref && prefab.read.find(c => c.id === r.fields.paymentSchedule.ref && c.name === 'PaymentScheduleArray');
+    if (!schedule) throw new Error(`${where}: no PaymentScheduleArray found for its paymentSchedule`);
+    if (!r.fields.paymentRoot || !r.fields.paymentRoot.ref) throw new Error(`${where}: no paymentRoot`);
+    if (typeof r.fields.priceIndex !== 'number') throw new Error(`${where}: no priceIndex`);
+    payeeOf.set(r.id, payees.length);
+    rootOf.set(r.fields.paymentRoot.ref, payees.length);
+    payees.push({ prices: schedule.fields.priceList, index: r.fields.priceIndex });
+  }
+  // A payment marker (Payment.cs's emptyVisual: an amber's ghost on a cairn or outpost): a tap pays
+  // its paymentValue and makes its prefabToMake there (Ken, 2026-11-09). payment: { value, make }.
+  for (const r of prefab.read || []) {
+    if (r.name !== 'Payment' || r.off) continue;
+    const where = `${prefab.path}: the Payment on ${(objects[r.go] || {}).name || r.go}`;
+    const marker = r.fields.emptyVisual && r.fields.emptyVisual.ref;
+    const make = r.fields.prefabToMake && r.fields.prefabToMake.asset && U.index()[r.fields.prefabToMake.asset];
+    if (!marker || !objects[marker]) throw new Error(`${where}: its emptyVisual (the marker) isn't one of the prefab's objects`);
+    if (!make) throw new Error(`${where}: its prefabToMake isn't in the guid index`);
+    if (typeof r.fields.paymentValue !== 'number') throw new Error(`${where}: no paymentValue`);
+    const payee = rootOf.get((objects[r.go] || {}).father);
+    at(marker).payment = { value: r.fields.paymentValue, make: path.basename(make.path).replace(/\.prefab$/, ''), ...(payee !== undefined ? { payee } : {}) };
+  }
+  const harvesters = new Set((prefab.scripts || []).filter(sc => U.isHarvesterClass(sc.name) && objects[sc.go]).map(sc => sc.go));
+  for (const go of harvesters) if (!above(go).slice(1).some(a => harvesters.has(a))) at(go).harvester = true;
+  // its health (HcHealth.healthMax, 1 when none or less): a fire-empowered stab on red armor does 1
+  for (const r of prefab.read || []) {
+    const t = r.name === 'HcHealth' && found.get(r.go);
+    if (t && t.harvester && typeof r.fields.healthMax === 'number' && r.fields.healthMax > 1) t.health = r.fields.healthMax;
+  }
+  for (const sc of prefab.scripts || []) if (sc.name === 'Cage' && !sc.off && objects[sc.go]) at(sc.go).cage = true;
+  if (!found.size) return null;
+  const list = [...found.values()], index = new Map(list.map((t, i) => [t.go, i]));
+  const innermost = go => { for (const a of above(go)) if (index.has(a)) return index.get(a); return null; };
+  for (const t of list) {
+    const father = objects[t.go].father, i = father ? innermost(father) : null;
+    if (i !== null) t.in = i;
+    if (!father) t.root = true;
+  }
+  // A cage's own guards (Cage.prefab's Wardens, HcGuards whose thingGuarded is the cage): those
+  // switched on register with it, as the scene's guards outside it do (Cage.RegisterGuard).
+  const guarding = new Set([...(prefab.scripts || []), ...(prefab.read || [])].filter(sc => sc.name === 'HcGuard' && !sc.off && objects[sc.go] && !objects[sc.go].off).map(sc => sc.go)); // HcGuard is read (its beam's fields): in read
+  for (const t of list) {
+    if (!t.harvester || !guarding.has(t.go) || t.in === undefined || !list[t.in].cage) continue;
+    t.guard = true;
+    list[t.in].guards = (list[t.in].guards || 0) + 1;
+  }
+  // A portal's payee, and the spinners its purchase starts (a Cairn's: under its Portal's object, or
+  // the prefab's only portal's)
+  const portals = list.filter(t => t.portal);
+  for (const t of portals) if (t.payeeId && payeeOf.has(t.payeeId)) t.portal.payee = payeeOf.get(t.payeeId);
+  for (const sc of prefab.scripts || []) {
+    if (sc.name !== 'Spinner' || !sc.byPurchase) continue;
+    const t = portals.find(q => above(sc.go).includes(q.portalGo)) || (portals.length === 1 ? portals[0] : null);
+    if (t) (t.spinners = t.spinners || []).push(sc.go);
+  }
+  // A part the dagger can't hurt though drawn in another material: one under the parent of a
+  // collision stand-in in an immune material (the Daisy's blade, beside its SawCollision), but not
+  // the harvester's own top object (Ken, 2026-11-09). part.immune; the page checks the drawn material too.
+  const immune = new Set(daggerImmune()), covered = new Set();
+  for (const o of Object.values(objects)) if (o.proxyMaterial && immune.has(o.proxyMaterial) && o.father && !harvesters.has(o.father)) covered.add(o.father);
+  // Mana mounted on a harvester (the flamers' FireObject, drawn in ManaFireMat; Ken, 2026-11-09: real
+  // fire mana): a part in a harvester drawn in a mana's material (manaMaterials) is that mana, mana:
+  // fire, air or water; a stab on it empowers the dagger and it goes.
+  const manaOf = manaMaterials();
+  const parts = prefab.parts.map(part => {
+    const i = part.go ? innermost(part.go) : null;
+    const shield = covered.size && part.go && above(part.go).some(a => covered.has(a));
+    const mana = i !== null && list[i].harvester && manaOf[part.material];
+    return i === null && !shield ? part : { ...part, ...(i === null ? {} : { thing: i }), ...(shield ? { immune: true } : {}), ...(mana ? { mana } : {}) };
+  });
+  return { things: list.map(({ portalGo, payeeId, ...t }) => t), parts, payees }; // go: its object (game mode switches it off when a unit is killed)
+}
 // Stand-ins' URLs, fresh (a piece of an imported area keeps its scripts without them).
 const withScriptUrls = scripts => scripts.map(s => (s.fields ? { ...s, url: scriptUrl(`scripts/${s.name}.js`) } : s));
 // Descriptions of the materials stand-ins' fields name (Cage.cs's liveMat and deadMat), by guid.
@@ -128,7 +237,8 @@ function layoutPrefabs() {
   return out;
 }
 // "assemblage: true" in a scene's frontmatter: it becomes a prefab of its own (tools/assemblage.js).
-const isAssemblage = text => /^---\n[\s\S]*?^assemblage:\s*true\s*$[\s\S]*?^---$/m.test(String(text || '').replace(/\r\n/g, '\n'));
+// assemblage: true (built from its pieces, tools/assemblage.js) or linked (its prefab keeps its objects' Unity data, tools/linked.js)
+const isAssemblage = text => /^---\n[\s\S]*?^assemblage:\s*(?:true|linked)\s*$[\s\S]*?^---$/m.test(String(text || '').replace(/\r\n/g, '\n'));
 function formatPieceLine(p) {
   const s = p.scale;
   const scale = Math.abs(s[0] - s[1]) < 1e-4 && Math.abs(s[0] - s[2]) < 1e-4 ? String(round(s[0], 3)) : s.map(v => round(v, 3)).join(' ');
@@ -282,13 +392,15 @@ const CANDIDATES = path.join(CACHE, 'candidates');
 // GridRender groups as candidateCutoffs.
 // A candidate mesh file's id and whether it is empty, remembered while the server runs and read
 // again only when its size or time changes (reading ~700 of them each load took seconds).
-const candidateInfo = new Map();
+// Kept on disk too (tools/keep.js; 2026-11-09: a restart read them all again, 2 s).
+const candidateInfo = Keep('candidate-info');
 function candidateFile(file) {
-  const s = fs.statSync(file), seen = candidateInfo.get(file);
+  const s = fs.statSync(file), all = candidateInfo.get(), seen = all[file];
   if (seen && seen.mtimeMs === s.mtimeMs && seen.size === s.size) return seen;
   const data = fs.readFileSync(file);
   const info = { mtimeMs: s.mtimeMs, size: s.size, blob: 'cand-' + crypto.createHash('sha1').update(data).digest('hex').slice(0, 20), empty: /indexCount: 0\b/.test(data.toString('latin1', 0, 2000)) };
-  candidateInfo.set(file, info);
+  all[file] = info;
+  candidateInfo.save();
   return info;
 }
 function withCandidates(pieces) {
@@ -334,26 +446,102 @@ const groupsFor = (parts, groups, scripts = []) => {
 };
 
 // A piece's game fields as served: { never } or { when }, and moved as a placement in Unity's terms.
-function gamePlacement(game) {
+function gamePlacement(game, lift = 0) {
   if (!game) return {};
   const { moved, ...gate } = game;
   if (!moved) return gate;
   const e = U.quatToEuler(moved.rot);
-  return { ...gate, moved: { when: moved.when, position: [moved.pos.x, moved.pos.y, moved.pos.z].map(v => round(v, 3)), rotation: [e.x, e.y, e.z].map(v => round(v, 2) % 360), scale: [moved.scl.x, moved.scl.y, moved.scl.z].map(v => round(v, 3)) } };
+  return { ...gate, moved: { when: moved.when, position: [moved.pos.x, moved.pos.y + lift, moved.pos.z].map(v => round(v, 3)), rotation: [e.x, e.y, e.z].map(v => round(v, 2) % 360), scale: [moved.scl.x, moved.scl.y, moved.scl.z].map(v => round(v, 3)) } };
 }
 // A tree's parts are drawn as GridRender draws them, whatever their objects' conditions.
 const plainParts = parts => parts.map(({ when, never, offSaved, ...rest }) => rest);
 
+// A biome scene's rise (RiseControl; Ken, 2026-11-09: fast forward always snaps): how far up its
+// anchor's pieces go to stand risen. A rise sets each of the scene's roots to altitudeSpan.max as its
+// stage starts (RiseHelpers.SetAltitudeOfAllRootObjectsInChunk); Mushroom, Maple, Coral and Umbra are
+// saved in storage (-1000), the others risen (0 m). { anchor, dy, stage } or null.
+function riseOf(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  const f = U.parse(text);
+  let rise = null;
+  for (const x of Object.values(f.inst)) {
+    const entry = x.src && U.index()[x.src];
+    if (!entry || !(/\/RiseDefault\.prefab$/.test(entry.path) || x.mods.some(m => m.path === 'riseStageId'))) continue;
+    const mod = k => { const m = x.mods.find(o => o.path === k); return m ? m.value : undefined; };
+    const prefabText = fs.readFileSync(path.join(U.REPO, entry.path), 'utf8');
+    const max = mod('altitudeSpan.max') ?? (/altitudeSpan:\n\s+min: [^\n]*\n\s+max: ([^\n]*)/.exec(prefabText) || [])[1];
+    const stage = mod('riseStageId') ?? (/riseStageId: (\d+)/.exec(prefabText) || [])[1];
+    rise = { max: +max, stage: +stage };
+  }
+  if (!rise) return null;
+  // the anchor: the root object named <Scene>Anchor (as split-scene.js and the game name them)
+  const m = /--- !u!1 &(\d+)\nGameObject:\n(?:(?!--- ).*\n)*? {2}m_Name: (\w+SceneAnchor)\n/.exec(text);
+  if (!m) return null;
+  const t = Object.values(f.t).find(tr => tr.go === m[1]);
+  if (!t || t.father !== '0') return null;
+  const dy = round(rise.max - t.pos.y, 3);
+  return { anchor: m[2], dy, stage: rise.stage };
+}
+
+// The materials the dagger can't hurt (Ken, 2026-11-09: Canopy checks the material of the part
+// struck): GearDagger.prefab's immuneMaterials (EnemyInvulnerable, the harvesters' red, and the saw
+// blades' C_Blade_D), as guids. In game mode a tap on a harvester part drawn in one doesn't kill.
+// The materials the mana items are drawn in, by element: ManaFire's (ManaFireMat) fire, ManaAir's air,
+// ManaWater's water ({ guid: element }), from the prefabs holding those Items.
+// Canopy's physics gravity (ProjectSettings/DynamicsManager.asset m_Gravity's y, 3 m/s2 down), what
+// a gravitic item falls by when thrown in game mode, and particles by their gravityModifier. Unread,
+// an error: never a quiet stand-in value (Ken, 2026-11-09: loud errors).
+function physicsGravity() {
+  const file = path.join(U.REPO, 'ProjectSettings', 'DynamicsManager.asset');
+  const m = /m_Gravity: \{x: [^,]+, y: ([^,]+),/.exec(fs.readFileSync(file, 'utf8'));
+  if (!m || !Number.isFinite(parseFloat(m[1]))) throw new Error(`no m_Gravity in ${file}`);
+  return -parseFloat(m[1]);
+}
+let manaKept = null;
+function manaMaterials() {
+  if (manaKept) return manaKept;
+  manaKept = {};
+  for (const [cls, element] of [['ManaFire', 'fire'], ['ManaAir', 'air'], ['ManaWater', 'water']]) {
+    const pf = U.prefabByName(cls);
+    if (!pf) throw new Error(`no ${cls}.prefab: the mana item whose material marks mounted ${element} mana`);
+    if (!Object.values(pf.items || {}).some(it => (it.class || it.kind) === cls)) throw new Error(`${pf.path} holds no ${cls} item`);
+    for (const part of pf.parts) if (part.material) manaKept[part.material] = element;
+  }
+  return manaKept;
+}
+let immuneKept = null; // { stamp, list }
+function daggerImmune() {
+  const e = Object.values(index()).find(x => x.path && x.path.endsWith('/GearDagger.prefab'));
+  const stamp = e ? e.blob || e.path : '';
+  if (immuneKept && immuneKept.stamp === stamp) return immuneKept.list;
+  immuneKept = { stamp, list: readImmune(e) };
+  return immuneKept.list;
+}
+function readImmune(e) {
+  if (!e) throw new Error('no GearDagger.prefab in the guid index (its immuneMaterials: what the dagger can\'t hurt)');
+  const text = fs.readFileSync(path.join(U.REPO, e.path), 'utf8').replace(/\r\n/g, '\n');
+  const block = /\n {2}immuneMaterials:\n((?: {2}- [^\n]*\n?)*)/.exec(text);
+  if (!block) throw new Error(`no immuneMaterials in ${e.path}`);
+  return [...block[1].matchAll(/guid: ([0-9a-f]+)/g)].map(m => m[1]);
+}
 // terrainOnly: only the trees (their chunks, as grid trees bring them), e.g. the Tangle's
 // GridTangle without the scene's gameplay pieces.
-function extractArea(scene, center, half, terrainOnly = false) {
+// under: only pieces at or below that path (Game's World: Game.unity's places, not its player rig,
+// editor objects or managers; Ken, 2026-11-09).
+function extractArea(scene, center, half, terrainOnly = false, under = null) {
   const file = path.join(U.REPO, 'Assets', 'Scenes', scene + '.unity');
   if (!fs.existsSync(file)) throw new Error(`no scene ${scene}`);
-  const inside = p => Math.abs(p.pos.x - center[0]) <= half && Math.abs(p.pos.y - center[1]) <= half && Math.abs(p.pos.z - center[2]) <= half;
+  const below = p => !under || p.path === under || p.path.startsWith(under + '/');
+  // never what Unity leaves out of the game: anything tagged EditorOnly or under such (Ken,
+  // 2026-11-09: drop what the game drops; Game.unity's Build group is tagged so)
+  const editorOnly = p => Boolean(p.editorOnly);
+  const inside = p => below(p) && !editorOnly(p) && Math.abs(p.pos.x - center[0]) <= half && Math.abs(p.pos.y - center[1]) <= half && Math.abs(p.pos.z - center[2]) <= half;
   const cfg = Config.load(scene);
   const all = U.scenePieces(file);
+  const rise = riseOf(file);
+  const lift = p => (rise && rise.dy && (p.path === rise.anchor || String(p.path).startsWith(rise.anchor + '/')) ? rise.dy : 0);
   const found = all.filter(p => inside(p) && !isTreeChunk(p.mesh, cfg)).sort((a, b) => a.path.localeCompare(b.path));
-  const trees = treeChunks(all, center, half, cfg);
+  const trees = treeChunks(all.filter(p => below(p) && !editorOnly(p)), center, half, cfg);
   // Plain-mesh pieces are named by their mesh; remember how they resolve.
   const lib = library();
   const meshPart = p => ({ mesh: p.mesh, m: U.I(), ...(p.layer ? { layer: p.layer } : {}), material: p.material || null, ...(p.materials ? { materials: p.materials } : {}), object: p.object, prefab: '', off: Boolean(p.meshOff) });
@@ -367,33 +555,100 @@ function extractArea(scene, center, half, terrainOnly = false) {
       // so the viewer never resolves (and fetches) the whole prefab.
       ...(parts ? { parts, source: p.prefab ? p.prefab.path : (p.mesh && p.mesh.path) || '' } : {}),
       ...(lodGroups && Object.keys(lodGroups).length ? { lodGroups } : {}),
-      position: [p.pos.x, p.pos.y, p.pos.z].map(v => round(v, 3)),
+      position: [p.pos.x, p.pos.y + lift(p), p.pos.z].map(v => round(v, 3)),
       rotation: [e.x, e.y, e.z].map(v => round(v, 2) % 360),
       scale: [p.scl.x, p.scl.y, p.scl.z].map(v => round(v, 3)),
       extra: [p.textId ? `textId ${p.textId}` : '', p.active ? '' : 'inactive', p.guards ? `guards ${p.guards}` : '', extra || ''].filter(Boolean).join(', '),
       // in the game (web/conditions.js): never on, or on while its when holds; moved, where its triggers put it
-      ...gamePlacement(p.game),
+      ...gamePlacement(p.game, lift(p)),
+      // a gem or ring locus's stage, for fast-forwarding (tools/unity.js lociStages)
+      ...(p.locus ? { locus: p.locus } : {}),
+      // game mode (Ken, 2026-11-09): what a tap can be on (gameThings; a whole piece's thing by the
+      // piece's name, as the scene names it), and what a guard guards
+      ...(p.things ? { things: p.things.map(t => (t.root || (t.portal && t.portal.atRoot) ? { ...t, name: p.path.split('/').pop(), ...(t.portal ? { portal: { ...t.portal, name: p.path.split('/').pop() } } : {}) } : t)) } : {}),
+      ...(p.payees ? { payees: p.payees } : {}),
+      ...(p.vacancies ? { vacancies: p.vacancies } : {}),
+      ...(p.guarding ? { guarding: p.guarding } : {}),
+      ...(p.guardedAs ? { guardedAs: p.guardedAs } : {}),
       // its point Lights (More Lights phase 4), in its own space as its parts' matrices are
       ...(((p.prefab && p.prefab.lights) || p.lights || []).length ? { lights: (p.prefab && p.prefab.lights) || p.lights } : {}),
       // its C# scripts that have stand-ins (their URLs are added when a scene loads), and the objects they move
-      ...(p.prefab && (p.prefab.scripts || []).some(s => s.fields) ? { scripts: p.prefab.scripts.filter(s => s.fields), ...(p.prefab.objects ? { objects: p.prefab.objects } : {}) } : {})
+      // (a guard's beam among them: tools/unity.js guardBeams)
+      ...(p.prefab && ((p.prefab.scripts || []).some(s => s.fields) || p.beam) ? { scripts: [...p.prefab.scripts.filter(s => s.fields), ...(p.beam ? [p.beam] : [])], ...(p.prefab.objects ? { objects: p.prefab.objects } : {}) } : {})
     };
   };
   // Every imported piece carries its own parts, filtered by the scene's show and hide rules
   // (unity.json). A piece whose parts are all switched off or hidden is left out; one with no
   // meshes at all stays, as a labeled box. A tree brings only its overlapping chunks.
+  // Vacancies and tenants (Ken, 2026-11-09; Canopy's Vacancy.cs and Tenant.cs): a Vacancy, placed
+  // under an instance, stands for that instance's first LODGroup under its parent object (`kept`),
+  // drawn in its shadowMaterial until a tenant with the same LOD0 mesh fills it. A Tenant is an Item
+  // with no mesh: the pieces placed under it are what it looks like, so their parts are its item.
+  const vacanciesOf = new Map(), tenants = new Set();
+  for (const v of all) {
+    const r = v.prefab && (v.prefab.read || []).find(x => x.name === 'Vacancy');
+    if (r) {
+      if (!v.parentInstance) throw new Error(`${scene}: the Vacancy at ${v.path} hangs under no prefab instance (Canopy's: its parent holds the piece it stands for)`);
+      if (!r.fields.shadowMaterial || !r.fields.shadowMaterial.asset) throw new Error(`${scene}: the Vacancy at ${v.path} has no shadowMaterial`);
+      (vacanciesOf.get(v.parentInstance) || vacanciesOf.set(v.parentInstance, []).get(v.parentInstance)).push({ object: v.parentObject || null, shadow: r.fields.shadowMaterial.asset, path: v.path });
+    }
+    if (v.prefab && !v.prefab.parts.length && Object.values(v.prefab.items || {}).some(it => it.kind === 'Tenant')) tenants.add(v.instance);
+  }
+  // a tenant's guards (Ken, 2026-11-10: anything can be guarded) go to its look, which is drawn for it,
+  // guarded as the tenant's path (game mode counts them down by it)
+  const tenantOf = new Map(all.filter(v => tenants.has(v.instance)).map(v => [v.instance, v]));
+  const meshId = m => `${(m && m.path) || ''}|${(m && m.name) || ''}`;
+  // a piece's parts with its vacancies marked (vacancy: index into piece.vacancies, shadow: guid)
+  function withVacancies(p, parts) {
+    const list = vacanciesOf.get(p.instance);
+    if (!list) return { parts };
+    const objects = (p.prefab && p.prefab.objects) || {};
+    const depth = go => { let d = 0; for (let k = go; k && objects[k]; k = objects[k].father) d++; return d; };
+    const under = (go, top) => { if (!top) return true; for (let k = go, i = 0; k && i < 64; k = objects[k] && objects[k].father, i++) if (k === top) return true; return false; };
+    const vacancies = [];
+    let out = parts;
+    for (const v of list) {
+      const candidates = parts.filter(part => part.lod && part.go && under(part.go, v.object));
+      if (!candidates.length) throw new Error(`${scene}: the Vacancy at ${v.path} finds no LOD group under ${v.object ? (objects[v.object] || {}).name : p.path}`);
+      const first = candidates.reduce((a, b) => (depth(b.go) < depth(a.go) ? b : a));
+      const kept = first.lod.key, lod0 = candidates.find(part => part.lod.key === kept && part.lod.levels.includes(0)) || first;
+      const i = vacancies.length;
+      vacancies.push({ mesh: meshId(lod0.mesh), shadow: v.shadow });
+      out = out.map(part => (part.lod && part.lod.key === kept ? { ...part, vacancy: i, shadow: v.shadow } : part));
+    }
+    return { parts: out, vacancies };
+  }
+  // a tenant's look: its parts are the tenant item (all one item, by the tenant's instance)
+  const asTenant = (p, parts) => (tenants.has(p.parentInstance) ? parts.map(part => ({ ...part, item: { kind: 'Tenant', key: 'tenant' + p.parentInstance } })) : parts);
   const pieces = [];
   for (const imported of terrainOnly ? [] : found) {
+    // a Vacancy or a Tenant has no mesh: drawn through its piece and its look, never as a box
+    if (imported.prefab && !imported.prefab.parts.length && ((imported.prefab.read || []).some(x => x.name === 'Vacancy') || tenants.has(imported.instance))) continue;
     if (trees.some(t => t.piece === imported)) continue;
+    // an assemblage placed in the scene (tools/placements.js): drawn from its current prefab, by
+    // name, never a stale copy; one right under the anchor can be moved and deleted from the page
+    if (imported.prefab && /^Assets\/Assemblages\//.test(imported.prefab.path || '')) {
+      const top = imported.instance && imported.path.split('/').length === 2;
+      pieces.push({ ...place({ ...imported, prefab: null }, null, ''), ...(top ? { placement: { instance: imported.instance } } : {}) });
+      continue;
+    }
     // a gem locus brings the gem the game makes on it (tools/gems.js)
     const p = imported.prefab ? { ...imported, prefab: Gems.withGem(imported.prefab, imported.scl) } : imported;
-    const parts = p.prefab ? p.prefab.parts : p.lightOnly ? [] : [meshPart(p)];
+    const g = p.prefab && gameThings(p.prefab);
+    if (g) { p.things = g.things; if (g.payees.length) p.payees = g.payees; }
+    const tenant = tenantOf.get(p.parentInstance);
+    if (tenant && tenant.guards) Object.assign(p, { guards: tenant.guards, guardedAs: tenant.path });
+    const own = g && g.things.find(t => t.root && t.cage);
+    if (own && own.guards) p.guards = (p.guards || 0) + own.guards; // its own Wardens, and the scene's guards
+    const vac = withVacancies(p, asTenant(p, p.prefab ? (g ? g.parts : p.prefab.parts) : p.lightOnly ? [] : [meshPart(p)]));
+    if (vac.vacancies) p.vacancies = vac.vacancies;
+    const parts = vac.parts;
     const shown = Config.visibleParts(cfg, p.piece, parts, materialName);
     if (parts.length && !shown.length) continue;
     pieces.push(place(p, p.prefab ? servedParts(p.prefab, shown) : shown, '', groupsFor(shown, p.prefab && p.prefab.lodGroups, ((p.prefab && p.prefab.scripts) || []).filter(s => s.fields))));
   }
   for (const t of trees) pieces.push(place({ ...t.piece, game: null }, plainParts(t.parts), `tree chunk meshes: ${t.parts.length - t.leaves}${t.leaves ? (t.leafSplit ? `, LeafSplit leaves (thinning from ${t.leafSplit.thin.from})` : ', leaves') : ''}${t.grid && t.grid.manual ? ', GridRender LODs' : ''}`, t.lodGroups));
-  return { source: { scene, center, half, terrainOnly, config: Config.extractKey(scene) }, pieces };
+  return { source: { scene, center, half, terrainOnly, ...(under ? { under } : {}), ...(rise && rise.dy ? { risen: rise.dy } : {}), config: Config.extractKey(scene) }, pieces };
 }
 function saveArea(name, area) {
   fs.mkdirSync(AREAS, { recursive: true });
@@ -496,7 +751,8 @@ function prepare(names, extraParts = []) {
       // Unity prefab even where a layout prefab shares its name).
       const model = /\.(fbx|obj)$/i.test(name) && Object.entries(index()).find(([, e]) => e.path.endsWith('/' + name));
       const p = Timing.time('prefabs', () => (model ? U.modelInstance(model[0], []) : U.prefabByName(name.replace(/\.prefab$/i, ''))));
-      if (p) lib[name] = { kind: model ? 'model' : 'prefab', source: p.path, parts: servedParts(p, p.parts), takesText: Boolean(p.takesText), lodGroups: p.lodGroups || {}, ...((p.lights || []).length ? { lights: p.lights } : {}), ...scriptsOf(p) };
+      const g = p && gameThings(p);
+      if (p) lib[name] = { kind: model ? 'model' : 'prefab', source: p.path, parts: servedParts(p, g ? g.parts : p.parts), ...(g ? { things: g.things, ...(g.payees.length ? { payees: g.payees } : {}) } : {}), takesText: Boolean(p.takesText), lodGroups: p.lodGroups || {}, ...((p.lights || []).length ? { lights: p.lights } : {}), ...scriptsOf(p) };
     }
     if (lib[name]) out[name] = { ...lib[name], parts: Config.visibleParts(cfg, name, lib[name].parts, materialName) };
   }
@@ -589,9 +845,9 @@ function prepare(names, extraParts = []) {
     part.obj = `meshes/${part.mesh.blob}-${key}.obj`;
   }
   writeLibrary(lib);
-  const materials = prepareMaterials(allParts.flatMap(p => [p.material, ...(p.materials || [])]).filter(Boolean), problems, cfg.maxTexture);
+  const materials = prepareMaterials(allParts.flatMap(p => [p.material, ...(p.materials || []), p.shadow]).filter(Boolean), problems, cfg.maxTexture);
   // A material tools/convert-materials.js moved onto a Canopy shader carries its copy as it was,
-  // on Unity's, as unity: ☰ View › Unity's shaders draws that (More Lights phase 3).
+  // on Unity's, as unity: ☰ Surfaces › Unity's shaders draws that (More Lights phase 3).
   const pairs = new Map(Convert.switchPairs());
   const converted = Object.keys(materials).filter(g => pairs.has(g));
   if (converted.length) {
@@ -675,12 +931,27 @@ const index = () => shared.index || (shared.index = JSON.parse(fs.readFileSync(p
 // Kept across requests too (listings), while none of its folders has changed (a folder's time
 // changes when a file is added to it or removed): walking them took a second or two a load
 // (Ken, 2026-11-04).
+// Kept on disk too (tools/keep.js; Ken, 2026-11-09: listing the 3854 meshes took 5 to 7 s of a
+// restarted server's first load), trusted while every folder's time is as kept. A file this process
+// writes (written) is added and its folders' times taken again, so its own writes never send the
+// next load back to walking the folder.
 const listings = new Map(); // dir -> { out, folders: Map(folder, mtime) }
+const keptListings = Keep('cache-listings');
+const folderTime = d => { try { return fs.statSync(d).mtimeMs; } catch { return -1; } };
+function saveListing(dir) {
+  const l = listings.get(dir);
+  keptListings.get()[dir] = { toJSON: () => ({ folders: [...l.folders], out: [...l.out] }) }; // made as it is written
+  keptListings.save();
+}
 function listing(dir) {
   const key = 'list:' + dir;
   if (!shared[key]) {
+    if (!listings.has(dir) && keptListings.get()[dir]) {
+      const k = keptListings.get()[dir];
+      listings.set(dir, { out: new Set(k.out), folders: new Map(k.folders) });
+    }
     const kept = listings.get(dir);
-    const mtime = d => { try { return fs.statSync(d).mtimeMs; } catch { return -1; } };
+    const mtime = folderTime;
     if (kept && Timing.time('cache listings checked', () => [...kept.folders].every(([d, t]) => mtime(d) === t))) {
       shared[key] = kept.out;
       return kept.out;
@@ -694,12 +965,22 @@ function listing(dir) {
     };
     Timing.time('cache listings', () => walk(dir, ''));
     listings.set(dir, { out, folders });
+    saveListing(dir);
     shared[key] = out;
   }
   return shared[key];
 }
 const cached = (dir, name) => listing(dir).has(name);
-const written = (dir, name) => listing(dir).add(name);
+function written(dir, name) {
+  listing(dir).add(name);
+  const l = listings.get(dir);
+  if (!l) return;
+  for (let d = path.dirname(path.join(dir, name)); d.length >= dir.length; d = path.dirname(d)) {
+    l.folders.set(d, folderTime(d));
+    if (d === dir) break;
+  }
+  saveListing(dir);
+}
 // Reads what the viewer needs from a .mat: base color, color texture, normal map, and (for
 // Canopy/General) the detail texture, each texture with its tiling and offset. Bump
 // MATERIAL_PARSER when what it reads changes, so cached materials are read again.
@@ -998,21 +1279,22 @@ function clipObj(text, M, center, half, leaves) {
   return [`# leaves ${leaves} ${per} ${list}`, ...lines.filter(l => !l.startsWith('f ') || keep.has(l))].join('\n');
 }
 
-module.exports = { REPO: U.REPO, ROOT, AREAS, MESHES, TEXTURES, LOCAL_MATERIALS, beginRequest, blobs, withCandidates, parseMaterial, materialGuid, shapeMaterials, materialSetting, pieceMaterial, parsePieceLines, areaLines, originLine, switchLine, includeLines, layoutPrefabs, withScriptUrls, fieldMaterials, isAssemblage, takeAstcWanted, textureSource, storeTexture, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };
+module.exports = { REPO: U.REPO, ROOT, AREAS, gameThings, daggerImmune, physicsGravity, MESHES, TEXTURES, LOCAL_MATERIALS, beginRequest, blobs, withCandidates, parseMaterial, materialGuid, shapeMaterials, materialSetting, pieceMaterial, parsePieceLines, areaLines, originLine, switchLine, includeLines, layoutPrefabs, withScriptUrls, fieldMaterials, isAssemblage, takeAstcWanted, textureSource, storeTexture, formatPieceLine, replacePieceLines, extractArea, saveArea, prepare };
 
 if (require.main === module) {
   const [command, ...args] = process.argv.slice(2);
-  if (command === 'extract' && args.length === 6) {
+  const under = args.includes('--under') ? args.splice(args.indexOf('--under'), 2)[1] : null;
+  if (command === 'extract' && (args.length === 6 || (args.length === 7 && args[6] === '--terrain'))) {
     const [scene, cx, cy, cz, half, name] = args;
-    const area = extractArea(scene, [+cx, +cy, +cz], +half);
-    saveArea(`${scene} ${name}`, area);
-    console.log(`extract: ${area.pieces.length} pieces -> areas/${scene} ${name}.json`);
+    const area = extractArea(scene, [+cx, +cy, +cz], +half, args[6] === '--terrain', under);
+    saveArea(name, area);
+    console.log(`extract: ${area.pieces.length} pieces -> areas/${name}.json`);
   } else if (command === 'prepare' && args.length) {
     const { library: lib, problems } = prepare(args);
     console.log(`prepare: ${Object.keys(lib).length} of ${args.length} names resolved`);
     problems.forEach(p => console.log('  ' + p));
   } else {
-    console.error('usage: node tools/scene.js extract <Scene> <cx> <cy> <cz> <halfSize> <Name> | prepare <name>...');
+    console.error('usage: node tools/scene.js extract <Scene> <cx> <cy> <cz> <halfSize> <Name> [--terrain] [--under <path>] | prepare <name>...');
     process.exitCode = 2;
   }
 }

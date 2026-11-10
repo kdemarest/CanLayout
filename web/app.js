@@ -12,6 +12,8 @@
         objects: [],          // Three.js group per piece, same order
         area: null,           // the imported area a composed scene sits on ("- Area:" line), or null
         also: [],             // other areas drawn alongside (☰ Areas, and a composed scene's later Area lines)
+        withAreas: [],        // those unity.json says go with the scene (Hawthorn's outland, Black Isle)
+        areaStages: {},       // each area's { from, auto }: when ☰ Fast forward loads it (server.js areaStage)
         areaLines: [],        // a composed scene's Area lines (the first is area)
         areaNames: [],        // every imported area, for ☰ Areas
         sceneSymbols: {},     // symbols of the Unity scenes of areas drawn alongside, by scene
@@ -30,7 +32,7 @@
         labels: false,        // name every piece, not only the placeholders
         hiddenFolders: new Set(),
         orbitDistance: 12,
-        // ☰ View's lighting checks (Ken, 2026-11-06), never remembered, so the page always opens
+        // ☰ Light's lighting checks (Ken, 2026-11-06), never remembered, so the page always opens
         // lit as the game is: no ambient light at all, and every normal map 10 times as strong.
         noAmbient: false,
         normalsTimes2: false,
@@ -45,10 +47,34 @@
     } catch (error) {
         throw new Error(`3D graphics (WebGL) could not start: ${error.message}. If the browser blocked it after a crash, close this tab and reopen it, or restart the browser.`, { cause: error });
     }
+    // Lost 3D graphics (Ken, 2026-11-09: tabbing away and back lost them; Android takes a hidden
+    // page's GPU context back): wait for the browser to give it back, when three.js rebuilds its
+    // buffers, textures (their data is kept: bitmaps are never closed, compressed mips stay) and
+    // programs by itself. Not back within GL_WAIT ms of the page being seen again: reload; the
+    // camera and toggles come back from this browser's storage.
+    const GL_WAIT = 5000;
+    let glLost = 0, glTimer = 0;
+    const glReload = () => {
+        if (glLost && document.visibilityState === "visible") location.reload();
+    };
+    const glWatch = () => {
+        clearTimeout(glTimer);
+        if (glLost && document.visibilityState === "visible") glTimer = setTimeout(glReload, GL_WAIT);
+    };
     canvas.addEventListener("webglcontextlost", e => {
-        e.preventDefault();
-        window.layoutError("3D graphics were lost (out of GPU memory?). Reload the page.");
+        e.preventDefault(); // so the browser may restore it
+        glLost = performance.now();
+        console.warn("layout: 3D graphics lost; waiting for them to come back");
+        say("3D graphics were taken back while the page was away; restoring…");
+        glWatch();
     });
+    canvas.addEventListener("webglcontextrestored", () => {
+        console.warn(`layout: 3D graphics back after ${Math.round(performance.now() - glLost)} ms`);
+        glLost = 0;
+        clearTimeout(glTimer);
+        say("3D graphics restored.");
+    });
+    document.addEventListener("visibilitychange", glWatch);
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     renderer.debug.onShaderError = (gl, program, vertex, fragment) => {
         const log = gl.getShaderInfoLog(fragment) || gl.getShaderInfoLog(vertex) || gl.getProgramInfoLog(program);
@@ -110,7 +136,7 @@
         } else scene.fog = new THREE.FogExp2(env.fogColor, env.fogDensity * Math.sqrt(Math.LN2));
         Surface.setEnvironment(env, state.fog);
         if (state.noAmbient) Surface.uniforms.canopyAmbient.value.setRGB(0, 0, 0);
-        // ☰ View › Full sun highlight: General's highlight as the committed shader had it, the sun's
+        // ☰ Light › Full sun highlight: General's highlight as the committed shader had it, the sun's
         // color as the inspector shows it (never made linear), without its intensity.
         if (state.fullSunHighlight) Surface.uniforms.canopySunHighlight.value.set(env.sunColor).convertLinearToSRGB();
         hemisphere.intensity = state.noAmbient ? 0 : 0.9; // Three.js's own materials' ambient
@@ -143,9 +169,59 @@
     // 0.03 to 400 m also keeps enough depth precision that far crossings (trunks at the sea) don't flicker.
     const camera = new THREE.PerspectiveCamera(55, 1, 0.03, 400);
     // What scripts (web/tickable.js) work with.
-    Tickable.use({ THREE, scene, camera, environment: () => state.environment, leafWind: () => leafWindUniforms, windLevels: () => ({ constantLevel: state.windLevel, gustLevel: state.gustLevel, cylinderGusts: state.gustKind === "cylinders" }), texture, material: guid => materialFor(guid, false), describe: guid => (state.materials || {})[guid] || null, textures: () => state.textures });
+    Tickable.use({ THREE, scene, camera, environment: () => state.environment, leafWind: () => leafWindUniforms, windLevels: () => ({ constantLevel: state.windLevel, gustLevel: state.gustLevel, cylinderGusts: state.gustKind === "cylinders" }), texture, material: guid => materialFor(guid, false), describe: guid => (state.materials || {})[guid] || null, textures: () => state.textures, gravity: () => {
+        if (typeof state.gravity !== "number") throw new Error("no gravity: the scene reply carried none (server.js, tools/scene.js physicsGravity)");
+        return state.gravity;
+    }, gateHolds: (when, piece) => state.conditions === "saved" || Conditions.allHold(when, symbolsNow(piece)), hideMeshes: (top, meshes, key) => Play.hideGroup(top, meshes, key) });
     camera.position.set(0, 5, 15);
     camera.lookAt(0, 0, 0);
+
+    // ---------- usage ----------
+    // How often each control is used (Ken, 2026-11-08: records for future revisions of the menu):
+    // every button tapped, by its menu and label ("Light › Fog", "☰ Game mode"), and game mode's
+    // takes, drops, hops and misses ("game: take"), counted here and sent every 20 s (and as the page
+    // is hidden) to the server's usage.json.
+    const Usage = (() => {
+        let pending = {}, any = false;
+        const count = name => {
+            pending[name] = (pending[name] || 0) + 1;
+            any = true;
+        };
+        function flush() {
+            if (!any) return;
+            const counts = pending;
+            pending = {};
+            any = false;
+            fetch("/api/usage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ counts }), keepalive: true }).catch(() => {});
+        }
+        setInterval(flush, 20000);
+        document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && flush());
+        document.addEventListener("click", e => {
+            const b = e.target.closest && e.target.closest("button");
+            if (!b || b.classList.contains("back") || b.closest("#hudRings")) return;
+            const sub = b.closest(".submenu");
+            const label = (b.getAttribute("aria-label") || b.textContent || "").split(":")[0].replace(/[▸☰⛶]/g, "").trim() || b.id;
+            count((sub ? sub.dataset.title + " › " : b.closest("#menu") ? "☰ " : "") + label);
+        }, true);
+        return { count };
+    })();
+    // Game mode's items, inventory and display (web/play.js).
+    const Play = window.CanopyPlay.create({ THREE, camera, scene, world, count: Usage.count, atGemStation: () => atGemStation(), objectOfPath: path => objectOfPath(path), inCage: mesh => Boolean(((tapTarget(mesh) || {}).thing || {}).cage), onReset: () => startPaying(), onChange: () => regate(), wardensLeft: top => wardensLeft(top), guardedPiece: path => guardedPiece(path), onTaken: group => takenBack(group), cast: (a, b, skip) => cast(a, b, skip), gravity: () => {
+        if (typeof state.gravity !== "number") throw new Error("no gravity: the scene reply carried none");
+        return state.gravity;
+    } });
+    // For driving the page from outside (lens/drive.js js '...'; Claude, 2026-11-08): its state and
+    // the Three.js objects, and lookAt, which puts the camera at one point looking at another
+    // (Three's world: x mirrored from Unity's).
+    window.Layout = {
+        state, camera, world, scene, Play, THREE,
+        lookAt(from, to) {
+            camera.position.set(from[0], from[1], from[2]);
+            camera.lookAt(to[0], to[1], to[2]);
+            camera.updateMatrixWorld();
+            return camera.position.toArray();
+        }
+    };
     const highlight = new THREE.BoxHelper(undefined, 0x4fb3ff);
     highlight.material.fog = false;
     highlight.visible = false;
@@ -602,9 +678,9 @@
     // gusts, added and never past strong; lean, wobble and flutter all follow their sum.
     // LeafGust (scripts/LeafGust.js) sets leafWindNow (the steady wind's direction x and z, its
     // strength, the gusts', in Unity's XZ) and its cylinders (leafGusts: centre, radius, life;
-    // leafGustDirs: heading, soft edge), tested by squared distance; ☰ View's gusts as waves turns on
+    // leafGustDirs: heading, soft edge), tested by squared distance; ☰ World's gusts as waves turns on
     // the wave gusts instead, travelling downwind and lulling to stillness between them. Its settings
-    // are unity.json's environment leafWind (applyEnvironment); the levels ☰ View's (windLevels).
+    // are unity.json's environment leafWind (applyEnvironment); the levels ☰ World's (windLevels).
     const leafWindUniforms = {
         leafWindNow: { value: new THREE.Vector4(1, 0, 0, 0) },  // LeafGust's: the steady wind's direction x, z (Unity), its strength, the gusts'
         leafWind: { value: new THREE.Vector4(0, 0, 1, 1000) }, // sway, flutter, frequency, fadeDistance
@@ -735,7 +811,7 @@
 \t\t\treflectedLight.directDiffuse += max(dot(normal, Lk), 0.0) * light * diffuseColor.rgb;
 \t\t\treflectedLight.directSpecular += ${lightHighlight} * light * canopyGlowOff;
 \t\t}
-\t\tif (canopyLightView > 0.5) { // ☰ View › Light crowding: none gray, then blue, green, yellow, red
+\t\tif (canopyLightView > 0.5) { // ☰ Light › Light crowding: none gray, then blue, green, yellow, red
 \t\t\tvec3 heat = reached < 0.5 ? vec3(0.08) : reached < 1.5 ? vec3(0.0, 0.2, 1.0) : reached < 2.5 ? vec3(0.0, 0.8, 0.1) : reached < 3.5 ? vec3(1.0, 0.85, 0.0) : vec3(1.0, 0.05, 0.0);
 \t\t\treflectedLight.indirectDiffuse = heat * (0.4 + 0.6 * max(dot(normal, L), 0.0));
 \t\t\treflectedLight.directDiffuse = vec3(0.0);
@@ -813,7 +889,7 @@
         return materials.get(key);
     }
     function materialFor(guid, faint, split, strip) {
-        // ☰ View › Unity's shaders: a material More Lights moved onto a Canopy shader drawn as its
+        // ☰ Surfaces › Unity's shaders: a material More Lights moved onto a Canopy shader drawn as its
         // copy on Unity's (tools/convert-materials.js; the server sends it as unity).
         const own = guid && state.materials[guid];
         const asUnity = Boolean(state.unityShaders && own && own.unity);
@@ -873,7 +949,7 @@
         const gloss = d.general && d.values && d.values._Glossiness ? d.values._Glossiness[0] : 0;
         // Unity's Standard by its own smoothness and metallic: Three.js's roughness is Unity's
         // perceptual roughness, 1 - smoothness, and both are GGX, so Unity's shaders compare fairly
-        // with Canopy's (More Lights phase 3, ☰ View › Unity's shaders).
+        // with Canopy's (More Lights phase 3, ☰ Surfaces › Unity's shaders).
         const standard = d.shader && d.shader.guid === "0000000000000000f000000000000000" && (d.shader.fileID === "46" || d.shader.fileID === "45");
         const value = (name, dflt) => (d.values && d.values[name] ? d.values[name][0] : dflt);
         const roughness = standard ? Math.min(1, Math.max(0, 1 - value("_Glossiness", 0.5))) : 0.85 - 0.5 * gloss;
@@ -881,7 +957,7 @@
         const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(...c), roughness, metalness, side, transparent: opacity < 1, opacity });
         // Canopy/General's _NormalStrength scales the normal map's tilt (Ken, 2026-11-04).
         const tilt = d.general && d.values && d.values._NormalStrength ? d.values._NormalStrength[0] : 1;
-        m.userData.tilt = tilt; // _NormalStrength, live in Tweak; ☰ View › Normal maps × 2 scales it
+        m.userData.tilt = tilt; // _NormalStrength, live in Tweak; ☰ Surfaces › Normal maps × 2 scales it
         m.normalScale.setScalar(tilt * (state.normalsTimes2 ? 2 : 1));
         // Tweak's live vars set these as a drag goes (tweakLive): the detail texture's tiling, how
         // far toward white it is eased (its strength against the baked one) and the color's gain.
@@ -917,7 +993,7 @@
         });
         texture(d.normal, false).then(t => {
             if (t && !strip) { // strips have no tangents: their normal comes from the shader
-                m.userData.normalMap = t; // kept for ☰ View › Normal maps
+                m.userData.normalMap = t; // kept for ☰ Surfaces › Normal maps
                 if (state.normalMaps) {
                     m.normalMap = t;
                     m.needsUpdate = true;
@@ -969,22 +1045,104 @@
         else boxes[key] = box;
     }
     // ---------- conditions ----------
-    // ☰ View Conditions (Ken, 2026-10-29; web/conditions.js): which objects are on, and where, as the
+    // ☰ World › Conditions (Ken, 2026-10-29; web/conditions.js): which objects are on, and where, as the
     // game has them with its conditions met (met), as a new game starts the scene's stage (start), or
     // as the scene was saved (saved). An imported piece or part carries its gate (never, or when:
     // terms over the scene's symbols, which the server sends) and moved (where its triggers put it).
-    // An object off in the mode is hidden; with ☰ View Inactive it is drawn faint instead, scripts off.
+    // An object off in the mode is hidden; with ☰ World › Inactive it is drawn faint instead, scripts off.
     // A piece from an area drawn alongside (☰ Areas) carries its own Unity scene, and is tested
     // against that scene's symbols (its stage), not the scene being viewed.
-    const symbolsNow = piece => (((piece && piece.unityScene && (state.sceneSymbols || {})[piece.unityScene]) || state.symbols || {})[state.conditions] || {});
+    // In game mode the inventory's symbols join them (Play.symbols: DaggerCount and the like).
+    const symbolsNow = piece => {
+        const own = (((piece && piece.unityScene && (state.sceneSymbols || {})[piece.unityScene]) || state.symbols || {})[state.conditions] || {});
+        return state.game ? { ...own, ...Play.symbols() } : own;
+    };
+    // Inventory gates (Ken, 2026-11-10): a piece gated on the inventory follows it in game mode, as
+    // Canopy's EffectBoolTrigger does: the Tangle's dagger beacon (DaggerCount<1) goes out when the
+    // dagger is collected, and comes back when game mode starts over. Built on, it is switched off and
+    // on (shown, and its scripts, web/tickable.js top.userData.gateOff); built off, it is rebuilt
+    // when its gate holds. A part's or particle system's gate is tested where it is drawn: parts
+    // when the piece is built, particle systems each frame (web/tickable.js).
+    const INVENTORY_SYMBOL = /\b(?:Thruster|Booster|Dagger|Headlamp)Count\b|\b(?:Amber|Fuel|Mana)Amount\b/;
+    const inventoryGated = piece => Boolean(piece && piece.when && INVENTORY_SYMBOL.test(JSON.stringify(piece.when)));
+    function regate() {
+        for (const list of [state.baseObjects, state.objects]) {
+            list.forEach((o, i) => {
+                const piece = o.userData.piece;
+                if (!inventoryGated(piece)) return;
+                const on = pieceOn(piece);
+                if (o.userData.builtOn) {
+                    o.userData.gateOff = !on;
+                    o.userData.off = !on && !state.inactive;
+                    o.visible = shown(o);
+                } else if (on) {
+                    const fresh = buildObject(piece);
+                    fresh.userData.pieceName = o.userData.pieceName;
+                    fresh.userData.piece = piece;
+                    world.remove(o);
+                    world.add(fresh);
+                    list[i] = fresh;
+                }
+            });
+        }
+    }
     const gateOf = (x, piece) => (x.never ? false : x.when ? Conditions.allHold(x.when, symbolsNow(piece)) : null);
+    // ☰ Fast forward (Ken, 2026-11-08): a stage chosen there starts the game at it, as Canopy does
+    // when Settings' starting stage is past the Tutorial (GameInit.RunFromSettings): the conditions
+    // as that stage starts (the FastForwardSymbols of every stage before it), a ring locus of an
+    // earlier stage gone (RingLocus.OnStage, unless keepDuringFastForward), a gem only on the loci
+    // of that stage (GemLocus.OnStage), and game mode's inventory and rings from its
+    // FastForwardConfig (web/play.js). The stage's conditions are World › Conditions' start mode,
+    // which it switches to; with no stage chosen, start is the scene's own stage.
+    // A stage's place in the order stages are played (Canopy's Stage.ValidStages; its number says
+    // nothing of order: Hawthorn is 10, between Tangle 2 and Oak 3), null if none.
+    const stageRank = name => {
+        const i = state.fastForward && name ? state.fastForward.order.indexOf(name) : -1;
+        return i < 0 ? null : i;
+    };
+    const stageFor = piece => state.ffStage || (((piece && piece.unityScene && (state.sceneSymbols || {})[piece.unityScene]) || state.symbols || {}).stage) || null;
+    function startAt(ff, name, extra) {
+        const at = ff.order.indexOf(name), out = {};
+        const rankOf = id => ff.order.findIndex(n => ff.stages[n] === Number(id));
+        for (const k of Object.keys(ff.symbols).sort((a, b) => rankOf(a) - rankOf(b))) if (rankOf(k) < at) Object.assign(out, ff.symbols[k]);
+        return Object.assign(out, { StageName: name }, extra);
+    }
+    function applyFastForward() {
+        const ff = state.fastForward;
+        for (const set of [state.symbols, ...Object.values(state.sceneSymbols || {})]) {
+            if (!set) continue;
+            if (!set.startSaved) set.startSaved = set.start;
+            set.start = state.ffStage && ff ? startAt(ff, state.ffStage, set.extra || {}) : set.startSaved;
+        }
+        Play.configure(ff, stageFor(null));
+    }
+    // A gem or ring locus's piece (part null) or gem (part) off as the stage starts (start mode only).
+    function lociOff(piece, part) {
+        const l = piece && piece.locus;
+        if (!l || state.conditions !== "start") return false;
+        const now = stageRank(stageFor(piece)), appear = stageRank(l.appear);
+        if (now === null || appear === null) return false;
+        if (l.kind === "RingLocus") return !part && !l.keep && now > appear;
+        return Boolean(part && part.item && part.item.kind === "Gem") && appear !== now;
+    }
+    // Fast-forwarded, a piece of a place played after that stage isn't there yet (Ken, 2026-11-09:
+    // to Beech, no Tangle; piece.from, the server's Conditions.placeStage; the Stronghold has none).
+    function laterPlace(piece) {
+        if (!state.ffStage || !piece || !piece.from) return false;
+        const at = stageRank(state.ffStage), from = stageRank(piece.from);
+        return at !== null && from !== null && from > at;
+    }
     function pieceOn(piece) {
+        if (laterPlace(piece) || lociOff(piece, null)) return false;
+        // editing an assemblage in place: its placements in the scene beneath would draw it twice
+        if (piece.placement && state.assemblagePrefab && piece.name === state.assemblagePrefab) return false;
         const saved = !/\binactive\b/.test(piece.extra || "");
         if (state.conditions === "saved") return saved;
         const gate = gateOf(piece, piece);
         return gate === null ? saved : gate;
     }
     function partOn(part, piece) {
+        if (lociOff(piece, part)) return false;
         if (state.conditions === "saved") return !part.offSaved;
         const gate = gateOf(part, piece);
         return gate === null ? true : gate;
@@ -1010,6 +1168,7 @@
         const entry = state.library[piece.name];
         group.userData.folder = folderOf(entry || (piece.source ? { source: piece.source } : null));
         const on = pieceOn(piece);
+        group.userData.builtOn = on; // with its scripts and lights (regate)
         group.userData.off = !on && !state.inactive; // hidden (shown() checks it)
         group.visible = shown(group);
         const faint = !on;
@@ -1038,9 +1197,12 @@
             return group;
         }
         if (!parts.length) {
-            // a piece that is only a light: a small ball of its color, unlit, not a placeholder box
+            // a piece that is only a light: a small ball of its color, unlit, not a placeholder box;
+            // one whose particle systems draw it (OutpostSkyBeamPfx's beam): those, no box or label
+            // (Ken, 2026-11-09)
+            const drawn = scripted && (scripted.scripts || []).some(sc => sc.name === "ParticleSystem" && sc.fields && !sc.off);
             if (piece.lights) for (const l of piece.lights) group.add(lightMarker(l));
-            else group.add(placeholder(new THREE.Matrix4(), piece.name));
+            else if (!drawn) group.add(placeholder(new THREE.Matrix4(), piece.name));
             return group;
         }
         for (const part of parts) {
@@ -1182,6 +1344,20 @@
         group("Composed scenes", list.composed, "composed");
         group("Imported areas (read-only)", list.areas, "area");
         state.areaNames = list.areas;
+        state.areaStages = list.areaStages || {};
+        if (!Array.isArray(list.stageOrder)) throw new Error("the scene list has no stageOrder (server.js /api/list)");
+        state.stageOrder = list.stageOrder;
+        // Fast forward is a choice here (Ken, 2026-11-09: the chooser says FF: Beech, and a reload
+        // opens that): the game's areas as that stage starts (loadScene)
+        const ffGroup = document.createElement("optgroup");
+        ffGroup.label = "Fast forward";
+        for (const stage of list.stageOrder) {
+            const o = document.createElement("option");
+            o.value = `ff:${stage}`;
+            o.textContent = `FF: ${stage}`;
+            ffGroup.appendChild(o);
+        }
+        sel.appendChild(ffGroup);
         $("unityScene").innerHTML = list.unityScenes.map(n => `<option>${n}</option>`).join("");
         if (select) sel.value = select;
         return list;
@@ -1189,8 +1365,10 @@
     // Textures, ☰ Snap, ☰ Labels, ☰ Fog, ☰ LOD tint, ☰ Tick and the rest are remembered per scene, in this
     // browser; a scene not seen before starts with these.
     const GUST_KINDS = ["cylinders", "waves"];
-    const TOGGLES = { textures: true, normalMaps: true, lights: true, lightView: false, unityShaders: false, snap: false, labels: false, fog: true, lodTint: false, candidates: false, fogClip: false, culling: false, refCube: false, showOrigin: false, wireframe: false, ticking: true, inactive: false, conditions: "met", windLevel: 1, gustLevel: 2, gustKind: "cylinders" };
-    const togglesKey = () => `layout.toggles.${state.scene.kind}:${state.scene.name}`;
+    const TOGGLES = { textures: true, normalMaps: true, lights: true, lightView: false, unityShaders: false, snap: false, labels: false, fog: true, lodTint: false, candidates: false, fogClip: false, culling: false, refCube: false, showOrigin: false, wireframe: false, ticking: true, inactive: false, conditions: "met", ffStage: "", windLevel: 1, gustLevel: 2, gustKind: "cylinders" };
+    // the chooser's value for the scene open: ff:<stage> for a fast-forward, else kind:name
+    const sceneValue = () => (state.scene.ff ? `ff:${state.scene.ff}` : `${state.scene.kind}:${state.scene.name}`);
+    const togglesKey = () => `layout.toggles.${sceneValue()}`;
     function loadToggles() {
         let saved;
         try {
@@ -1213,7 +1391,7 @@
     }
     // The camera's place and direction, remembered per scene in this browser (saved about once a
     // second while it changes), so a scene opens where it was left.
-    const cameraKey = () => `layout.camera.${state.scene.kind}:${state.scene.name}`;
+    const cameraKey = () => `layout.camera.${sceneValue()}`;
     let cameraSaved = "", cameraSavedAt = 0;
     function saveCamera(now) {
         if (!state.scene || now - cameraSavedAt < 1000) return;
@@ -1243,17 +1421,28 @@
     // keepCamera: stay put (a new scene on the area being viewed covers the same ground).
     async function loadScene(value, keepCamera = false) {
         if (state.dirty && !confirm("Discard unsaved changes?")) {
-            $("sceneSelect").value = `${state.scene.kind}:${state.scene.name}`;
+            $("sceneSelect").value = sceneValue();
             return;
         }
-        const [kind, ...rest] = value.split(":");
-        const name = rest.join(":");
+        let [kind, ...rest] = value.split(":");
+        let name = rest.join(":"), ff = null, alsoList = null;
+        // ff:<stage>: the stage's own area (else the first the game shows then), the rest of what the
+        // game shows at that stage alongside, conditions as it starts
+        if (kind === "ff") {
+            ff = name;
+            const needed = ffAreasFor(ff);
+            if (!needed.length) throw new Error(`Fast forward to ${ff}: no imported area is shown at that stage`);
+            kind = "area";
+            name = needed.includes(ff) ? ff : needed[0];
+            alsoList = needed.filter(a => a !== name);
+        }
         const started = performance.now(), before = { meshes: geometries.size, textures: textures.size };
         // the seconds counting up until the load says it's done (Ken, 2026-11-04: to see its timing)
-        const loading = () => `Loading ${name}… ${Math.round((performance.now() - started) / 1000)} s`;
+        const title = ff ? `FF: ${ff}` : name;
+        const loading = () => `Loading ${title}… ${Math.round((performance.now() - started) / 1000)} s`;
         say(loading());
-        const ticking = setInterval(() => (status.textContent.startsWith(`Loading ${name}…`) ? say(loading()) : clearInterval(ticking)), 1000);
-        const also = loadAlso(`${kind}:${name}`).map(a => `&also=${encodeURIComponent(a)}`).join("");
+        const ticking = setInterval(() => (status.textContent.startsWith(`Loading ${title}…`) ? say(loading()) : clearInterval(ticking)), 1000);
+        const also = (alsoList || loadAlso(`${kind}:${name}`)).map(a => `&also=${encodeURIComponent(a)}`).join("");
         let data;
         try {
             data = await call("GET", `/api/scene?kind=${kind}&name=${encodeURIComponent(name)}${also}`);
@@ -1263,10 +1452,15 @@
             throw error;
         }
         const fetched = performance.now();
-        state.scene = { name, kind, editable: data.editable };
+        state.scene = { name, kind, editable: data.editable, ...(ff ? { ff } : {}) };
+        state.unityScene = data.unityScene || null; // the Canopy scene an area is cut from
+        state.assemblagePrefab = data.assemblagePrefab || null; // this working scene's prefab, if an assemblage
         if (!state.tweak) clearSelection(); // its pieces went with the old scene
         loadHidden();
         loadToggles();
+        // fast-forwarded only as an FF: <stage> scene; any other opens as itself
+        state.ffStage = ff || "";
+        if (ff) state.conditions = "start";
         state.pieces = data.pieces;
         state.origin = data.origin || null; // an assemblage's root, "- Origin: x y z" (Unity axes)
         state.switch = data.switch || null; // "- Switch: ...": sets of inspect layers, one shown at a time
@@ -1274,6 +1468,7 @@
         else updateSwitch();
         state.area = data.area || null;
         state.also = data.also || [];
+        state.withAreas = data.withAreas || [];
         state.areaLines = data.areaLines || [];
         state.base = data.base || [];
         Object.assign(state.library, data.library);
@@ -1282,6 +1477,12 @@
         Environment.load(state.environment && state.environment.live); // eased from scratch: the first step snaps
         state.symbols = data.symbols || { met: {}, start: {} };
         state.sceneSymbols = data.sceneSymbols || {};
+        state.fastForward = data.fastForward || null;
+        state.immune = new Set(data.immune || []);
+        if (typeof data.gravity !== "number") throw new Error("the scene reply has no gravity (server.js, tools/scene.js physicsGravity)");
+        state.gravity = data.gravity; // Canopy's physics gravity (thrown items, particles) // the materials the dagger can't hurt (tools/scene.js daggerImmune)
+        if (state.ffStage && !(state.fastForward && state.ffStage in state.fastForward.stages)) throw new Error(`Fast forward to ${state.ffStage}: no such stage in the scan (tools/conditions.js fastForward)`);
+        applyFastForward();
         state.lodView = data.lod || { fov: 90, bias: 1 };
         state.clip = data.clip || { near: 0.03, far: 400 };
         state.cullSettings = data.culling || { perFrame: 0.05, margin: 6 };
@@ -1304,7 +1505,7 @@
         updateUi();
         const on = (state.area ? `, on ${state.area}` : "") + (state.also.length ? `, with ${state.also.join(", ")}` : "") + (state.area || state.also.length ? ` (${state.base.length}, read-only)` : "");
         clearInterval(ticking);
-        say(`${name}: ${data.pieces.length} pieces, loaded in ${((performance.now() - started) / 1000).toFixed(1)} s${on}${data.problems.length ? `; ${data.problems.length} meshes failed` : ""}${data.editable ? "" : " (read-only; Add starts a scene on it)"}`);
+        say(`${title}: ${data.pieces.length} pieces, loaded in ${((performance.now() - started) / 1000).toFixed(1)} s${on}${data.problems.length ? `; ${data.problems.length} meshes failed` : ""}${data.editable ? "" : " (read-only; Add starts a scene on it)"}`);
         logLoad(name, started, fetched, before).catch(() => {});
         findTweaks().catch(fail);
         showRefCube();
@@ -1324,7 +1525,7 @@
     // Shown: not in a folder ☰ Folders hides, and not culled (☰ Culling).
     function shown(o) {
         if (o.userData.duplicate) return false; // a second of a singleton (web/tickable.js)
-        if (o.userData.off) return false; // off in ☰ View Conditions' mode
+        if (o.userData.off) return false; // off in ☰ World › Conditions' mode
         return !state.hiddenFolders.has(o.userData.folder) && !(state.culling && o.userData.culled);
     }
     // Where the fog hides farClip.threshold of the light (FarClipManager's distance; see applyClip).
@@ -1438,7 +1639,7 @@
             object,
             rel: camera.matrixWorld.clone().invert().multiply(object.matrix),
             factor: 1,
-            base: index >= 0 ? uniformScale(state.pieces[index].scale) : 1, // its size when picked up, x base size
+            base: index >= 0 ? uniformScale(state.pieces[index].scale) : index === PLACED ? uniformScale(object.userData.piece.scale) : 1, // its size when picked up, x base size
             original: object.matrix.clone(),
             camera: { position: camera.position.clone(), quaternion: camera.quaternion.clone() }, // where Cancel returns to
             extra: index >= 0 ? state.pieces[index].extra || "" : "" // settings, e.g. a tablet's text id
@@ -1475,7 +1676,8 @@
             canopyReload();
         }
     }
-    async function addPiece(name) {
+    // placing: an assemblage added to the Canopy scene of the area open (dropping writes it there)
+    async function addPiece(name, placing = false) {
         closePanels();
         if (!state.library[name]) {
             say(`Preparing ${name}…`);
@@ -1499,7 +1701,15 @@
             new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw + Math.PI),
             new THREE.Vector3(1, 1, 1)
         );
+        // an assemblage starts where it was authored (its Origin) if that is in sight: a one-of-a-kind
+        // made in place drops right back where it was designed
+        const authored = placing && palette && (palette.scenes || []).find(x => x.prefab === name);
+        if (authored && authored.origin) {
+            const at = Space.pieceMatrix(THREE, { position: authored.origin, rotation: [0, 0, 0], scale: [1, 1, 1] });
+            if (new THREE.Vector3().setFromMatrixPosition(at).distanceTo(camera.position) < 300) object.matrix.copy(at);
+        }
         startCarry(-1, object);
+        if (placing) state.carried.placement = { scene: state.unityScene, prefab: name };
         say(`Carrying ${name}. Move to carry it, drag to circle it, the buttons above Q and E to spin it, then Drop.${takesText(state.carried) ? " Add text picks its text." : ""}`);
     }
     function carriedMatrix() {
@@ -1513,7 +1723,7 @@
             if (!box.isEmpty()) {
                 const center = box.getCenter(new THREE.Vector3());
                 const ray = new THREE.Raycaster(new THREE.Vector3(center.x, box.max.y + 0.05, center.z), new THREE.Vector3(0, -1, 0));
-                const others = [...state.baseObjects, ...state.objects.filter((o, i) => i !== c.index)].filter(o => o.visible);
+                const others = [...state.baseObjects, ...state.objects].filter(o => o.visible && o !== c.object);
                 const hit = ray.intersectObjects(others, true).find(h => h.object.isMesh && h.object.material !== wire);
                 if (hit) {
                     m.premultiply(new THREE.Matrix4().makeTranslation(0, hit.point.y - box.min.y, 0));
@@ -1532,6 +1742,7 @@
             return say("Reference cube placed (kept in this browser, not in the scene).");
         }
         const placement = Space.placementOf(THREE, carriedMatrix());
+        if (c.placement) return dropPlacement(c, placement);
         commit(() => {
             if (c.index < 0) {
                 const piece = { name: c.object.userData.pieceName, ...placement, extra: c.extra };
@@ -1539,6 +1750,7 @@
                 state.objects.push(c.object);
             } else {
                 Object.assign(state.pieces[c.index], placement, { extra: c.extra });
+                carryLinkedChildren(c);
             }
             c.object.matrix.copy(Space.pieceMatrix(THREE, c.index < 0 ? state.pieces[state.pieces.length - 1] : state.pieces[c.index]));
         });
@@ -1546,6 +1758,58 @@
         endCarry();
         refreshLabels();
         say("Dropped.");
+    }
+    // A linked assemblage's piece (tools/linked.js: "link <id>", "in <its parent's id>") moved: the
+    // pieces under it (in, at any depth) move with it, as children do in Unity (Ken, 2026-11-09:
+    // Black Isle's shamans and the thrusters on them).
+    const linkIdOf = extra => (/(?:^|, )link (-?\d+)/.exec(extra || "") || [])[1] || null;
+    const linkParentOf = extra => (/(?:^|, )in (-?\d+)/.exec(extra || "") || [])[1] || null;
+    function carryLinkedChildren(c) {
+        const root = linkIdOf(state.pieces[c.index].extra);
+        if (!root) return;
+        const moving = new Set([root]);
+        for (let grew = true; grew;) {
+            grew = false;
+            for (const p of state.pieces) {
+                const id = linkIdOf(p.extra);
+                if (id && !moving.has(id) && moving.has(linkParentOf(p.extra))) {
+                    moving.add(id);
+                    grew = true;
+                }
+            }
+        }
+        const delta = Space.pieceMatrix(THREE, state.pieces[c.index]).multiply(c.original.clone().invert());
+        state.pieces.forEach((p, i) => {
+            if (i === c.index || !moving.has(linkIdOf(p.extra))) return;
+            const m = delta.clone().multiply(Space.pieceMatrix(THREE, p));
+            Object.assign(p, Space.placementOf(THREE, m));
+            state.objects[i].matrix.copy(Space.pieceMatrix(THREE, p));
+        });
+    }
+    // An assemblage's placement written into its Canopy scene, then shown as the scene's (read-only
+    // beneath, carried again from there).
+    async function dropPlacement(c, placement) {
+        const p = c.placement;
+        say(`Writing ${p.prefab} into ${p.scene}…`);
+        let result;
+        try {
+            result = await call("POST", "/api/placement", { op: p.instance ? "move" : "add", scene: p.scene, prefab: p.prefab, instance: p.instance, placement });
+        } catch (error) {
+            cancel();
+            return fail(error);
+        }
+        const piece = c.index === PLACED ? Object.assign(c.object.userData.piece, result.piece) : { ...result.piece, ...(p.scene !== state.unityScene ? { unityScene: p.scene } : {}) };
+        if (c.index !== PLACED) {
+            c.object.userData.piece = piece;
+            c.object.userData.pieceName = piece.name;
+            state.base.push(piece);
+            state.baseObjects.push(c.object);
+        }
+        c.object.matrix.copy(Space.pieceMatrix(THREE, placed(piece)));
+        c.object.updateMatrixWorld(true);
+        endCarry();
+        refreshLabels();
+        say(`${piece.name} ${p.instance ? "moved" : "placed"} in ${p.scene} (logged in Canopy Changes).`);
     }
     function cancel() {
         const c = state.carried;
@@ -1566,6 +1830,7 @@
     }
     function remove() {
         const c = state.carried;
+        if (c && c.index === PLACED) return removePlacement(c);
         if (!c || c.index < 0) return;
         commit(() => {
             world.remove(c.object);
@@ -1575,6 +1840,25 @@
         endCarry();
         refreshLabels();
         say("Deleted.");
+    }
+
+    async function removePlacement(c) {
+        const p = c.placement;
+        if (!confirm(`Delete this ${p.prefab} from ${p.scene}?`)) return;
+        try {
+            await call("POST", "/api/placement", { op: "delete", scene: p.scene, instance: p.instance });
+        } catch (error) {
+            return fail(error);
+        }
+        world.remove(c.object);
+        const i = state.baseObjects.indexOf(c.object);
+        if (i >= 0) {
+            state.baseObjects.splice(i, 1);
+            state.base.splice(state.base.indexOf(c.object.userData.piece), 1);
+        }
+        endCarry();
+        refreshLabels();
+        say(`${p.prefab} deleted from ${p.scene} (logged in Canopy Changes).`);
     }
 
     // ---------- camera ----------
@@ -1643,7 +1927,7 @@
     }
     // The move keys' base speed: the same in every scene (Ken, 2026-11-03; it was a share of the
     // scene's size, so the same ground went at different speeds in different areas): what
-    // HawthornScene Whole gave; the keys go from a sixtieth of it to six times it (frame()'s
+    // Hawthorn gave; the keys go from a sixtieth of it to six times it (frame()'s
     // RAMP). Carrying, it follows the piece's size, for placing small things.
     const MOVE_SPEED = 44;
     function speed() {
@@ -1655,8 +1939,16 @@
     const pointers = new Map();
     let gesture = null;
     let pinchStart = null; // when the pinch last moved (its speed sets how far it goes)
+    // (a synthetic pointer, lens/drive.js's taps, can't be captured: it goes on uncaptured)
+    const capture = (element, id) => {
+        try {
+            element.setPointerCapture(id);
+        } catch {
+            // not a live pointer
+        }
+    };
     canvas.addEventListener("pointerdown", e => {
-        canvas.setPointerCapture(e.pointerId);
+        capture(canvas, e.pointerId);
         pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now() });
         pinchStart = null;
         gesture = null;
@@ -1708,7 +2000,7 @@
         if (pointers.size === 0) tweakReleased();
     });
     function tap(x, y) {
-        if (state.game) return hopToward(x, y);
+        if (state.game) return gameTapOrThrow(x, y);
         if (state.carried || state.tweak || !state.scene) return;
         const ray = new THREE.Raycaster();
         const r = canvas.getBoundingClientRect();
@@ -1718,7 +2010,19 @@
             return say("Carrying the reference cube. Drop or Cancel.");
         }
         pickMaterial(ray);
-        if (!state.scene.editable) return;
+        if (!state.scene.editable) {
+            // in an imported area, an assemblage placed in the scene can be carried (its other pieces can't)
+            const near = ray.intersectObjects(state.baseObjects.filter(o => o.visible), true).find(h => h.object.isMesh && visibleUp(h.object));
+            let top = near && near.object;
+            while (top && top.parent !== world) top = top.parent;
+            const placed = top && top.userData.piece && top.userData.piece.placement;
+            if (!placed) return;
+            const piece = top.userData.piece;
+            startCarry(PLACED, top);
+            state.carried.placement = { scene: piece.unityScene || state.unityScene, prefab: piece.name, instance: placed.instance };
+            say(`Carrying ${piece.name}, placed in ${state.carried.placement.scene}. Drop to move it there, Cancel, or Delete.`);
+            return;
+        }
         const hit = ray.intersectObjects(state.objects.filter(o => o.visible), true)[0];
         if (!hit) return;
         let o = hit.object;
@@ -1733,16 +2037,20 @@
     }
 
     // ---------- game mode ----------
-    // ☰ Game mode (Ken, 2026-11-02): only ☰ (holding Edit mode, which ends it) and ⛶ on screen;
-    // dragging looks around and a pinch travels, as ever; a tap casts a ray, reaching HOP_REACH m
-    // level or upward, and below level anything within HOP_REACH m across (in x and z, however
-    // far down: Ken, 2026-11-02), and the camera (the player) hops there along an arc, landing a meter off the tapped
-    // polygon along its normal (turned toward the side tapped), still looking the same way.
-    // Leaves are never landed on (Ken, 2026-11-03): a tap passes through them to what is behind,
-    // and a hop, which tests nothing on its way, goes through them.
+    // ☰ Game mode (Ken, 2026-11-02): only ☰ and ⛶ on screen, and the reticle; dragging looks around
+    // and a pinch travels, as ever. A tap casts a ray; the first thing drawn it meets (leaves are
+    // passed through, Ken, 2026-11-03):
+    //   an Item (web/play.js) within 2.5 m is taken into Hold (Ken, 2026-11-08);
+    //   anything else is hopped to if it is within HOP_REACH m, level or upward, or below level
+    //   within HOP_REACH m across (in x and z, however far down: Ken, 2026-11-02): the camera (the
+    //   player) hops there along an arc, landing a meter off the tapped polygon along its normal
+    //   (turned toward the side tapped), still looking the same way; a hop goes through leaves.
+    // Out of reach (or nothing there), a red dot shows a moment where the tap was. The reticle gets
+    // a ring while what it points at could be taken or hopped to.
     const HOP_REACH = 20, HOP_STANDOFF = 1;
     const isLeaf = part => Boolean(part && (part.leafSplit || /\/ForestTreeLeaves/.test((part.mesh && part.mesh.path) || "")));
     function setGame(on) {
+        portalLinks.clear();
         if (on) {
             if (state.carried) cancel();
             if (state.tweak) endTweak();
@@ -1752,31 +2060,570 @@
         }
         state.game = on;
         state.hop = null;
+        lastStable = on ? camera.position.clone() : null; // where game mode starts is stable
+        Play.setActive(on); // whatever was taken goes back where it was
         document.body.classList.toggle("game", on);
         $("gameBtn").textContent = on ? "Edit mode" : "Game mode";
-        say(on ? "Game mode: drag to look, tap to hop there." : "Edit mode.");
+        $("reticle").classList.remove("aim");
+        say(on ? "Game mode: drag to look, tap to hop there or take an item." : "Edit mode.");
     }
     $("gameBtn").onclick = () => setGame(!state.game);
-    function hopToward(x, y) {
-        if (state.hop) return;
-        const ray = new THREE.Raycaster();
+    // ☰ Game display (game mode only; default off): the counts and the ring fingers.
+    $("hudBtn").onclick = () => {
+        Play.toggleDisplay();
+        updateUi();
+    };
+    // The first thing drawn along a ray: a mesh with a face, it and everything above it visible
+    // (hidden LOD levels, culled and switched-off pieces aren't), not a leaf; taken items aren't hit
+    // (they are on another layer), the rings game mode made are.
+    const seen = o => { for (let p = o; p; p = p.parent) if (!p.visible) return false; return true; };
+    const gameRay = new THREE.Raycaster();
+    // The sea (Ken, 2026-11-09): taps pass through its surface (it isn't in the world a tap meets) to
+    // whatever is below it, which is the target; only when nothing is, the tap is taken as at the hop's
+    // full reach along it, under the surface (hit.sea: the sea is no surface to land on; the player
+    // tries to go in). One whose surface is out of reach: a red dot. A hop that brings the head (the camera) within SEA_TOUCH of it,
+    // from above, is Canopy's head in the sea (Sea.Update, Player.OnSeaSurfaceDeath): back to the last
+    // stable place, where a hop or a portal last left the head more than STABLE_ABOVE_SEA above it
+    // (Rules' stablePositionHeadAboveSeaDist; or where game mode started). SeaSkip, WaterBounce and
+    // Antacid, which spare the player in Canopy, aren't played. A biome below the sea (Coral, Maple:
+    // their air zones) is never "in the sea": only a hop from above the surface down to it counts.
+    const SEA_TOUCH = 0.2, STABLE_ABOVE_SEA = 0.2;
+    const seaLevel = () => { const y = Surface.uniforms.canopySeaLevel.value; return y > -1e8 ? y : null; };
+    let lastStable = null;
+    function seaHit(ray) {
+        const y = seaLevel();
+        if (y === null || Math.abs(ray.direction.y) < 1e-6) return null;
+        const t = (y - ray.origin.y) / ray.direction.y;
+        if (t <= 0) return null;
+        // at full reach: HOP_REACH across (hopReaches), or along the ray when it points nearly straight down
+        const flat = Math.hypot(ray.direction.x, ray.direction.z);
+        const reach = Math.max(t, flat > 1e-3 ? HOP_REACH / flat : HOP_REACH);
+        const surfaceAcross = t * flat;
+        const d = surfaceAcross > HOP_REACH ? t : reach; // the surface out of reach: there (a red dot)
+        return { sea: true, distance: d, point: ray.at(d, new THREE.Vector3()), face: { normal: new THREE.Vector3(0, ray.origin.y > y ? 1 : -1, 0) }, object: null };
+    }
+    function noteStable() {
+        const y = seaLevel();
+        if (y === null || camera.position.y > y + STABLE_ABOVE_SEA) lastStable = camera.position.clone();
+    }
+    function gameHit(ndc) {
+        gameRay.setFromCamera(ndc, camera);
+        gameRay.far = Infinity;
+        return gameRay.intersectObjects([world, ...Play.extras()], true).find(h => h.face && h.object.isMesh && seen(h.object) && !isLeaf(h.object.userData.part)) || seaHit(gameRay.ray);
+    }
+    const across = p => Math.hypot(p.x - camera.position.x, p.z - camera.position.z);
+    // Within a hop: level or upward within HOP_REACH m, below level within HOP_REACH m across.
+    const hopReaches = hit => (gameRay.ray.direction.y < 0 ? across(hit.point) <= HOP_REACH : hit.distance <= HOP_REACH);
+    const ndcOf = (x, y) => {
         const r = canvas.getBoundingClientRect();
-        ray.setFromCamera(new THREE.Vector2((x - r.left) / r.width * 2 - 1, -((y - r.top) / r.height) * 2 + 1), camera);
-        const down = ray.ray.direction.y < 0;
-        ray.far = down ? Infinity : HOP_REACH;
-        const across = p => Math.hypot(p.x - camera.position.x, p.z - camera.position.z);
-        // what is drawn: a mesh with a face, it and everything above it visible (hidden LOD levels,
-        // culled and switched-off pieces aren't)
-        const seen = o => { for (let p = o; p; p = p.parent) if (!p.visible) return false; return true; };
-        const hit = ray.intersectObject(world, true).find(h => h.face && h.object.isMesh && seen(h.object) && !isLeaf(h.object.userData.part));
-        if (hit && down && across(hit.point) > HOP_REACH) return;
-        if (!hit) return;
-        const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
-        if (normal.dot(ray.ray.direction) > 0) normal.negate(); // the side it was tapped from
-        const to = hit.point.clone().addScaledVector(normal, HOP_STANDOFF);
+        return new THREE.Vector2((x - r.left) / r.width * 2 - 1, -((y - r.top) / r.height) * 2 + 1);
+    };
+    // At the Gem Station (Ken, 2026-11-08: where a held gem tapped goes into the first open ring):
+    // within STATION_REACH m of any piece of the temple's GemWorkbench.
+    const GEM_STATION = /\/GemWorkbench\//, STATION_REACH = 3, stationBox = new THREE.Box3();
+    function atGemStation() {
+        for (const o of allObjects()) {
+            const piece = o.userData.piece;
+            if (!piece || !GEM_STATION.test(piece.path || "") || !seen(o)) continue;
+            stationBox.setFromObject(o);
+            if (!stationBox.isEmpty() && stationBox.distanceToPoint(camera.position) <= STATION_REACH) return true;
+        }
+        return false;
+    }
+    // The piece group a mesh belongs to (the world's child), and the drawn piece at a Unity path.
+    const topObject = o => { while (o && o.parent && o.parent !== world) o = o.parent; return o && o.parent === world ? o : null; };
+    // What a tap in game mode is on (Ken, 2026-11-09: a tap should always figure out what you
+    // tapped): the innermost of its piece's things (a portal, harvester or cage: tools/scene.js
+    // gameThings, the piece's own or, for a piece drawn from its prefab such as an assemblage, its
+    // library entry's) holding the part hit. { top, piece, thing, meshes }: piece is the drawn piece
+    // for a thing that is all of it (its guards, its path), else one of its own ({ name, path,
+    // guarding }); meshes, the thing's (null: all of top's); thing null: ground (or an item).
+    const thingsOf = piece => piece.things || (state.library[piece.name] || {}).things || [];
+    const within = (things, i, outer) => { for (let k = i, n = 0; k !== undefined && k !== null && n < 64; k = things[k].in, n++) if (k === outer) return true; return false; };
+    function unityMatrix(piece) {
+        return new THREE.Matrix4().compose(new THREE.Vector3(...piece.position), Space.unityEulerToQuaternion(THREE, piece.rotation), new THREE.Vector3(...piece.scale));
+    }
+    // a portal thing with its landing in the world
+    const worldPortal = (piece, portal) => ({ ...portal, landing: new THREE.Vector3(...portal.landing).applyMatrix4(unityMatrix(piece)).toArray() });
+    function tapTarget(object) {
+        const top = topObject(object), piece = top && top.userData.piece;
+        if (!piece) return null;
+        const things = thingsOf(piece), i = object.userData.part ? object.userData.part.thing : undefined;
+        const t = i === undefined ? null : things[i];
+        if (!t) return { top, piece, thing: null, meshes: null };
+        const own = (piece.path || piece.name || "").split("/").pop(); // a whole piece's portal goes by the piece's name
+        const thing = t.portal ? { ...t, portal: worldPortal(piece, t.portal.atRoot ? { ...t.portal, name: own } : t.portal) } : t;
+        if (t.root) return { top, piece, thing, meshes: null, index: i };
+        const meshes = [];
+        top.traverse(o => { if (o.isMesh && o.userData.part && within(things, o.userData.part.thing, i)) meshes.push(o); });
+        // a cage's own guard counts down that cage (the drawn piece, when the cage is all of it)
+        const cage = t.guard && things[t.in] && things[t.in].root ? piece.path : null;
+        return { top, piece: { name: t.name, path: `${piece.path}/${t.name}`, ...(cage ? { guarding: cage } : {}) }, thing, meshes, index: i };
+    }
+    // The piece guarded as path (its own path, or a tenant look's guardedAs), or null.
+    function guardedPiece(path) {
+        const o = allObjects().find(x => x.userData.piece && (x.userData.piece.path === path || x.userData.piece.guardedAs === path));
+        return o ? o.userData.piece : null;
+    }
+    // A cage's own guards (its wardens: things marked guard) still in the world, any mesh of theirs not
+    // taken (Ken, 2026-11-10: no firefly while any warden exists on that cage, they all guard it).
+    function wardensLeft(top) {
+        const things = thingsOf(top.userData.piece);
+        let left = 0;
+        things.forEach((t, i) => {
+            if (!t.guard) return;
+            let alive = false;
+            top.traverse(o => { if (!alive && o.isMesh && !o.userData.taken && o.userData.part && within(things, o.userData.part.thing, i)) alive = true; });
+            if (alive) left++;
+        });
+        return left;
+    }
+    // ---------- portals paid, and payees (Ken, 2026-11-09) ----------
+    // In game mode portals start unpaid, as in Canopy: no bubble (Portal.TestLit: lit only when paid
+    // and leading somewhere) and the spinners a purchase starts standing still; paid only as a scene
+    // saves them (Portal.isPaid), as fast forward pays them (an Outpost and its Temple portal once
+    // both their stages are done: FastForwardConfig.LinkTemplePortals), as one is arrived at through
+    // a portal that links back (the Temple's cairn: SetLeadsTo), or bought. A payee (Payee.cs) shows
+    // as many markers as its price takes (ShowPaymentsAtCurrentPrice); amber paid on them (web/play.js
+    // pay, the amber made where the marker was) counts toward the price; reaching it, a second later
+    // (finalPaymentDelay) the amber is used up and the portal paid (and the one it leads to,
+    // Portal.SetPaid), which hides its payee's markers (SetPaymentsUnavailable); a payee of no portal
+    // goes to its next price. Taking amber back off a marker takes it off the price. Edit mode shows
+    // everything, as ever. (Canopy's sounds and the final payment's particle burst aren't played.)
+    const paying = { portals: [], payees: [], made: new Map(), touched: new Set() };
+    const madeObjects = [];
+    let madeCount = 0;
+    function thingMeshes(top, things, i) {
+        const out = [];
+        top.traverse(o => { if (o.isMesh && o.userData.part && within(things, o.userData.part.thing, i)) out.push(o); });
+        return out;
+    }
+    // drawn or not, as game mode has it (layer 1: neither drawn nor hit, web/play.js HIDDEN)
+    function showMeshes(meshes, on) {
+        for (const m of meshes) {
+            if (m.userData.shownMask === undefined) m.userData.shownMask = m.layers.mask;
+            paying.touched.add(m);
+            if (on) {
+                m.layers.mask = m.userData.shownMask;
+                delete m.userData.taken;
+            } else {
+                m.layers.set(1);
+                m.userData.taken = true;
+            }
+        }
+    }
+    const portalName = (piece, t) => (t.portal.atRoot ? (piece.path || piece.name || "").split("/").pop() : t.portal.name);
+    // where a portal leads now (by name): where game mode linked it, the fast-forward stage's link,
+    // else as saved ("": nowhere)
+    function leadsTo(portal, name) {
+        const ff = state.fastForward, config = ff && state.ffStage && ff.configs[ff.stages[state.ffStage]];
+        const saved = portal.target !== name ? portal.target : "";
+        return portalLinks.get(name) || (config && config.portalLinks && config.portalLinks[name]) || saved;
+    }
+    const priceOf = payee => (payee.index >= 0 && payee.index < payee.prices.length ? payee.prices[payee.index] : 0);
+    function startPaying() {
+        for (const o of madeObjects) world.remove(o);
+        madeObjects.length = 0;
+        paying.made.clear();
+        for (const p of paying.payees) clearTimeout(p.timer);
+        showMeshes([...paying.touched], true);
+        paying.touched.clear();
+        for (const o of allObjects()) if (o.userData.stillSpinners) delete o.userData.stillSpinners;
+        paying.portals = [];
+        paying.payees = [];
+        damage.clear();
+        startVacancies();
+        payingObjects = allObjects();
+        if (!state.game) return;
+        for (const o of allObjects()) {
+            const piece = o.userData.piece, things = piece ? thingsOf(piece) : [];
+            if (!things.length) continue;
+            const payees = (piece.payees || (state.library[piece.name] || {}).payees || []).map(p => ({ top: o, prices: p.prices, index: p.index, markers: [], timer: null }));
+            things.forEach((t, i) => {
+                const payee = t.payment && payees[t.payment.payee];
+                if (payee) payee.markers.push({ i, things, value: t.payment.value, placed: null });
+                if (t.portal) paying.portals.push({ top: o, piece, t, i, things, name: portalName(piece, t), paid: Boolean(t.portal.paid), payee: payees[t.portal.payee] || null });
+            });
+            paying.payees.push(...payees);
+        }
+        // fast-forwarded: the pairs that lead to each other, both from stages done (LinkTemplePortals)
+        const at = stageRank(state.ffStage);
+        if (at !== null) {
+            const done = p => p.piece.from && stageRank(p.piece.from) !== null && stageRank(p.piece.from) < at;
+            for (const p of paying.portals) {
+                const q = portalByName(p.t.portal.target);
+                if (q && q !== p && q.t.portal.target === p.name && done(p) && done(q)) p.paid = q.paid = true;
+            }
+        }
+        for (const p of paying.portals) if (p.paid && p.payee) p.payee.index = -1;
+        refreshPaying();
+    }
+    // Meshes load after their pieces are built, and Fast forward loads areas: twice a second in game
+    // mode the drawn world is checked (new pieces: game mode's state starts over; new meshes: hidden
+    // or shown as their portal or payee has them).
+    let payingAt = 0, payingObjects = null;
+    function payingTick(now) {
+        if (now - payingAt < 500) return;
+        payingAt = now;
+        const objects = allObjects();
+        if (payingObjects && (objects.length !== payingObjects.length || objects.some((o, k) => o !== payingObjects[k]))) Play.reset();
+        else {
+            refreshPaying();
+            refreshVacancies();
+        }
+        payingObjects = objects;
+    }
+    const portalByName = name => (name ? paying.portals.find(p => p.name === name) || null : null);
+    function refreshPaying() {
+        const still = new Map(); // top -> its unpaid portals' spinners
+        for (const p of paying.portals) {
+            showMeshes(thingMeshes(p.top, p.things, p.i), p.paid && Boolean(leadsTo(p.t.portal, p.name)));
+            if (!p.paid) for (const go of p.t.spinners || []) (still.get(p.top) || still.set(p.top, new Set()).get(p.top)).add(go);
+        }
+        for (const p of paying.portals) p.top.userData.stillSpinners = still.get(p.top) || null; // scripts/Spinner.js
+        for (const payee of paying.payees) {
+            let left = priceOf(payee);
+            for (const m of payee.markers) {
+                const shown = left >= m.value;
+                if (shown) left -= m.value;
+                showMeshes(thingMeshes(payee.top, m.things, m.i), shown && !m.placed);
+            }
+        }
+    }
+    // Portal.SetPaid: paid, its payee's markers gone, and the portal it leads to paid too
+    function setPaid(p) {
+        if (!p || p.paid) return;
+        p.paid = true;
+        if (p.payee) p.payee.index = -1;
+        setPaid(portalByName(leadsTo(p.t.portal, p.name)));
+    }
+    function payeeTotal(payee) {
+        return payee.markers.reduce((sum, m) => sum + (m.placed ? m.value : 0), 0);
+    }
+    function checkPayee(payee) {
+        clearTimeout(payee.timer);
+        const price = priceOf(payee);
+        if (price > 0 && payeeTotal(payee) >= price) payee.timer = setTimeout(() => completePayee(payee), 1000);
+    }
+    // Payee.OnPaymentComplete: the amber used up; its portal paid, else its next price
+    function completePayee(payee) {
+        payee.timer = null;
+        for (const m of payee.markers) {
+            if (!m.placed) continue;
+            world.remove(m.placed);
+            paying.made.delete(m.placed);
+            m.placed = null;
+        }
+        const portal = paying.portals.find(p => p.payee === payee);
+        if (portal) setPaid(portal);
+        else payee.index = payee.index >= 0 ? payee.index + 1 : payee.index;
+        Usage.count("game: purchase");
+        say(portal ? `${portal.name} bought.` : "Bought.");
+        refreshPaying();
+    }
+    // A marker tapped: paid (web/play.js pay), its amber made where it was (its prefabToMake, Amber10;
+    // centered on the marker, no gravity), counted toward its payee.
+    async function payAt(top, i, thing, hit, x, y) {
+        const paid = Play.pay(thing.payment.value, hit, x, y);
+        if (paid !== "paid") return paid;
+        const payee = paying.payees.find(p => p.top === top && p.markers.some(m => m.i === i));
+        const marker = payee && payee.markers.find(m => m.i === i);
+        const meshes = thingMeshes(top, thingsOf(top.userData.piece), i);
+        const box = new THREE.Box3();
+        for (const m of meshes) box.expandByObject(m);
+        showMeshes(meshes, false);
+        const name = thing.payment.make;
+        if (!state.library[name]) {
+            const data = await call("POST", "/api/prepare", { names: [name] });
+            Object.assign(state.library, data.library);
+            Object.assign(state.materials, data.materials || {});
+        }
+        const center = box.isEmpty() ? camera.position.clone() : box.getCenter(new THREE.Vector3());
+        const at = Space.placementOf(THREE, new THREE.Matrix4().makeTranslation(center.x, center.y, center.z));
+        const piece = { name, path: `made/${name}/${++madeCount}`, position: at.position, rotation: [0, 0, 0], scale: [1, 1, 1], extra: "" };
+        const object = buildObject(piece);
+        object.userData.pieceName = name;
+        object.userData.piece = piece;
+        world.add(object);
+        madeObjects.push(object);
+        if (marker) {
+            marker.placed = object;
+            paying.made.set(object, { payee, marker });
+            checkPayee(payee);
+        }
+        return true;
+    }
+    // an item taken (web/play.js): amber made on a marker, taken back off it
+    function takenBack(group) {
+        const made = paying.made.get(group);
+        if (!made) return;
+        paying.made.delete(group);
+        made.marker.placed = null;
+        checkPayee(made.payee);
+        refreshPaying();
+    }
+    // Mana mounted on a harvester (Ken, 2026-11-09: the flamer is sure to be killed, and the mana must
+    // go on existing): taken, the mounted mana is hidden and a real mana item (ManaFire, ManaAir or
+    // ManaWater, by element) made where it was goes into Hold, a thing of its own; gone when game
+    // mode starts over. In Canopy the flamers should carry a real ManaFire (docs: Flamer).
+    const MANA_ITEM = { fire: "ManaFire", air: "ManaAir", water: "ManaWater" };
+    async function takeMounted(top, meshes, element) {
+        const box = new THREE.Box3();
+        for (const m of meshes) box.expandByObject(m);
+        Play.hideGroup(top, meshes);
+        const name = MANA_ITEM[element];
+        if (!state.library[name]) {
+            const data = await call("POST", "/api/prepare", { names: [name] });
+            Object.assign(state.library, data.library);
+            Object.assign(state.materials, data.materials || {});
+        }
+        const center = box.getCenter(new THREE.Vector3());
+        const at = Space.placementOf(THREE, new THREE.Matrix4().makeTranslation(center.x, center.y, center.z));
+        const piece = { name, path: `made/${name}/${++madeCount}`, position: at.position, rotation: [0, 0, 0], scale: [1, 1, 1], extra: "" };
+        const object = buildObject(piece);
+        object.userData.pieceName = name;
+        object.userData.piece = piece;
+        world.add(object);
+        madeObjects.push(object);
+        // its meshes load a moment later: then it is taken
+        for (let waited = 0; waited < 5000; waited += 50) {
+            if (!object.parent) return; // game mode started over meanwhile
+            let found = null;
+            object.traverse(o => { if (!found && o.isMesh && o.userData.part && o.userData.part.item) found = o; });
+            if (found) return Play.holdMade(found);
+            await new Promise(r => setTimeout(r, 50));
+        }
+        say(`${name} didn't load.`);
+    }
+    // A fire-empowered stab on red armor: a point of damage (Ken, 2026-11-09); dead at its health
+    // (HcHealth.healthMax, 1 unless more). Damage is forgotten when game mode starts over.
+    const damage = new Map(); // harvester path -> damage taken
+    function burn(top, piece, thing, hit, x, y, meshes) {
+        const taken = (damage.get(piece.path) || 0) + 1, health = thing.health || 1;
+        damage.set(piece.path, taken);
+        Usage.count("game: fire on red");
+        if (taken >= health) return Play.kill(top, piece, hit, x, y, meshes, meshes ? thing.go : null);
+        say(`Burned: ${health - taken} of ${health} health left.`);
+    }
+    // ---------- vacancies (Ken, 2026-11-09; Canopy's Vacancy.cs and Tenant.cs) ----------
+    // In game mode a vacancy's piece (the first LOD group under its parent, tools/scene.js) is drawn
+    // in its translucent shadowMaterial, as Canopy draws the copy it makes; tapped within reach while
+    // holding a tenant with the same most-detailed mesh (HasSameLod0Mesh), the piece is drawn again,
+    // the vacancy gone, and the tenant used up. Holding anything else: a red dot. Edit mode, and
+    // game mode starting over, draw them as they are.
+    const vacancies = { list: [] }; // { top, i, vac, filled, shadowed: Map(mesh -> its material) }
+    function vacancyMeshes(top, i) {
+        const out = [];
+        top.traverse(o => { if (o.isMesh && o.userData.part && o.userData.part.vacancy === i) out.push(o); });
+        return out;
+    }
+    function unshadow(v) {
+        for (const [m, material] of v.shadowed) m.material = material;
+        v.shadowed.clear();
+    }
+    function startVacancies() {
+        for (const v of vacancies.list) unshadow(v);
+        vacancies.list = [];
+        if (!state.game) return;
+        for (const o of allObjects()) {
+            const piece = o.userData.piece;
+            (piece && piece.vacancies || []).forEach((vac, i) => vacancies.list.push({ top: o, i, vac, filled: false, shadowed: new Map() }));
+        }
+        refreshVacancies();
+    }
+    // (twice a second, with the payees: meshes load late)
+    function refreshVacancies() {
+        for (const v of vacancies.list) {
+            if (v.filled) continue;
+            const shadow = materialFor(v.vac.shadow, false);
+            if (!shadow) throw new Error(`no material ${v.vac.shadow} for a vacancy (the scene reply should carry it: part.shadow)`);
+            for (const m of vacancyMeshes(v.top, v.i)) if (!v.shadowed.has(m)) {
+                v.shadowed.set(m, m.material);
+                m.material = shadow;
+            }
+        }
+    }
+    // a tap on a vacancy within reach: true when it took the tap
+    function tapVacancy(object, hit, x, y) {
+        const part = object.userData.part, top = topObject(object);
+        const v = part && part.vacancy !== undefined && vacancies.list.find(q => q.top === top && q.i === part.vacancy && !q.filled);
+        if (!v || hit.distance > Play.TAKE_REACH || !Play.inventory().held) return false;
+        if (Play.heldMeshId() !== v.vac.mesh) {
+            Play.miss(x, y);
+            say("That doesn't fit there.");
+            return true;
+        }
+        unshadow(v);
+        v.filled = true;
+        Play.useHeld();
+        Usage.count("game: vacancy filled");
+        say("It fits.");
+        return true;
+    }
+    // Every portal drawn: { portal (its landing in the world), from (its place's stage) }.
+    function portalPieces() {
+        const out = [];
+        for (const o of allObjects()) {
+            const piece = o.userData.piece;
+            if (!piece) continue;
+            for (const t of thingsOf(piece)) if (t.portal) out.push({ portal: worldPortal(piece, t.portal.atRoot ? { ...t.portal, name: (piece.path || piece.name || "").split("/").pop() } : t.portal), from: piece.from });
+        }
+        return out;
+    }
+    function objectOfPath(path) {
+        for (const o of allObjects()) if (o.userData.piece && o.userData.piece.path === path) return o;
+        return null;
+    }
+    // Through a portal or cairn (Portal.TeleportInteractableAndConnect): to the landing of the portal
+    // it leads to (its CrossSceneReference, or the fast-forward stage's portalLinks), standing there.
+    const EYE = 1.6;
+    const portalLinks = new Map(); // portal name -> where game mode has linked it; cleared as game mode starts over
+    function teleport(piece, hit, x, y) {
+        if (hit.distance > Play.TAKE_REACH) {
+            Play.miss(x, y);
+            Usage.count("game: portal out of reach");
+            return;
+        }
+        // where it leads now: where game mode linked it (one that links itself to incomers), the
+        // fast-forward stage's link, else as saved (a portal leading to itself leads nowhere yet)
+        const target = leadsTo(piece.portal, piece.portal.name);
+        const to = target && portalPieces().find(p => p.portal.name === target);
+        if (!to) {
+            Play.miss(x, y);
+            return say(target ? `${piece.portal.name} leads to ${target}, which isn't loaded.` : `${piece.portal.name} isn't linked anywhere.`);
+        }
+        // Fast-forwarded, an Outpost and its Temple portal (each leads to the other) are lit once both
+        // their places' stages are done (Ken, 2026-11-09; Canopy's FastForwardConfig.LinkTemplePortals).
+        const at0 = stageRank(state.ffStage);
+        const late = at0 !== null && to.portal.name !== piece.portal.name && to.portal.target === piece.portal.name && [piece, to].find(p => p.from && stageRank(p.from) !== null && stageRank(p.from) >= at0);
+        if (late) {
+            Play.miss(x, y);
+            return say(`${piece.portal.name} isn't lit yet: fast-forwarded to ${state.ffStage}, ${late.from} isn't done.`);
+        }
+        const at = new THREE.Vector3().setFromMatrixPosition(Space.pieceMatrix(THREE, { position: to.portal.landing, rotation: [0, 0, 0], scale: [1, 1, 1] }));
+        camera.position.copy(at).add(new THREE.Vector3(0, EYE, 0));
+        noteStable();
+        if (to.portal.linkBack) { // Portal.SetLeadsTo: linked back, and paid (lit)
+            portalLinks.set(to.portal.name, piece.portal.name);
+            setPaid(portalByName(to.portal.name));
+            refreshPaying();
+        }
+        camera.updateMatrixWorld();
+        Usage.count("game: teleport");
+        say(`Through ${piece.portal.name} to ${target}.`);
+    }
+    // A double tap in game mode, holding something, throws it there (Ken, 2026-11-09; web/play.js
+    // throwHeld): at what the tap meets, else along the tap from the camera. So, holding something, a
+    // single tap waits DOUBLE_TAP ms to be sure it isn't the first of two.
+    const DOUBLE_TAP = 300, DOUBLE_SLOP = 40;
+    let pendingTap = null;
+    function gameTapOrThrow(x, y) {
+        if (!Play.inventory().held) {
+            pendingTap = null;
+            return gameTap(x, y);
+        }
+        if (pendingTap && Math.hypot(x - pendingTap.x, y - pendingTap.y) < DOUBLE_SLOP) {
+            clearTimeout(pendingTap.timer);
+            pendingTap = null;
+            return throwAt(x, y);
+        }
+        if (pendingTap) { // a different place: the first was a tap of its own
+            clearTimeout(pendingTap.timer);
+            gameTap(pendingTap.x, pendingTap.y);
+        }
+        const p = { x, y };
+        p.timer = setTimeout(() => {
+            if (pendingTap !== p) return;
+            pendingTap = null;
+            gameTap(x, y);
+        }, DOUBLE_TAP);
+        pendingTap = p;
+    }
+    function throwAt(x, y) {
+        const hit = gameHit(ndcOf(x, y));
+        const dir = gameRay.ray.direction.clone();
+        const target = hit && !hit.sea ? hit.point.clone() : null;
+        const from = camera.position.clone().addScaledVector(dir, 0.4); // just off the camera
+        if (Play.throwHeld(from, target, dir)) say(target ? "Thrown at what you tapped." : "Thrown.");
+    }
+    // What a thrown item meets between two points (web/play.js fly): { point, normal (toward from) }.
+    const castRay = new THREE.Raycaster();
+    function cast(from, to, exclude) {
+        const d = to.clone().sub(from), len = d.length();
+        if (len < 1e-6) return null;
+        castRay.set(from, d.divideScalar(len));
+        castRay.far = len;
+        castRay.camera = camera; // a sprite (a placeholder's label) needs it to be raycast; without it three.js throws and the loop stops
+        const skip = new Set(exclude);
+        const h = castRay.intersectObjects([world], true).find(x => x.face && x.object.isMesh && !skip.has(x.object) && seen(x.object) && !isLeaf(x.object.userData.part));
+        if (!h) return null;
+        const normal = h.face.normal.clone().transformDirection(h.object.matrixWorld);
+        if (normal.dot(d) > 0) normal.negate();
+        return { point: h.point, normal };
+    }
+    function gameTap(x, y) {
+        if (state.hop) return;
+        const hit = gameHit(ndcOf(x, y));
+        const { top, piece, thing, meshes, index } = (hit && !hit.sea && tapTarget(hit.object)) || {};
+        if (hit && !hit.sea && tapVacancy(hit.object, hit, x, y)) return; // a vacancy, holding something
+        // a payment marker within reach: paid (or a red dot, too poor), its amber made there
+        if (thing && thing.payment && hit.distance <= Play.TAKE_REACH) {
+            payAt(top, index, thing, hit, x, y).catch(error => say(`Couldn't pay: ${error.message}`));
+            return;
+        }
+        if (thing && thing.cage && Play.tapCage(top, piece, hit, x, y, meshes)) return; // a cage: its firefly, unguarded and within reach; else hopped to
+        if (hit && !hit.sea && Play.tapHit(hit, x, y)) return; // an item: taken, or out of reach
+        // a portal's bubble: through it within reach; farther, hopped to like any ground (Ken, 2026-11-09)
+        if (thing && thing.portal && hit.distance <= Play.TAKE_REACH) return teleport({ portal: thing.portal, from: piece.from }, hit, x, y);
+        // a harvester: killed within reach; farther, hopped to like any ground (Ken, 2026-11-09); a
+        // part drawn in a material the dagger can't hurt (GearDagger.immuneMaterials: the red
+        // EnemyInvulnerable and the like; Canopy checks the part struck) isn't, a red dot
+        if (thing && thing.harvester && hit.distance <= Play.TAKE_REACH) {
+            const part = hit.object.userData.part || {};
+            // mana mounted on it (the flamers' fire mana, real fire mana): a real mana item, taken
+            if (part.mana) {
+                const mana = [];
+                top.traverse(o => { if (o.isMesh && !o.userData.taken && o.userData.part && o.userData.part.mana === part.mana && within(thingsOf(top.userData.piece), o.userData.part.thing, index)) mana.push(o); });
+                if (mana.length) return void takeMounted(top, mana, part.mana).catch(error => say(`Couldn't take the mana: ${error.message}`));
+            }
+            if (part.immune || (state.immune || new Set()).has(hitMaterial(hit, top.userData.piece).guid)) {
+                // red armor: a fire-empowered stab does a point of damage, and the fire is used up
+                if (Play.useFire()) return void burn(top, piece, thing, hit, x, y, meshes);
+                Play.miss(x, y);
+                Usage.count("game: immune part");
+                return say("Immune: the dagger can't hurt that part.");
+            }
+            return void Play.kill(top, piece, hit, x, y, meshes, meshes ? thing.go : null); // a unit: its own object switched off (its particle systems, a guard's beam)
+        }
+        if (!hit || !hopReaches(hit)) {
+            Play.miss(x, y);
+            Usage.count("game: hop out of reach");
+            return;
+        }
+        Usage.count("game: hop");
+        const normal = hit.sea ? hit.face.normal.clone() : hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+        if (normal.dot(gameRay.ray.direction) > 0) normal.negate(); // the side it was tapped from
+        // into the sea: to full reach under it (the head goes in on the way); else standing off what was tapped
+        const to = hit.point.clone().addScaledVector(normal, hit.sea ? 0 : HOP_STANDOFF);
         const from = camera.position.clone();
         const distance = from.distanceTo(to);
-        state.hop = { from, to, t: 0, seconds: 0.3 + distance / 15, lift: Math.min(3, 0.3 * distance) };
+        const sea = seaLevel();
+        state.hop = { from, to, t: 0, seconds: 0.3 + distance / 15, lift: Math.min(3, 0.3 * distance), aboveSea: sea !== null && from.y > sea + SEA_TOUCH };
+    }
+    // The reticle's ring: what the screen's center points at, looked at again (at most 6 times a
+    // second) only once the camera has moved or turned.
+    const aimCenter = new THREE.Vector2(0, 0), aimLast = new THREE.Matrix4();
+    let aimAt = 0;
+    function aim(now) {
+        if (now - aimAt < 160 || aimLast.equals(camera.matrixWorld)) return;
+        aimAt = now;
+        aimLast.copy(camera.matrixWorld);
+        const hit = gameHit(aimCenter);
+        const { top, piece, thing, meshes } = (hit && !hit.sea && tapTarget(hit.object)) || {};
+        // something to tap (an item, a portal, a harvester, a cage giving its firefly) within reach, else somewhere to hop
+        const touchable = Boolean(hit) && ((!hit.sea && Play.isItem(hit.object) && !(thing && thing.cage)) || Boolean(thing && ((thing.cage && Play.cageGives(top, piece, hit, meshes)) || ((thing.portal || thing.harvester || thing.payment) && hit.distance <= Play.TAKE_REACH))));
+        const can = Boolean(hit) && (touchable ? hit.distance <= Play.TAKE_REACH : hopReaches(hit));
+        $("reticle").classList.toggle("aim", can);
     }
     function stepHop(dt) {
         const h = state.hop;
@@ -1784,7 +2631,20 @@
         const s = h.t * h.t * (3 - 2 * h.t); // eases off and in
         camera.position.lerpVectors(h.from, h.to, s);
         camera.position.y += h.lift * 4 * s * (1 - s); // the arc
-        if (h.t >= 1) state.hop = null;
+        const sea = seaLevel();
+        if (h.aboveSea && sea !== null && camera.position.y <= sea + SEA_TOUCH) return seaTouched();
+        if (h.t >= 1) {
+            state.hop = null;
+            noteStable();
+        }
+    }
+    // the head in the sea (Player.OnSeaSurfaceDeath): back to the last stable place
+    function seaTouched() {
+        state.hop = null;
+        if (lastStable) camera.position.copy(lastStable);
+        camera.updateMatrixWorld();
+        Usage.count("game: head in the sea");
+        say("Head in the sea: back where you last stood.");
     }
 
     // Movement pad and keys: held buttons move continuously. Only a finger that lands on a pad
@@ -1940,6 +2800,11 @@
             } else move(direction, speed() * dt * (sideways && !state.carried ? 0.5 : 1) * ramp);
         }
         if (state.hop) stepHop(dt);
+        if (state.game) {
+            Play.frame(dt);
+            aim(now);
+            payingTick(now);
+        }
         stepEnvironment(dt);
         if (state.carried) {
             state.carried.object.matrix.copy(carriedMatrix());
@@ -1960,6 +2825,7 @@
         renderer.render(scene, camera);
         const triangles = renderer.info.render.triangles; // the scene's (each render starts the count over)
         if (state.wireframe) drawWireframe();
+        if (state.game) Play.render(renderer, linearFrame); // the held item, in its corner
         if (linearFrame) {
             renderer.setRenderTarget(null);
             renderer.render(toScreen, toScreenCamera);
@@ -1977,6 +2843,9 @@
     // ☰ Reference cube: a 1 m cube to judge sizes by. Tap it to carry it (Drop, Cancel); where it
     // is, per scene, stays in this browser and never goes into the scene.
     const REF_CUBE = -2; // its carried "index"
+    // An assemblage placed in a Canopy scene, carried from an imported area (its piece in state.base;
+    // tools/placements.js writes the scene; Ken, 2026-11-09: a biome refers to each instance it wants).
+    const PLACED = -3;
     const refCube = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0xff7a1a, roughness: 0.6 }));
     refCube.add(new THREE.LineSegments(new THREE.EdgesGeometry(refCube.geometry), new THREE.LineBasicMaterial({ color: 0x1a0d00 })));
     refCube.matrixAutoUpdate = false;
@@ -2250,7 +3119,7 @@
         return {
             folder: `material:${guid}`, family: d.name, assets: [pieceName], shaders: [],
             vars: [
-                live("_Brightness", "Brightness", 1, 0, 10, 0.01), live("_Glossiness", "Gloss", 0, 0, 1, 0.01), live("_HighlightStrength", "Highlight strength", 0.2, 0, 2, 0.01),
+                live("_Brightness", "Brightness", 1, 0, 10, 0.01), live("_Glossiness", "Gloss", 0, 0, 1, 0.01), live("_HighlightStrength", "Highlight strength", 0.2, 0, 10, 0.01),
                 ...(d.normal ? [live("_NormalStrength", "Normal strength", 1, 0, 4, 0.01)] : []), ...tile("_NormalMap", "Normal tiling", d.normal), ...tile("_DetailTex", "Detail tiling", d.detail)
             ]
         };
@@ -2261,7 +3130,7 @@
         const o = state.carried ? state.carried.object : state.pickedObject;
         highlight.visible = Boolean(o);
         if (!o) return;
-        const move = Boolean(state.carried) || Boolean(state.scene && state.scene.editable && state.objects.includes(o));
+        const move = Boolean(state.carried) || Boolean(state.scene && state.scene.editable && state.objects.includes(o)) || Boolean(o.userData.piece && o.userData.piece.placement);
         const asset = assetOf(o.userData.pieceName);
         const tweak = state.tweakFamilies.some(f => f.assets.includes(asset));
         highlight.material.color.setHex(move ? (tweak ? 0x4fe07a : 0x4fb3ff) : tweak ? 0xffb13d : 0x9aa3ad);
@@ -2680,7 +3549,7 @@
         // Drop, Cancel and Delete appear only while carrying (Delete only for a placed piece).
         $("dropBtn").hidden = !carrying;
         $("cancelBtn").hidden = !carrying;
-        $("deleteBtn").hidden = !carrying || state.carried.index < 0;
+        $("deleteBtn").hidden = !carrying || (state.carried.index < 0 && state.carried.index !== PLACED);
         $("undoBtn").disabled = !state.undo.length || carrying;
         $("redoBtn").disabled = !state.redo.length || carrying;
         // While tweaking, Add, Drop, Cancel and Delete hide, and undo and redo step through tweaks.
@@ -2726,30 +3595,45 @@
         $("gustBtn").textContent = `Gusts: ${GUST_LEVELS[state.gustLevel]}`;
         $("gustKindBtn").textContent = `Gusts as: ${state.gustKind}`;
         $("originBtn").disabled = !state.origin;
+        $("hudBtn").classList.toggle("on", Play.displayOn());
+        $("ffBtn").textContent = `Fast forward${state.ffStage ? `: ${state.ffStage}` : ""} ▸`;
+        buildFastForward();
     }
+    const submenus = [...document.querySelectorAll(".submenu")];
     function closePanels() {
-        for (const id of ["palette", "importPanel", "folders", "menu", "viewMenu", "tweakPanel"]) $(id).style.display = "none";
+        for (const id of ["palette", "importPanel", "folders", "menu", "tweakPanel"]) $(id).style.display = "none";
+        for (const m of submenus) m.style.display = "none";
     }
-    // The ☰ menu holds New, Save, Import area, Areas, Folders, Inspect layers, Snap, Reference cube, View
-    // and Game mode (in game mode only Edit mode);
-    // choosing one closes it. ☰ View (Ken, 2026-10-29) holds the view toggles (Textures, Labels,
-    // Wireframe, LOD tint, Fog, Fog far clip, Culling, Origin, Candidate trees, Tick, Conditions,
-    // Inactive), in its place,
-    // and stays open while they are flipped, until a tap elsewhere.
+    // ☰ (Ken, 2026-11-08: nothing more than one level below it) holds Scene ▸, Edit ▸, Surfaces ▸,
+    // Light ▸, Overlays ▸, World ▸, Fast forward ▸ and Game mode; in game mode only Fast forward ▸,
+    // Game display, Reframe scene and Edit mode. Choosing one closes it; a submenu opens in its
+    // place, with ‹ Back. Submenus of toggles (data-stay: Surfaces, Light, Overlays, World) stay
+    // open while they are flipped, until a tap elsewhere; the others close once one is chosen.
     $("menuBtn").onclick = e => {
         e.stopPropagation();
-        const open = $("menu").style.display === "flex";
+        const open = $("menu").style.display === "flex" || submenus.some(m => m.style.display === "flex");
         closePanels();
         $("menu").style.display = open ? "none" : "flex";
     };
     for (const b of $("menu").querySelectorAll("button")) b.addEventListener("click", () => ($("menu").style.display = "none"));
-    $("viewBtn").onclick = e => {
-        e.stopPropagation();
-        $("viewMenu").style.display = "flex";
-    };
+    for (const b of $("menu").querySelectorAll("[data-sub]")) {
+        b.addEventListener("click", e => {
+            e.stopPropagation();
+            closePanels();
+            $(b.dataset.sub).style.display = "flex";
+        });
+    }
+    for (const m of submenus) {
+        m.querySelector(".back").onclick = e => {
+            e.stopPropagation();
+            closePanels();
+            $("menu").style.display = "flex";
+        };
+        if (!m.dataset.stay) m.addEventListener("click", e => { if (e.target.closest("button") && !e.target.closest(".back")) m.style.display = "none"; });
+    }
     document.addEventListener("pointerdown", e => {
         if ($("menu").style.display === "flex" && !$("menu").contains(e.target) && e.target !== $("menuBtn")) $("menu").style.display = "none";
-        if ($("viewMenu").style.display === "flex" && !$("viewMenu").contains(e.target) && e.target !== $("viewBtn")) $("viewMenu").style.display = "none";
+        for (const m of submenus) if (m.style.display === "flex" && !m.contains(e.target) && e.target !== $("menuBtn")) m.style.display = "none";
     });
     function toggle(id) {
         const show = $(id).style.display !== "flex";
@@ -2774,9 +3658,15 @@
             for (const x of all.slice(0, 300)) {
                 const row = document.createElement("div");
                 row.textContent = x.label + mark(x.label);
-                row.addEventListener("click", () => addPiece(x.piece).catch(fail));
+                row.addEventListener("click", () => choose(x).catch(fail));
                 list.appendChild(row);
             }
+        };
+        const onArea = state.scene && state.scene.kind === "area";
+        const choose = async x => {
+            if (onArea && paletteMode() === "scenes" && state.unityScene) return addPiece(x.piece, true);
+            if (onArea && !await newScene(state.scene.name)) return;
+            return addPiece(x.piece);
         };
         // Add places a single piece, or with Scenes a whole assemblage scene (its prefab).
         $("palettePieces").classList.toggle("on", paletteMode() === "pieces");
@@ -2820,12 +3710,12 @@
     }
     $("addBtn").onclick = async () => {
         try {
-            // On an imported area, Add first makes a composed scene on it; the area stays read-only.
+            // On an imported area of a Canopy scene, Scenes places an assemblage in that scene; Pieces
+            // first makes a composed scene on the area, which stays read-only.
             if (state.carried) {
                 texts = texts || (await call("GET", "/api/texts")).texts;
                 $("paletteFilter").placeholder = "Filter text ids";
             } else {
-                if (state.scene.kind === "area" && !await newScene(state.scene.name)) return;
                 palette = palette || await call("GET", "/api/palette");
                 if (palette.shapeErrors.length) window.layoutError(`Shape lines: ${palette.shapeErrors.join("; ")}`);
                 $("paletteFilter").placeholder = "Filter pieces";
@@ -2904,7 +3794,7 @@
         showOrigin();
         updateUi();
     };
-    // ☰ View Conditions cycles met, start, saved; ☰ View Inactive draws what is off faint. Both rebuild.
+    // ☰ World › Conditions cycles met, start, saved; ☰ World › Inactive draws what is off faint. Both rebuild.
     const CONDITION_SAYS = { met: "the game's conditions met (its flags as the game sets them)", start: "as a new game starts the scene's stage", saved: "as saved in Unity, conditions ignored" };
     $("conditionsBtn").onclick = () => {
         state.conditions = Conditions.MODES[(Conditions.MODES.indexOf(state.conditions) + 1) % Conditions.MODES.length];
@@ -2914,7 +3804,42 @@
         say(`Conditions: ${CONDITION_SAYS[state.conditions]}.`);
         updateUi();
     };
-    // ☰ View Wind and Gusts cycle the leaves' steady wind and gusts through their levels, added
+    // ☰ Fast forward ▸: Off (start mode is the scene's own stage) or a stage to start the game at
+    // (applyFastForward); choosing a stage switches World › Conditions to start. Rebuilds, and in
+    // game mode starts the inventory over.
+    function buildFastForward() {
+        const ff = state.fastForward, own = (state.symbols && state.symbols.stage) || null;
+        const stages = ff ? ff.order : [];
+        $("ffList").innerHTML = [["", `Off${own ? ` (the scene's stage, ${own})` : ""}`], ...stages.map(n => [n, `${n}${ff.configs[ff.stages[n]] ? "" : " (no FastForwardConfig)"}`])]
+            .map(([value, label]) => `<button data-stage="${value}" class="${state.ffStage === value ? "on" : ""}">${label}</button>`).join("");
+    }
+    // ☰ Fast forward ▸: the chooser's FF: <stage> scenes (loadScene), the camera kept; Off, the area
+    // open as itself
+    $("ffList").addEventListener("click", e => {
+        const b = e.target.closest("button[data-stage]");
+        if (!b) return;
+        closePanels();
+        if (!b.dataset.stage) {
+            if (state.scene.ff) loadScene(`area:${state.scene.name}`, true).catch(fail);
+            else say("Fast forward is off.");
+            return;
+        }
+        loadScene(`ff:${b.dataset.stage}`, true).catch(fail);
+    });
+    // The areas the game shows at the fast-forward stage: each area's earliest place played by then,
+    // or always shown; never a terrain-only work in progress.
+    function ffAreasFor(stage) {
+        const rank = n => state.stageOrder.indexOf(n), at = rank(stage);
+        if (at < 0) throw new Error(`Fast forward: no stage ${stage}`);
+        return state.areaNames.filter(a => {
+            const info = state.areaStages[a];
+            if (!info || !info.auto) return false;
+            if (info.from === null) return true;
+            const from = rank(info.from);
+            return from >= 0 && from <= at;
+        });
+    }
+    // ☰ World › Wind and Gusts cycle the leaves' steady wind and gusts through their levels, added
     // (LeafGust: scripts/LeafGust.js); Gusts as switches cylinders and waves. Nothing rebuilds.
     const WIND_LEVELS = ["still", "light", "medium", "strong"], GUST_LEVELS = ["none", "light", "medium", "strong"];
     $("windBtn").onclick = () => {
@@ -2951,7 +3876,7 @@
     };
     // ☰ Reframe scene (Ken, 2026-11-06): back to seeing the whole scene, as a first load frames
     // it, when the camera has been steered too far away to find it.
-    $("reframeBtn").onclick = () => {
+    $("reframeBtn").onclick = $("reframeGameBtn").onclick = () => {
         if (!sceneExtent()) return say("Nothing in the scene to frame.");
         frameAll();
         say(`Reframed ${state.scene.name}.`);
@@ -3027,7 +3952,7 @@
     };
     // ☰ Areas (Claude, 2026-11-03): other imported areas drawn alongside the scene, read-only, as
     // an area a composed scene sits on is (Unity scenes share one world, so they line up), e.g.
-    // BeechScene Whole while viewing HawthornScene Whole. Remembered per scene in this browser; a
+    // Beech while viewing Hawthorn. Remembered per scene in this browser; a
     // composed scene's own Area lines are always drawn. The first area gives the settings (fog,
     // environment); each area's pieces keep their own scene's stage for Conditions.
     const alsoKey = value => `layout.also.${value}`;
@@ -3049,7 +3974,7 @@
     $("areasBtn").onclick = () => {
         if (!state.scene) return;
         const value = `${state.scene.kind}:${state.scene.name}`;
-        const fixed = new Set(state.scene.kind === "area" ? [state.scene.name] : state.areaLines);
+        const fixed = new Set([...(state.scene.kind === "area" ? [state.scene.name] : state.areaLines), ...state.withAreas]);
         const panel = $("folders");
         panel.innerHTML = "<div class='row'><b>Areas drawn alongside</b></div>";
         for (const area of state.areaNames) {
@@ -3070,7 +3995,7 @@
                 closePanels();
                 loadScene(value, true).catch(fail);
             };
-            const why = fixed.has(area) ? (state.scene.kind === "area" ? " (this area)" : " (an Area line)") : "";
+            const why = !fixed.has(area) ? "" : area === state.scene.name ? " (this area)" : state.withAreas.includes(area) ? " (goes with it)" : " (an Area line)";
             row.append(box, ` ${area}${why}`);
             panel.appendChild(row);
         }
@@ -3113,7 +4038,7 @@
         if (!state.carried) rebuildWorld();
     };
     // Materials More Lights moved onto Canopy's shaders, drawn on Unity's again or not (materialFor).
-    // ☰ View › Normal maps (Ken, 2026-11-06: are they drawn at all?): off, every material lit by
+    // ☰ Surfaces › Normal maps (Ken, 2026-11-06: are they drawn at all?): off, every material lit by
     // its mesh's own normals, to see what its normal map adds.
     $("normalMapsBtn").onclick = () => {
         state.normalMaps = !state.normalMaps;

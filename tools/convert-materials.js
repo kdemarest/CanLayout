@@ -10,7 +10,7 @@
 // Unity's own properties stay in the .mat, unused. A copy of the .mat as it was goes to
 // Assets/Resources/ShaderSwitch/<Name> (Unity).mat (a new guid), listed with it in
 // ShaderSwitch.asset, which Canopy's ShaderSwitch.cs reads to switch the game back to Unity's
-// shaders and forth (and tools/material-preview.js and layout's ☰ View to compare).
+// shaders and forth (and tools/material-preview.js and layout's ☰ Surfaces to compare).
 //
 // What maps (Unity's built-in shaders; Canopy/General's color is texture × detail × tint × brightness):
 //   Standard, opaque          → Canopy/General: _Color → _Tint, _BumpMap → _NormalMap at _MainTex's

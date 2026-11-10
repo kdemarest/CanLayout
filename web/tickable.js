@@ -9,13 +9,22 @@
 //   top (the scene piece's object); piece; params (the class's static params, then the script
 //   line's settings, then the piece's); fields (a stand-in's saved C# fields, else {}); object
 //   (a stand-in's game object key); environment() (unity.json's, as the scene has it); leafWind()
-//   (the leaf wind's shader uniforms, app.js windPatch, for LeafGust and Wind); windLevels() (☰ View's
+//   (the leaf wind's shader uniforms, app.js windPatch, for LeafGust and Wind); windLevels() (☰ World's
 //   wind and gust levels and kind);
 //   texture(description, srgb) (a material's texture, a promise); describe(guid) (a material's
-//   description, tools/scene.js); textures() (whether ☰ View ▸ Textures is on); eye (the camera in this.space's
+//   description, tools/scene.js); textures() (whether ☰ Surfaces › Textures is on); eye (the camera in this.space's
 //   coordinates, once makeSpace has made one).
 // A class with static singleton = true runs once: a second piece with it is hidden and its scripts
 // stopped (the first loaded wins; a scene's included pieces load before its own).
+// Switched off and carried (Ken, 2026-11-10), as Unity's SetActive and a moved transform: a script
+// is off while its object, or one above it, is off: its gate (a stand-in's when, tools/unity.js) not
+// holding (world.gateHolds), its piece's top.userData.gateOff (app.js: a piece's inventory gate in
+// game mode), or game mode (web/play.js) having it in its prefab's off (object keys; "*" the whole
+// prefab: a killed harvester, an empty cage's contents, an item worn, collected or used up). Going
+// off calls switchOff() (a particle system's particles go), coming back switchOn() (it starts
+// over). An item game mode has taken carries its scripts with it: prefab.carried maps an object
+// key to { mesh, origin }, the object now moved as mesh has moved from origin (its world matrix
+// where the prefab put it); mesh is any Object3D with a matrixWorld (play.js's hand for a held one).
 (function (root) {
     const classes = new Map(), loading = new Map();
     const running = new Set(), singletons = new Map();
@@ -27,6 +36,56 @@
         start() {}
         tick(dt) {}
         stop() {}
+        switchOff() { if (this.space) this.space.visible = false; }
+        switchOn() { if (this.space) this.space.visible = true; }
+        // Whether this script's object is key or under it (key: an object key of its prefab).
+        within(key) {
+            const objects = this.prefab.objects || {};
+            for (let k = this.object; k; k = objects[k] && objects[k].father) if (k === key) return true;
+            return false;
+        }
+        // Off now (see above): its gate, its piece's, or game mode's.
+        switchedOff() {
+            if (this.top.userData.gateOff) return true;
+            if (this.when && !world.gateHolds(this.when, this.piece)) return true;
+            const off = this.prefab.off;
+            if (!off || !off.size) return false;
+            if (off.has("*")) return true;
+            for (const k of off) if (this.within(k)) return true;
+            return false;
+        }
+        // How game mode has moved its object (a taken item, dropped or thrown), in Three.js's world, or null.
+        movedBy() {
+            const carried = this.prefab.carried;
+            if (!carried || !carried.size) return null;
+            const objects = this.prefab.objects || {};
+            for (let k = this.object; k; k = objects[k] && objects[k].father) {
+                const c = carried.get(k);
+                if (c) return new this.THREE.Matrix4().multiplyMatrices(c.mesh.matrixWorld, c.origin.clone().invert());
+            }
+            return null;
+        }
+        // Its group's world matrix, moved as game mode moved its object.
+        worldMatrix() {
+            this.group.updateWorldMatrix(true, false);
+            const moved = this.movedBy();
+            return moved ? moved.multiply(this.group.matrixWorld) : this.group.matrixWorld.clone();
+        }
+        // Its space (in its piece) follows a carried object: the move, in the group's axes.
+        follow() {
+            const space = this.space;
+            if (!space || space.parent !== this.group) return;
+            const moved = this.movedBy();
+            if (!moved) {
+                space.matrixAutoUpdate = true; // as makeSpace made it
+                return;
+            }
+            this.group.updateWorldMatrix(true, false);
+            const g = this.group.matrixWorld;
+            space.matrixAutoUpdate = false;
+            space.matrix.copy(g).invert().multiply(moved).multiply(g).multiply(new this.THREE.Matrix4().makeScale(-1, 1, 1));
+            space.matrixWorldNeedsUpdate = true;
+        }
         // A group to draw in, in Unity coordinates: the piece's own (scaled with it), or world's.
         makeSpace(inWorld = false) {
             const space = new this.THREE.Group();
@@ -132,8 +191,7 @@
         // Stand-ins: how far a game object's origin is from the camera now, in meters.
         distanceToCamera(ref) {
             const p = this.positionOf(ref);
-            this.group.updateWorldMatrix(true, false);
-            return this.group.localToWorld(new this.THREE.Vector3(-p.x, p.y, p.z)).distanceTo(this.camera.position); // Three.js's X is Unity's mirrored
+            return new this.THREE.Vector3(-p.x, p.y, p.z).applyMatrix4(this.worldMatrix()).distanceTo(this.camera.position); // Three.js's X is Unity's mirrored
         }
         // Stand-ins: where a game object's origin is now, in the prefab's axes (Unity's).
         positionOf(ref) {
@@ -152,7 +210,8 @@
         return q;
     }
 
-    // The scene's things scripts need; app.js calls it once.
+    // The scene's things scripts need; app.js calls it once. gateHolds(when, piece) must be among
+    // them: a stand-in's gate is tested by it.
     Tickable.use = things => { world = things; };
     Tickable.register = (name, cls) => { classes.set(name, cls); };
 
@@ -203,8 +262,8 @@
                 if (!cls) return;
                 const s = scripts[i];
                 const t = new cls();
-                Object.assign(t, { THREE: world.THREE, camera: world.camera, scene: world.scene, environment: world.environment, leafWind: world.leafWind, windLevels: world.windLevels, texture: world.texture, describe: world.describe, textures: world.textures,
-                    group, top, piece, prefab, name: s.name, object: s.go || null, fields: s.fields || {}, lod: s.lod || null, eye: new world.THREE.Vector3(),
+                Object.assign(t, { THREE: world.THREE, camera: world.camera, scene: world.scene, environment: world.environment, leafWind: world.leafWind, windLevels: world.windLevels, texture: world.texture, describe: world.describe, textures: world.textures, gravity: world.gravity,
+                    group, top, piece, prefab, name: s.name, object: s.go || null, fields: s.fields || {}, lod: s.lod || null, when: s.never ? [false] : s.when || null, eye: new world.THREE.Vector3(), hideMeshes: world.hideMeshes,
                     params: { ...paramsOf(cls), ...settingsOf(s.settings), ...settingsOf(piece.extra) } });
                 if (s.id) prefab.components.set(s.id, t);
                 t.top.userData.tickables = [...(t.top.userData.tickables || []), t];
@@ -214,6 +273,7 @@
                     singletons.set(cls, t);
                 }
                 running.add(t);
+                t.wasOff = false;
                 try {
                     t.start();
                 } catch (error) {
@@ -281,6 +341,7 @@
         for (const mesh of p.group.children) {
             const part = mesh.userData.part;
             if (!part || !part.go) continue;
+            if (mesh.userData.taken) continue; // taken in game mode (web/play.js): where the player put it, until game mode ends
             movesDown(p, part.go, all);
             if (!mesh.userData.placed) {
                 if (all.equals(IDENTITY)) continue; // never moved: as the prefab put it
@@ -296,14 +357,22 @@
                 end(t);
                 continue;
             }
+            prefabs.add(t.prefab);
             try {
+                const off = t.switchedOff();
+                if (off !== t.wasOff) {
+                    t.wasOff = off;
+                    if (off) t.switchOff();
+                    else t.switchOn();
+                }
+                if (off) continue;
+                t.follow();
                 t.updateEye();
                 t.tick(dt);
             } catch (error) {
                 end(t);
                 setTimeout(() => { throw error; }); // reported like any page error
             }
-            prefabs.add(t.prefab);
         }
         for (const p of prefabs) {
             try {

@@ -1,0 +1,182 @@
+{
+ "game: hop": {
+  "count": 255,
+  "first": "2026-11-08",
+  "last": "2026-11-10"
+ },
+ "menuBtn": {
+  "count": 32,
+  "first": "2026-11-08",
+  "last": "2026-11-10"
+ },
+ "game: hop out of reach": {
+  "count": 31,
+  "first": "2026-11-08",
+  "last": "2026-11-10"
+ },
+ "☰ Game mode": {
+  "count": 25,
+  "first": "2026-11-08",
+  "last": "2026-11-10"
+ },
+ "game: kill": {
+  "count": 25,
+  "first": "2026-11-09",
+  "last": "2026-11-10"
+ },
+ "game: take": {
+  "count": 14,
+  "first": "2026-11-08",
+  "last": "2026-11-10"
+ },
+ "W": {
+  "count": 13,
+  "first": "2026-11-08",
+  "last": "2026-11-09"
+ },
+ "game: teleport": {
+  "count": 12,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "☰ Fast forward": {
+  "count": 11,
+  "first": "2026-11-08",
+  "last": "2026-11-10"
+ },
+ "game: portal out of reach": {
+  "count": 10,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "☰ Edit mode": {
+  "count": 7,
+  "first": "2026-11-08",
+  "last": "2026-11-10"
+ },
+ "Eup": {
+  "count": 5,
+  "first": "2026-11-08",
+  "last": "2026-11-09"
+ },
+ "game: take out of reach": {
+  "count": 5,
+  "first": "2026-11-08",
+  "last": "2026-11-09"
+ },
+ "☰ Game display": {
+  "count": 4,
+  "first": "2026-11-08",
+  "last": "2026-11-09"
+ },
+ "S": {
+  "count": 4,
+  "first": "2026-11-08",
+  "last": "2026-11-09"
+ },
+ "Fast forward › Beech": {
+  "count": 4,
+  "first": "2026-11-08",
+  "last": "2026-11-09"
+ },
+ "game: head in the sea": {
+  "count": 4,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "Probe": {
+  "count": 4,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "game: firefly from cage": {
+  "count": 4,
+  "first": "2026-11-09",
+  "last": "2026-11-10"
+ },
+ "game: pay": {
+  "count": 3,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "game: purchase": {
+  "count": 3,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "D": {
+  "count": 3,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "game: drop": {
+  "count": 2,
+  "first": "2026-11-08",
+  "last": "2026-11-08"
+ },
+ "game: collect": {
+  "count": 2,
+  "first": "2026-11-08",
+  "last": "2026-11-08"
+ },
+ "A": {
+  "count": 2,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "Fast forward › Oak": {
+  "count": 2,
+  "first": "2026-11-08",
+  "last": "2026-11-09"
+ },
+ "game: immune part": {
+  "count": 2,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "game: guarded": {
+  "count": 2,
+  "first": "2026-11-10",
+  "last": "2026-11-10"
+ },
+ "☰ Light": {
+  "count": 1,
+  "first": "2026-11-08",
+  "last": "2026-11-08"
+ },
+ "game: take firefly": {
+  "count": 1,
+  "first": "2026-11-08",
+  "last": "2026-11-08"
+ },
+ "game: swap": {
+  "count": 1,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "☰ Reframe scene": {
+  "count": 1,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "game: tenant placed": {
+  "count": 1,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "game: vacancy filled": {
+  "count": 1,
+  "first": "2026-11-09",
+  "last": "2026-11-09"
+ },
+ "game: throw": {
+  "count": 1,
+  "first": "2026-11-10",
+  "last": "2026-11-10"
+ },
+ "game: collect dagger": {
+  "count": 1,
+  "first": "2026-11-10",
+  "last": "2026-11-10"
+ }
+}

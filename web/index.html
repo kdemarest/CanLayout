@@ -47,18 +47,53 @@
   /* The camera looks through the screen's exact center; W and S keep what is under it there. */
   #reticle { position: fixed; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px; pointer-events: none; z-index: 2; }
   #menu { position: fixed; top: 3.2em; left: 0.5em; display: none; flex-direction: column; gap: 0.3em; padding: 0.4em; border-radius: 10px; background: var(--panel); z-index: 6; }
-  #menu button, #viewMenu button { text-align: left; min-width: 9em; }
-  /* ☰ View: the view toggles, beside ☰, open while you flip several */
-  #viewMenu { position: fixed; top: 3.2em; left: 0.5em; display: none; flex-direction: column; gap: 0.3em; padding: 0.4em; border-radius: 10px; background: var(--panel); z-index: 6; }
+  #menu button, .submenu button { text-align: left; min-width: 9em; }
+  /* ☰'s submenus (Ken, 2026-11-08: nothing more than one level below ☰): each opens in ☰'s place,
+     ‹ Back returns; those of toggles stay open while you flip several (data-stay). */
+  .submenu { position: fixed; top: 3.2em; left: 0.5em; display: none; flex-direction: column; gap: 0.3em; padding: 0.4em; border-radius: 10px; background: var(--panel); z-index: 6; max-height: calc(100vh - 4em); overflow-y: auto; }
+  .submenu .back { color: var(--dim); }
+  body:not(.game) .gameOnly { display: none; }
   /* Tweak: its list, and the dragged value. */
   /* ⛶ and Tweak sit at the right end of the top bar. */
   #fullBtn { margin-left: auto; }
   #probeBtn { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } /* held 1.2 s: back to the probe */
   #tweakList div.on { background: #2a3344; border-left: 3px solid var(--accent); }
   #tweakList small { color: var(--dim); }
-  /* Game mode (Ken, 2026-11-02): nothing on screen but ☰ (holding only Edit mode and Reframe scene) and ⛶. */
+  /* Game mode (Ken, 2026-11-02): nothing on screen but ☰ (holding only Fast forward, Game display,
+     Reframe scene and Edit mode), ⛶ and the reticle (Ken, 2026-11-08). */
   body.game #top > :not(#menuBtn):not(#fullBtn), body.game #actions, body.game #pad, body.game #status, body.game #lodLegend,
-  body.game #reticle, body.game #scalebar, body.game #tweakHud, body.game .panel, body.game #viewMenu, body.game #menu > :not(#gameBtn):not(#reframeBtn) { display: none !important; }
+  body.game #scalebar, body.game #tweakHud, body.game .panel, body.game .submenu:not(#ffMenu), body.game #menu > :not(.inGame) { display: none !important; }
+  /* the reticle's ring (Ken, 2026-11-08): in game mode, on a place a tap hops to or an item it takes */
+  #reticleRing { display: none; }
+  body.game #reticle.aim #reticleRing { display: inline; }
+  /* Game mode's display (web/play.js; ☰ Game display): the counts top right, the ring fingers bottom
+     left, the held item bottom right, a collected item's count at the top, a red dot where a tap
+     was out of reach. */
+  #hud { display: none; }
+  body.game #hud { display: block; }
+  /* the display off: only the daggers and fireflies carried (Ken, 2026-11-09) */
+  body.game:not(.hud) #hudRings, body.game:not(.hud) #hudCounts .count:not(.always) { display: none; }
+  #hudCounts { position: fixed; right: 0.6em; top: 3.4em; display: flex; flex-direction: column; align-items: flex-end; gap: 0.25em; z-index: 3; pointer-events: none; }
+  .count { display: flex; align-items: center; gap: 0.35em; padding: 0.15em 0.5em; border-radius: 8px; background: rgba(0, 0, 0, 0.45); font-weight: 600; font-size: 0.95em; }
+  .count svg { width: 1.3em; height: 1.3em; display: block; }
+  /* the empowered dagger radiates its element (Ken, 2026-11-09): red fire, white air, blue water */
+  .count .empowered { display: block; animation: radiate 0.9s ease-in-out infinite alternate; }
+  .empowered.fire { --glow: #ff3b1f; }
+  .empowered.air { --glow: #ffffff; }
+  .empowered.water { --glow: #3b8bff; }
+  @keyframes radiate { from { filter: drop-shadow(0 0 2px var(--glow)); } to { filter: drop-shadow(0 0 6px var(--glow)) drop-shadow(0 0 3px var(--glow)); } }
+  .count.pulse { animation: pulse 0.9s ease-out; }
+  @keyframes pulse { 0% { transform: scale(1.35); background: rgba(255, 255, 255, 0.35); } 100% { transform: scale(1); } }
+  #hudRings { position: fixed; left: 0.6em; bottom: 0.6em; display: flex; flex-direction: column; gap: 0.25em; z-index: 3; }
+  #hudRings .hand { display: flex; gap: 0.25em; }
+  #hudRings button { width: 2.2em; height: 2.2em; padding: 0; background: rgba(0, 0, 0, 0.45); border: 0; display: flex; align-items: center; justify-content: center; }
+  #hudRings svg { width: 1.6em; height: 1.6em; }
+  #heldBox { position: fixed; right: 0.6em; bottom: 0.6em; display: none; border: 1px solid rgba(255, 255, 255, 0.35); border-radius: 10px; z-index: 3; touch-action: none; }
+  body.game #heldBox.held { display: block; }
+  #toast { position: fixed; left: 50%; top: 3.4em; transform: translateX(-50%); display: none; z-index: 7; pointer-events: none; }
+  #toast.show { display: block; }
+  .missDot { position: fixed; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; background: #ff2a2a; box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.5); pointer-events: none; z-index: 8; animation: miss 0.6s ease-in forwards; }
+  @keyframes miss { 0% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: scale(1.6); } }
   #tweakHud { position: fixed; left: 50%; top: 3.4em; transform: translateX(-50%); display: none; padding: 0.35em 0.8em; border-radius: 8px; background: var(--panel); border: 1px solid var(--accent); font-weight: 600; z-index: 4; }
 </style>
 </head>
@@ -91,40 +126,64 @@ window.addEventListener("unhandledrejection", function (e) {
   <button id="switchBtn" hidden class="on" title="Switch: show the next set of layers (the scene's Switch line)"></button>
   <button id="tweakBtn" hidden title="Tweak" aria-label="Tweak"><svg viewBox="0 0 24 24" width="1.3em" height="1.3em" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg></button>
 </div>
-<svg id="reticle" viewBox="0 0 22 22" aria-hidden="true"><g stroke="rgba(0,0,0,0.6)" stroke-width="3"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g><g stroke="#ffffff" stroke-width="1.2"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g></svg>
+<svg id="reticle" viewBox="0 0 22 22" aria-hidden="true"><g stroke="rgba(0,0,0,0.6)" stroke-width="3"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g><g stroke="#ffffff" stroke-width="1.2"><path d="M11 1v7M11 14v7M1 11h7M14 11h7"/></g><g id="reticleRing" fill="none"><circle cx="11" cy="11" r="6.5" stroke="rgba(0,0,0,0.6)" stroke-width="3"/><circle cx="11" cy="11" r="6.5" stroke="#ffffff" stroke-width="1.2"/></g></svg>
 <div id="status">Loading…</div>
 <div id="lodLegend"></div>
 <div id="tweakHud"></div>
 <div id="menu">
+  <button data-sub="sceneMenu">Scene ▸</button>
+  <button data-sub="editMenu">Edit ▸</button>
+  <button data-sub="surfacesMenu">Surfaces ▸</button>
+  <button data-sub="lightMenu">Light ▸</button>
+  <button data-sub="overlaysMenu">Overlays ▸</button>
+  <button data-sub="worldMenu">World ▸</button>
+  <button data-sub="ffMenu" id="ffBtn" class="inGame">Fast forward ▸</button>
+  <button id="hudBtn" class="inGame gameOnly">Game display</button>
+  <button id="reframeGameBtn" class="inGame gameOnly">Reframe scene</button>
+  <button id="gameBtn" class="inGame">Game mode</button>
+</div>
+<div id="sceneMenu" class="submenu" data-title="Scene">
+  <button class="back">‹ Back</button>
   <button id="newBtn">New</button>
   <button id="saveBtn">Save</button>
   <button id="importBtn">Import area</button>
   <button id="areasBtn">Areas</button>
   <button id="foldersBtn">Folders</button>
-  <button id="inspectBtn" hidden>Inspect layers ▸</button>
+  <button id="reframeBtn">Reframe scene</button>
+</div>
+<div id="editMenu" class="submenu" data-title="Edit">
+  <button class="back">‹ Back</button>
   <button id="snapBtn">Snap</button>
   <button id="refCubeBtn">Reference cube</button>
-  <button id="reframeBtn">Reframe scene</button>
-  <button id="viewBtn">View ▸</button>
-  <button id="gameBtn">Game mode</button>
+  <button id="inspectBtn" hidden>Inspect layers</button>
 </div>
-<div id="viewMenu">
+<div id="surfacesMenu" class="submenu" data-title="Surfaces" data-stay="1">
+  <button class="back">‹ Back</button>
   <button id="texturesBtn" class="on">Textures</button>
   <button id="normalMapsBtn" class="on">Normal maps</button>
   <button id="normals2Btn">Normal maps × 2</button>
-  <button id="noAmbientBtn">No ambient</button>
-  <button id="fullSunHighlightBtn">Full sun highlight</button>
+  <button id="wireframeBtn">Wireframe</button>
+  <button id="unityShadersBtn" hidden>Unity's shaders</button>
+</div>
+<div id="lightMenu" class="submenu" data-title="Light" data-stay="1">
+  <button class="back">‹ Back</button>
   <button id="lightsBtn" class="on">Lights</button>
   <button id="lightViewBtn">Light crowding</button>
-  <button id="unityShadersBtn" hidden>Unity's shaders</button>
-  <button id="labelsBtn">Labels</button>
-  <button id="wireframeBtn">Wireframe</button>
-  <button id="lodTintBtn">LOD tint</button>
+  <button id="noAmbientBtn">No ambient</button>
+  <button id="fullSunHighlightBtn">Full sun highlight</button>
   <button id="fogBtn" class="on">Fog</button>
   <button id="fogClipBtn">Fog far clip</button>
+</div>
+<div id="overlaysMenu" class="submenu" data-title="Overlays" data-stay="1">
+  <button class="back">‹ Back</button>
+  <button id="labelsBtn">Labels</button>
+  <button id="lodTintBtn">LOD tint</button>
   <button id="cullingBtn">Culling</button>
   <button id="originBtn">Origin</button>
   <button id="candidatesBtn" hidden>Candidate trees</button>
+</div>
+<div id="worldMenu" class="submenu" data-title="World" data-stay="1">
+  <button class="back">‹ Back</button>
   <button id="tickBtn" class="on">Tick</button>
   <button id="conditionsBtn">Conditions: met</button>
   <button id="inactiveBtn">Inactive</button>
@@ -132,6 +191,13 @@ window.addEventListener("unhandledrejection", function (e) {
   <button id="gustBtn">Gusts: medium</button>
   <button id="gustKindBtn">Gusts as: cylinders</button>
 </div>
+<div id="ffMenu" class="submenu" data-title="Fast forward">
+  <button class="back">‹ Back</button>
+  <div id="ffList" style="display: contents"></div>
+</div>
+<div id="hud"><div id="hudCounts"></div><div id="hudRings"></div></div>
+<div id="heldBox"></div>
+<div id="toast" class="count"></div>
 
 <div id="scalebar"><span>Scale</span><input id="scale" type="range" min="-2" max="5.615" step="0.005" value="0"><span id="scaleValue">×1.00</span></div>
 
@@ -160,7 +226,7 @@ window.addEventListener("unhandledrejection", function (e) {
   <div class="row">Scene <select id="unityScene"></select></div>
   <div class="row">Center <input id="cx" placeholder="x"><input id="cy" placeholder="y"><input id="cz" placeholder="z"></div>
   <div class="row">Half-size (m) <input id="half" value="20"></div>
-  <div class="row">Name <input id="areaName" placeholder="e.g. Rings" style="width:10em"></div>
+  <div class="row">Name <input id="areaName" placeholder="e.g. Tangle" style="width:10em"></div>
   <div class="row"><label><input type="checkbox" id="terrainOnly"> Terrain only (its trees, nothing else)</label></div>
   <div class="row"><button id="extractBtn">Extract</button></div>
   <div style="color: var(--dim); font-size: 0.85em">Imported areas are read-only copies of Unity. Compose in a scene of your own (New).</div>
@@ -182,6 +248,7 @@ window.addEventListener("unhandledrejection", function (e) {
 <script src="conditions.js"></script>
 <script src="tickable.js"></script>
 <script src="pfx.js"></script>
+<script src="play.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

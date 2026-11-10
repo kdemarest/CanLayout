@@ -12,8 +12,9 @@
 //   shrunk    an EffectScale to zero: gone once its trigger's condition holds (the Sky Isle's cloud)
 //   moves     an EffectMove (to its end mark's world position), EffectTransform (to its final's
 //             position and scale), EffectScale to a size: where the object is once its trigger fired
-//   reveals   a Pod's Revealer (PodRequest) a trigger plays: the pieces under its revealRoot stay
-//             hidden until then, as Revealer.Prepare hides them
+//   reveals   a Pod's Revealer (PodRequest) a trigger plays: the pieces under its revealRoot, which
+//             Revealer.Prepare hides until then; Layout shows them revealed (Ken, 2026-11-10;
+//             tools/unity.js landedPods)
 //   hidden    HideOnStart: its renderer is switched off when the game starts
 // Triggers are OnCondition, OnConditionOnce, OnConditionDoEffect, EffectTrigger and the obsolete
 // EffectConditional; each plays the effects on its effectsToExecute object (Effects.PlayMine: that
@@ -24,6 +25,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const U = require('./unity.js');
 const Config = require('./config.js');
+const { keep: Keep } = require('./keep.js');
 
 const TRIGGERS = new Set(['OnCondition', 'OnConditionOnce', 'OnConditionDoEffect', 'EffectTrigger', 'EffectConditional']);
 const SELF_DEFAULT = new Set(['EffectTrigger', 'EffectConditional']); // no effectsToExecute: their own object
@@ -161,37 +163,98 @@ const dedupe = terms => [...new Map(terms.map(t => [JSON.stringify(t), t])).valu
 //          Left, Right; set to zero or cleared only if nothing sets it otherwise) and EffectMath
 //          (its additions summed), and each stage's <Stage>Deposits at its Gates' most required
 //   start  as fast-forwarding to the scene's stage starts it: the stages before it, nothing else
-// Both have Stage and StageName (Progress.cs) as the scene's stage, by its name (<Stage>Scene).
+// Both have StageName (Progress.cs) as the scene's stage, by its name (<Stage>Scene); conditions
+// test stages by name only (Ken, 2026-11-09: no Stage number).
 // unity.json's "symbols" (defaults, then the scene's) set flags code sets at run time (Underwater,
 // RingsWorn) in both; a composed scene's "- Symbols: A=1 B=0" lines win (the page applies those).
-const SCRIPTS = ['EffectSetProgressFlag', 'EffectMath', 'FastForwardSymbols', 'Gate', 'GateOutpost', 'GateMini'];
-let scan = null, scanKey = null;
-// The scan is kept in cache/game-scan.json, by what it reads: the guid index (every Canopy
-// file's blob, uncommitted ones rehashed) and unity.json (scenes' stages). A restart used to
-// scan again, about 8 s (Ken, 2026-11-04: a reload took 12 s).
-const SCAN_CACHE = path.join(__dirname, '..', 'cache', 'game-scan.json');
+const SCRIPTS = ['EffectSetProgressFlag', 'EffectMath', 'FastForwardSymbols', 'FastForwardConfig', 'Gate', 'GateOutpost', 'GateMini'];
+const SCAN_VERSION = 6; // bump when the scan reads more
+// The scan is kept per file (tools/keep.js, cache/game-scan.json): each scene's and prefab's
+// findings by its blob in the guid index, so only a file whose blob changed is read again (Ken,
+// 2026-11-09: any Canopy change, a texture even, rescanned them all, 5 to 7 s), and they are merged
+// by unity.json and StageId.cs as they are now. Looked at again only when one of those three files
+// changes. (2026-11-04: a restart used to scan again, about 8 s.)
+const INDEX_FILE = path.join(__dirname, '..', 'cache', 'guid-index.json');
+const UNITY_JSON = path.join(__dirname, '..', 'unity.json');
+const keptScan = Keep('game-scan');
+let scanMemo = null; // { stamp, scan }
 function scanGame() {
-  const key = require('crypto').createHash('sha1').update(fs.readFileSync(path.join(__dirname, '..', 'cache', 'guid-index.json')))
-    .update(fs.readFileSync(path.join(__dirname, '..', 'unity.json'))).digest('hex');
-  if (scan && scanKey === key) return scan;
-  try {
-    const saved = JSON.parse(fs.readFileSync(SCAN_CACHE, 'utf8'));
-    if (saved.key === key) {
-      scan = saved.scan;
-      scanKey = key;
-      return scan;
-    }
-  } catch { /* none kept yet */ }
+  const stampOf = f => { try { const st = fs.statSync(f); return `${st.mtimeMs}:${st.size}`; } catch { return '-'; } };
+  const stamp = [INDEX_FILE, UNITY_JSON, path.join(U.REPO, 'Assets', 'Scripts', 'StageId.cs')].map(stampOf).join('|');
+  if (scanMemo && scanMemo.stamp === stamp) return scanMemo.scan;
+  const kept = keptScan.get();
+  if (kept.version !== SCAN_VERSION || !kept.files) {
+    for (const k of Object.keys(kept)) delete kept[k];
+    Object.assign(kept, { version: SCAN_VERSION, files: {} });
+  }
+  const files = kept.files;
+  const entries = Object.values(JSON.parse(fs.readFileSync(INDEX_FILE, 'utf8')).entries).filter(e => e.path && /^Assets\/.*\.(unity|prefab)$/.test(e.path));
+  const stale = entries.filter(e => !e.blob || !files[e.path] || files[e.path].blob !== e.blob);
   const guids = Object.fromEntries(SCRIPTS.map(n => [U.scriptGuid(n), n]).filter(([g]) => g));
   const pattern = `guid: (${Object.keys(guids).join('|')})|propertyPath: (flagId|depositsRequired)$`;
-  let files = [];
-  try {
-    files = execFileSync('grep', ['-rlE', pattern, '--include=*.unity', '--include=*.prefab', 'Assets'], { cwd: U.REPO, maxBuffer: 1 << 26 }).toString().trim().split('\n').filter(Boolean);
-  } catch (error) {
-    if (error.status !== 1) throw error; // 1: no file matched
+  // many to read (the first scan): grep picks the files that matter; else each is read and tested
+  let matching = null;
+  if (stale.length > 40) {
+    let out = '';
+    try {
+      out = execFileSync('grep', ['-rlE', pattern, '--include=*.unity', '--include=*.prefab', 'Assets'], { cwd: U.REPO, maxBuffer: 1 << 26 }).toString();
+    } catch (error) {
+      if (error.status !== 1) throw error; // 1: no file matched
+    }
+    matching = new Set(out.trim().split('\n').filter(Boolean));
   }
+  const re = new RegExp(pattern, 'm');
+  for (const e of stale) {
+    let text = null;
+    if (!matching || matching.has(e.path)) {
+      try { text = fs.readFileSync(path.join(U.REPO, e.path), 'utf8').replace(/\r\n/g, '\n'); } catch { /* gone */ }
+    }
+    files[e.path] = { blob: e.blob || null, found: text && re.test(text) ? findings(text, guids) : null };
+  }
+  const present = new Set(entries.map(e => e.path));
+  let dropped = 0;
+  for (const p of Object.keys(files)) if (!present.has(p)) { delete files[p]; dropped++; }
+  if (stale.length || dropped) keptScan.save();
+  const scan = mergeFindings(files);
+  scanMemo = { stamp, scan };
+  return scan;
+}
+// What one scene or prefab sets, before stages are known: { set: [[flag, op]], adds: { flag: n },
+// ff: { stageId: { flag: value } }, configs: { stageId: config }, deposits: its Gates' most required }.
+function findings(text, guids) {
+  const f = U.parse(text);
+  const out = { set: [], adds: {}, ff: {}, configs: {}, deposits: 0 };
+  for (const [, guid, body] of f.scripts) {
+    const name = guids[guid];
+    if (!name) continue;
+    const fx = U.scriptFields(body);
+    if (name === 'EffectSetProgressFlag') out.set.push([String(fx.flagId ?? ''), fx.flagOp]);
+    if (name === 'EffectMath' && fx.mathOperation === 0) out.adds[fx.flagId] = (out.adds[fx.flagId] || 0) + (fx.amount || 0);
+    if (name === 'FastForwardSymbols') {
+      const list = {};
+      for (const m of body.matchAll(/\n {2}- key: ([^\n]*)\n {4}value: ([^\n]*)/g)) list[m[1].trim()] = m[2].trim();
+      out.ff[fx.stageId] = { ...out.ff[fx.stageId], ...list };
+    }
+    if (name === 'FastForwardConfig') out.configs[fx.stageId || 0] = fastForwardConfig(body);
+    if (/^Gate/.test(name) && fx.depositsRequired) out.deposits = Math.max(out.deposits, fx.depositsRequired);
+  }
+  // instances' settings: a flag set by a prefab's EffectSetProgressFlag, a Gate's deposits
+  for (const x of Object.values(f.inst)) {
+    for (const m of x.mods) {
+      if (m.path === 'flagId' && m.value) {
+        const op = x.mods.find(o => o.target === m.target && o.path === 'flagOp');
+        out.set.push([String(m.value), op ? +op.value : 1]);
+      }
+      if (m.path === 'depositsRequired' && +m.value) out.deposits = Math.max(out.deposits, +m.value);
+    }
+  }
+  return out;
+}
+// The files' findings as the scan: { ff, sets, adds, deposits, stages, configs }; a file's Gates'
+// deposits count for the stage its scene plays (by name, or unity.json's stage).
+function mergeFindings(files) {
   const stages = stageIds();
-  const ff = {}, sets = {}, adds = {}, deposits = {};
+  const ff = {}, sets = {}, adds = {}, deposits = {}, configs = {};
   const setFlag = (flag, op) => {
     if (!flag) return;
     const s = sets[flag] = sets[flag] || { one: false, count: 0, text: null, zero: false, clear: false };
@@ -203,58 +266,85 @@ function scanGame() {
     else if (op === 110) s.text = 'Left';
     else if (op === 120) s.text = 'Right';
   };
-  for (const file of files) {
-    const text = fs.readFileSync(path.join(U.REPO, file), 'utf8').replace(/\r\n/g, '\n');
-    const f = U.parse(text);
-    const sceneName = path.basename(file).replace(/\.\w+$/, ''), playsIn = Config.load(sceneName).stage;
-    const stage = sceneStage(playsIn ? playsIn + 'Scene' : sceneName, stages); // its Gates' deposits count for that stage
-    for (const [, guid, body] of f.scripts) {
-      const name = guids[guid];
-      if (!name) continue;
-      const fx = U.scriptFields(body);
-      if (name === 'EffectSetProgressFlag') setFlag(String(fx.flagId ?? ''), fx.flagOp);
-      if (name === 'EffectMath' && fx.mathOperation === 0) adds[fx.flagId] = (adds[fx.flagId] || 0) + (fx.amount || 0);
-      if (name === 'FastForwardSymbols') {
-        const list = {};
-        for (const m of body.matchAll(/\n {2}- key: ([^\n]*)\n {4}value: ([^\n]*)/g)) list[m[1].trim()] = m[2].trim();
-        ff[fx.stageId] = { ...ff[fx.stageId], ...list };
-      }
-      if (/^Gate/.test(name) && stage && fx.depositsRequired) deposits[stage.name] = Math.max(deposits[stage.name] || 0, fx.depositsRequired);
-    }
-    // instances' settings: a flag set by a prefab's EffectSetProgressFlag, a Gate's deposits
-    for (const x of Object.values(f.inst)) {
-      for (const m of x.mods) {
-        if (m.path === 'flagId' && m.value) {
-          const op = x.mods.find(o => o.target === m.target && o.path === 'flagOp');
-          setFlag(m.value, op ? +op.value : 1);
-        }
-        if (m.path === 'depositsRequired' && stage && +m.value) deposits[stage.name] = Math.max(deposits[stage.name] || 0, +m.value);
-      }
+  for (const file of Object.keys(files).sort()) {
+    const found = files[file].found;
+    if (!found) continue;
+    for (const [flag, op] of found.set) setFlag(flag, op);
+    for (const [flag, n] of Object.entries(found.adds)) adds[flag] = (adds[flag] || 0) + n;
+    for (const [id, list] of Object.entries(found.ff)) ff[id] = { ...ff[id], ...list };
+    Object.assign(configs, found.configs);
+    if (found.deposits) {
+      const sceneName = path.basename(file).replace(/\.\w+$/, ''), playsIn = Config.load(sceneName).stage;
+      const stage = sceneStage(playsIn ? playsIn + 'Scene' : sceneName, stages);
+      if (stage) deposits[stage.name] = Math.max(deposits[stage.name] || 0, found.deposits);
     }
   }
-  scan = { ff, sets, adds, deposits, stages };
-  scanKey = key;
-  fs.writeFileSync(SCAN_CACHE, JSON.stringify({ key, scan }));
-  return scan;
+  return { ff, sets, adds, deposits, stages, configs };
 }
-// StageId.cs's enum: { name: number }.
+// A FastForwardConfig (Game.unity, one per stage): what fast-forwarding to its stage starts the
+// player with (FastForwardConfig.ApplyInitialSettings): its inventory's fields, its ringList (ten
+// AbilityIds, left thumb to right pinky; Unity keeps an int array as little-endian hex). The
+// temple's gems aren't listed: Canopy finds them (FastForwardConfig.FillTemple).
+function fastForwardConfig(body) {
+  const inventory = {};
+  const block = /\n {2}inventory:\n((?: {4}\w+: [^\n]*\n?)*)/.exec(body);
+  for (const m of ((block && block[1]) || '').matchAll(/ {4}(\w+): ([^\n]*)/g)) inventory[m[1]] = +m[2] || 0;
+  const ints = hex => (String(hex || '').match(/.{8}/g) || []).map(h => Buffer.from(h, 'hex').readInt32LE(0));
+  const field = name => ((new RegExp('\\n {2}' + name + ': ([0-9a-f]*)')).exec(body) || [])[1];
+  // portalLinks: portals the fast-forward links (FastForwardConfig.ApplyFastForward), { name: destination }
+  const portalLinks = Object.fromEntries([...body.matchAll(/\n {2}- portalName: ([^\n]*)\n {4}destinationPortalName: ([^\n]*)/g)].map(m => [m[1].trim(), m[2].trim()]).filter(([a, b]) => a && b));
+  return { inventory, rings: ints(field('ringList')), portalLinks }; // the temple fills itself (FastForwardConfig.FillTemple)
+}
+// AbilityId.cs's enum: { number: name }.
+function abilityNames() {
+  const file = path.join(U.REPO, 'Assets', 'Scripts', 'AbilityId.cs');
+  const m = fs.existsSync(file) && /enum AbilityId\s*\{([^}]*)\}/.exec(fs.readFileSync(file, 'utf8'));
+  return m ? Object.fromEntries([...m[1].matchAll(/(\w+)\s*=\s*(\d+)/g)].map(x => [+x[2], x[1]])) : {};
+}
+// Fast forward (Ken, 2026-11-08; the page's ☰ Fast forward): the stages, each stage's
+// FastForwardSymbols, and each stage's FastForwardConfig with its rings named and colored (a ring
+// shows its gem's color, GemTypes; NoAbility: a ring holding no gem; NoRing: an empty finger).
+function fastForward() {
+  const g = scanGame(), names = abilityNames(), types = require('./gems.js').gemTypes();
+  const ring = id => {
+    if (!id) return null;
+    const t = types.byAbility[id];
+    return { id, ability: names[id] || String(id), ...(t && types.colors[t.color] ? { color: types.colors[t.color].slice(0, 3) } : {}) };
+  };
+  const configs = Object.fromEntries(Object.entries(g.configs || {}).map(([stage, c]) => [stage, { inventory: c.inventory, portalLinks: c.portalLinks || {}, rings: c.rings.map(ring) }]));
+  // stages: { name: number }; order: the names as played; symbols and configs by number;
+  // abilities: { id: name }, for gems set into rings
+  return { stages: g.stages, order: stageOrder().order, symbols: g.ff, configs, abilities: names };
+}
+// StageId.cs's enum: { name: number }, each stage's permanent number (not its order; Invalid left out).
 function stageIds() {
   const file = path.join(U.REPO, 'Assets', 'Scripts', 'StageId.cs');
   const m = fs.existsSync(file) && /enum StageId\s*\{([^}]*)\}/.exec(fs.readFileSync(file, 'utf8'));
-  return m ? Object.fromEntries([...m[1].matchAll(/(\w+)\s*=\s*(\d+)/g)].map(x => [x[1], +x[2]])) : {};
+  return m ? Object.fromEntries([...m[1].matchAll(/(\w+)\s*=\s*(\d+)/g)].filter(x => x[1] !== 'Invalid').map(x => [x[1], +x[2]])) : {};
+}
+// The stages in the order they are played: StageId.cs's Stage.ValidStages (Ken, 2026-11-09: Hawthorn,
+// number 10, plays between Tangle and Oak), else by number. { order: [names], rank: { name: place } }.
+function stageOrder() {
+  const file = path.join(U.REPO, 'Assets', 'Scripts', 'StageId.cs');
+  const m = fs.existsSync(file) && /ValidStages\s*=\s*\{([^}]*)\}/.exec(fs.readFileSync(file, 'utf8'));
+  const ids = stageIds();
+  const order = m ? [...m[1].matchAll(/StageId\.(\w+)/g)].map(x => x[1]).filter(n => n in ids) : Object.keys(ids).sort((a, b) => ids[a] - ids[b]);
+  return { order, rank: Object.fromEntries(order.map((n, i) => [n, i])) };
 }
 function sceneStage(scene, stages) {
   const m = /^(\w+?)Scene$/.exec(scene || '');
-  return m && m[1] in stages ? { name: m[1], id: stages[m[1]] } : null;
+  return m && m[1] in stages ? { name: m[1], id: stages[m[1]], rank: stageOrder().rank[m[1]] } : null;
 }
 // stageName: the stage the scene plays in, when its name is not one (unity.json stage).
 function symbols(scene, extra = {}, stageName = null) {
   const g = scanGame();
   const stage = sceneStage(stageName ? stageName + 'Scene' : scene, g.stages);
-  const met = {}, start = {};
-  for (const id of Object.keys(g.ff).map(Number).sort((a, b) => a - b)) {
+  const met = {}, start = {}, { rank } = stageOrder();
+  const nameOf = Object.fromEntries(Object.entries(g.stages).map(([n, id]) => [id, n]));
+  const rankOf = id => rank[nameOf[id]] ?? -1;
+  for (const id of Object.keys(g.ff).map(Number).sort((a, b) => rankOf(a) - rankOf(b))) {
     Object.assign(met, g.ff[id]);
-    if (stage && id < stage.id) Object.assign(start, g.ff[id]);
+    if (stage && rankOf(id) < stage.rank) Object.assign(start, g.ff[id]);
   }
   for (const [flag, s] of Object.entries(g.sets)) {
     if (s.one) met[flag] = '1';
@@ -265,10 +355,10 @@ function symbols(scene, extra = {}, stageName = null) {
   for (const [flag, n] of Object.entries(g.adds)) met[flag] = String((parseInt(met[flag], 10) || 0) + n);
   for (const [name, n] of Object.entries(g.deposits)) met[name + 'Deposits'] = String(n);
   for (const t of [met, start]) {
-    if (stage) Object.assign(t, { Stage: String(stage.id), StageName: stage.name });
+    if (stage) t.StageName = stage.name;
     for (const [k, v] of Object.entries(extra)) t[k] = String(v);
   }
-  return { met, start, stage: stage ? stage.name : null };
+  return { met, start, stage: stage ? stage.name : null, extra: Object.fromEntries(Object.entries(extra).map(([k, v]) => [k, String(v)])) };
 }
 // "- Symbols: A=1 B=0 Name='Tangle'" lines of a composed scene, merged: { A: '1', ... }.
 function symbolLines(text) {
@@ -279,4 +369,23 @@ function symbolLines(text) {
   return out;
 }
 
-module.exports = { rulesOf, nodeTerms, gameFields, symbols, symbolLines, sceneStage, stageIds };
+// The stage a piece of a Canopy scene shows from, for fast-forwarding (Ken, 2026-11-09: fast-
+// forwarded to Beech, Tangle and the later biomes aren't shown; the Stronghold always is, the Temple
+// with Beech): unity.json's places in its scene, by path (Game.unity's Approach from the Tutorial,
+// Temple from Beech, Stronghold always: null), then its stagePath (Game's World/<Stage>Biome/), else
+// its scene's stage (or the stage it plays in);
+// null: always shown.
+// placeStager(scene): placeStage for that scene's pieces, its unity.json and StageId.cs read once
+// (Claude, 2026-11-09: reading both again for each of a load's 555 pieces took 3 of its 4 s).
+function placeStager(scene) {
+  const cfg = Config.load(scene), ids = stageIds();
+  const own = sceneStage(cfg.stage ? cfg.stage + 'Scene' : scene, ids);
+  return piecePath => {
+    for (const place of cfg.places) if (piecePath === place.path || String(piecePath || '').startsWith(place.path + '/')) return place.from;
+    const named = cfg.stagePath && cfg.stagePath.exec(String(piecePath || ''));
+    if (named && named[1] in ids) return named[1]; // Game's World/OakBiome/...: from Oak
+    return own ? own.name : null;
+  };
+}
+const placeStage = (scene, piecePath) => placeStager(scene)(piecePath);
+module.exports = { scanGame, rulesOf, nodeTerms, gameFields, symbols, symbolLines, sceneStage, stageIds, stageOrder, fastForward, placeStage, placeStager };

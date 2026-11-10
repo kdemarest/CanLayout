@@ -1,5 +1,9 @@
 {
   "defaults": {
+    "substitute": [
+      { "prefab": "FireObject", "with": "ManaFire", "in": ["Flamer", "Bunsen", "BunsenFront"], "why": "the flamers' mounted fire mana is real fire mana, an item taken off them (Ken, 2026-11-09; Canopy: docs Flamer @fix)" },
+      { "prefab": "ManaShow", "with": "AbstractMana", "in": ["Game"], "scale": 0.075, "why": "the Temple's mana display shown as Abstract Mana, 7.5 cm tall, a slot's size (Ken, 2026-11-09; Canopy: docs Gem Station @fix)" }
+    ],
     "near": 0.03,
     "far": 400,
     "lodFov": 90,
@@ -16,13 +20,20 @@
     "tweakWorkers": { "Assets/Modl/": ["python3", "../modl/obj/serve.py"] },
     "maxTexture": 1024,
     "include": ["World"],
+    "with": ["Game"],
     "show": [
       "mesh:ForestTreeLeaves*"
     ],
     "hide": []
   },
   "scenes": {
-    "HawthornScene": { "stage": "Oak" },
-    "BlackIsleScene": { "stage": "Oak" }
+    "Game": {
+      "places": [
+        { "path": "World/BeechApproach", "from": "Tutorial", "title": "Approach" },
+        { "path": "World/BeechBiome", "from": "Beech", "title": "Temple" },
+        { "path": "World/MoonBiome", "from": null, "title": "Stronghold" }
+      ],
+      "stagePath": "^World/(\\w+)Biome/"
+    }
   }
 }

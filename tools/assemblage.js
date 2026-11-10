@@ -74,6 +74,7 @@ function readObj(text) {
 // The scene's plan: { name, files: {path: text}, notes }.
 function plan(sceneName) {
   const text = fs.readFileSync(path.join(SCENES, sceneName + '.md'), 'utf8');
+  if (require('./linked.js').isLinked(text)) return require('./linked.js').plan(sceneName); // a linked assemblage: its prefab is edited, not built
   if (!S.isAssemblage(text)) throw new Error(`${sceneName} is not an assemblage (frontmatter assemblage: true)`);
   const origin = S.originLine(text);
   if (!origin) throw new Error(`${sceneName}: an assemblage needs a "- Origin: x y z" line`);
