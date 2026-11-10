@@ -16,7 +16,7 @@
 // equator down, so the south pole, as far below, is inside the trunk). --inspect writes layout
 // layers <Prefix> (the mesh, front faces), <Prefix>Inside (its back faces, red) and <Prefix>Ball;
 // --write writes the mesh over the Canopy file, without the vertices nothing uses any more (log it
-// in docs/Canopy Changes.md); --out writes it to a local file instead (for tools/mesh-clean.js
+// in docs/code/Canopy Changes.md); --out writes it to a local file instead (for tools/mesh-clean.js
 // --texture-only --from <file>, so the texture is made afresh after the trunk is widened).
 const fs = require('fs');
 const path = require('path');

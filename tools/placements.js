@@ -3,7 +3,7 @@
 // them all and nothing else needs checking. Layout writes them where Unity keeps them: one
 // PrefabInstance of the assemblage's prefab (Assets/Assemblages/<Name>/<Name>.prefab) under the
 // scene's anchor, placed in the anchor's space. Added, moved and deleted from an imported area in
-// the page (web/app.js); every change goes into docs/Canopy Changes.md, and the scene's areas are
+// the page (web/app.js); every change goes into docs/code/changes/Assemblage Placements Changes.md (linked from docs' Canopy Changes), and the scene's areas are
 // patched so nothing needs extracting again.
 //   add(scene, prefabName, placement) -> { instance, piece }
 //   move(scene, instance, placement)  -> { instance, piece }
@@ -14,7 +14,7 @@ const path = require('path');
 const U = require('./unity.js');
 
 const AREAS = path.join(__dirname, '..', 'areas');
-const CHANGES = path.join(__dirname, '..', '..', 'docs', 'Canopy Changes.md');
+const CHANGES = path.join(__dirname, '..', '..', 'docs', 'code', 'changes', 'Assemblage Placements Changes.md');
 const sceneFile = scene => path.join(U.REPO, 'Assets', 'Scenes', scene + '.unity');
 const round = (v, d) => Math.round(v * 10 ** d) / 10 ** d;
 const fmt = v => String(round(v, 6));
@@ -90,14 +90,12 @@ function patchAreas(scene, instance, newPiece) {
   }
 }
 
-// One line in Canopy Changes.md's running list of placements.
+// One line at the end of the placements' running list (a doc of its own, so appending is always
+// in place; Ken, 2026-11-10). Its file must exist: the list is how Ken finds what Layout changed.
 function log(text) {
-  if (!fs.existsSync(CHANGES)) return;
-  const head = '## Assemblage placements by Layout';
-  let s = fs.readFileSync(CHANGES, 'utf8');
-  if (!s.includes(head)) s = s.replace(/\n*$/, '\n\n') + `${head}\n\nWritten by Layout (tools/placements.js) as Ken places assemblages in an imported area: each a PrefabInstance of the assemblage's prefab under the scene's anchor. Undo: delete the instance (Layout's Delete, or in Unity).\n`;
-  s = s.replace(/\n*$/, '\n') + `- ${new Date().toISOString().slice(0, 10)} ${text}\n`;
-  fs.writeFileSync(CHANGES, s);
+  if (!fs.existsSync(CHANGES)) throw new Error(`placements: no ${CHANGES}: the running list of placements went missing (docs/code/changes); restore it from the docs repo`);
+  const s = fs.readFileSync(CHANGES, 'utf8');
+  fs.writeFileSync(CHANGES, s.replace(/\n*$/, '\n') + `- ${new Date().toISOString().slice(0, 10)} ${text}\n`);
 }
 
 const where = p => p.position.map(v => round(v, 2)).join(' ');

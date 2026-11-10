@@ -24,7 +24,7 @@
 //
 //   node tools/split-scene.js <rules.json> [--from <scene file>] [--write]
 // Without --write the two scenes go to cache/split/; with it, into the Canopy working tree
-// (logged in docs/Canopy Changes.md). --from reads the scene to split from a file instead of
+// (logged in docs/code/Canopy Changes.md). --from reads the scene to split from a file instead of
 // Canopy (a copy taken before an earlier --write, so a split can be redone).
 const fs = require('fs');
 const path = require('path');

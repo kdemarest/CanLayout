@@ -93,7 +93,7 @@
 // --material names the Unity material (e.g. BarkBeech) Clean and Original are drawn with when
 // layout's Textures is on (else in their colors). --skip rejoin leaves the self-crossing segments as they are (not yet approved). --write writes
 // the cleaned mesh over the Canopy file, without the vertices nothing uses any more (log it in
-// docs/Canopy Changes.md).
+// docs/code/Canopy Changes.md).
 const fs = require('fs');
 const path = require('path');
 const S = require('./scene.js');
